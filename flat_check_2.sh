@@ -1715,92 +1715,125 @@ register_dep() {
     fi
 }
 
+# --- Per-PM package presence probes -----------------------------------------
+# One self-contained function per package manager: main name, then each
+# comma-separated legacy name, using only that PM's own query tool — no
+# other PM's commands appear inside. Each sets FOUND_PKG_VER/FOUND_PKG_STATUS,
+# prints the matching ok/warn/fail line and returns:
+#   0 = installed  1 = installed but not fully configured (dpkg only)
+#   2 = legacy name found instead  3 = not found at all
+# check_pkg_installed() below only ever calls these through a $PM dispatch.
+
+check_pkg_installed_dpkg() {
+    local pkg="$1" legacy="$2" old found ver status
+
+    found=$(dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$pkg" 2>/dev/null)
+    if [[ -n "$found" ]]; then
+        ver=$(echo "$found" | awk '{print $2}')
+        status=$(echo "$found" | awk '{$1=""; $2=""; print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        FOUND_PKG_VER="$ver"
+        FOUND_PKG_STATUS="$status"
+        if [[ "$status" == "install ok installed" ]]; then
+            print_ok "pkg: $pkg installed"
+            return 0
+        else
+            print_warn "pkg: $pkg installed but status='$status'"
+            return 1
+        fi
+    fi
+
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        found=$(dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$old" 2>/dev/null)
+        [[ -n "$found" ]] || continue
+        ver=$(echo "$found" | awk '{print $2}')
+        status=$(echo "$found" | awk '{$1=""; $2=""; print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        FOUND_PKG_VER="$ver"
+        FOUND_PKG_STATUS="$status"
+        print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
+        return 2
+    done
+
+    print_fail "pkg: $pkg not installed"
+    return 3
+}
+
+check_pkg_installed_rpm() {
+    local pkg="$1" legacy="$2" old ver
+
+    if rpm -q "$pkg" &>/dev/null; then
+        ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null)
+        FOUND_PKG_VER="$ver"
+        print_ok "pkg: $pkg installed"
+        return 0
+    fi
+
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        rpm -q "$old" &>/dev/null || continue
+        ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$old" 2>/dev/null)
+        FOUND_PKG_VER="$ver"
+        print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
+        return 2
+    done
+
+    print_fail "pkg: $pkg not installed"
+    return 3
+}
+
+check_pkg_installed_pacman() {
+    local pkg="$1" legacy="$2" old ver
+
+    if pacman -Q "$pkg" &>/dev/null; then
+        ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
+        FOUND_PKG_VER="$ver"
+        print_ok "pkg: $pkg installed"
+        return 0
+    fi
+
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        pacman -Q "$old" &>/dev/null || continue
+        ver=$(pacman -Q "$old" 2>/dev/null | awk '{print $2}')
+        FOUND_PKG_VER="$ver"
+        print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
+        return 2
+    done
+
+    print_fail "pkg: $pkg not installed"
+    return 3
+}
+
+check_pkg_installed_apk() {
+    local pkg="$1" legacy="$2" old
+
+    if apk info -e "$pkg" &>/dev/null; then
+        print_ok "pkg: $pkg installed"
+        return 0
+    fi
+
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        apk info -e "$old" &>/dev/null || continue
+        print_warn "pkg: $pkg not found, but legacy '$old' exists"
+        return 2
+    done
+
+    print_fail "pkg: $pkg not installed"
+    return 3
+}
+
 # Check if package is installed using PM (verbose, prints status)
 check_pkg_installed() {
     local pkg="$1"
     local legacy="$2"
-    local found=""
-    local ver=""
-    local status=""
 
     FOUND_PKG_VER=""
     FOUND_PKG_STATUS=""
 
-    if [[ "$PM" == "dpkg" ]]; then
-        found=$(dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$pkg" 2>/dev/null)
-        if [[ -n "$found" ]]; then
-            ver=$(echo "$found" | awk '{print $2}')
-            status=$(echo "$found" | awk '{$1=""; $2=""; print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            FOUND_PKG_VER="$ver"
-            FOUND_PKG_STATUS="$status"
-            if [[ "$status" == "install ok installed" ]]; then
-                print_ok "pkg: $pkg installed"
-                return 0
-            else
-                print_warn "pkg: $pkg installed but status='$status'"
-                return 1
-            fi
-        fi
-    elif [[ "$PM" == "rpm" ]]; then
-        if rpm -q "$pkg" &>/dev/null; then
-            ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null)
-            FOUND_PKG_VER="$ver"
-            print_ok "pkg: $pkg installed"
-            return 0
-        fi
-    elif [[ "$PM" == "pacman" ]]; then
-        if pacman -Q "$pkg" &>/dev/null; then
-            ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
-            FOUND_PKG_VER="$ver"
-            print_ok "pkg: $pkg installed"
-            return 0
-        fi
-    elif [[ "$PM" == "apk" ]]; then
-        if apk info -e "$pkg" &>/dev/null; then
-            print_ok "pkg: $pkg installed"
-            return 0
-        fi
-    fi
-
-    # Check legacy names
-    if [[ -n "$legacy" ]]; then
-        local old
-        for old in $(echo "$legacy" | tr ',' ' '); do
-            if [[ "$PM" == "dpkg" ]]; then
-                found=$(dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$old" 2>/dev/null)
-                if [[ -n "$found" ]]; then
-                    ver=$(echo "$found" | awk '{print $2}')
-                    status=$(echo "$found" | awk '{$1=""; $2=""; print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    FOUND_PKG_VER="$ver"
-                    FOUND_PKG_STATUS="$status"
-                    print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
-                    return 2
-                fi
-            elif [[ "$PM" == "rpm" ]]; then
-                if rpm -q "$old" &>/dev/null; then
-                    ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$old" 2>/dev/null)
-                    FOUND_PKG_VER="$ver"
-                    print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
-                    return 2
-                fi
-            elif [[ "$PM" == "pacman" ]]; then
-                if pacman -Q "$old" &>/dev/null; then
-                    ver=$(pacman -Q "$old" 2>/dev/null | awk '{print $2}')
-                    FOUND_PKG_VER="$ver"
-                    print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
-                    return 2
-                fi
-            elif [[ "$PM" == "apk" ]]; then
-                if apk info -e "$old" &>/dev/null; then
-                    print_warn "pkg: $pkg not found, but legacy '$old' exists"
-                    return 2
-                fi
-            fi
-        done
-    fi
-
-    print_fail "pkg: $pkg not installed"
-    return 3
+    case "$PM" in
+        dpkg)   check_pkg_installed_dpkg "$pkg" "$legacy" ;;
+        rpm)    check_pkg_installed_rpm "$pkg" "$legacy" ;;
+        pacman) check_pkg_installed_pacman "$pkg" "$legacy" ;;
+        apk)    check_pkg_installed_apk "$pkg" "$legacy" ;;
+        *)      print_fail "pkg: $pkg not installed"; return 3 ;;
+    esac
 }
 
 has_any_trace() {
