@@ -2485,6 +2485,30 @@ is_lib_available() {
 
 # --- 5. Infrastructure + repositories ------------------------------------------
 # Check all collected dependencies (Infrastructure)
+# Find the first candidate systemd service whose unit *file* exists and
+# report whether it's active. This is the exact pattern that used to be
+# copy-pasted for mariadb/postgresql/redis below: try candidates in given
+# order, stop at the first unit-file match (regardless of active state) —
+# never reports on a candidate whose unit was never installed at all.
+# Returns 0 if a matching unit file was found, 1 otherwise (caller decides
+# what "no matching unit at all" means for that dependency).
+_infra_report_first_unit() {
+    local label="$1"; shift
+    local svc active
+    for svc in "$@"; do
+        if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
+            active=$(systemctl is-active "${svc}.service" 2>/dev/null)
+            if [[ "$active" == "active" ]]; then
+                print_ok "$label: $svc active"
+            else
+                print_warn "$label: $svc $active"
+            fi
+            return 0
+        fi
+    done
+    return 1
+}
+
 check_infrastructure() {
     echo ""
     echo "=== Infrastructure ==="
@@ -2559,19 +2583,7 @@ check_infrastructure() {
                     ver=$(mysql --version 2>/dev/null | head -1 | cut -d' ' -f1-4)
                     print_ok "mariadb/mysql: $ver"
                     if command -v systemctl &>/dev/null; then
-                        local svc
-                        for svc in mariadb mysql; do
-                            if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
-                                local active
-                                active=$(systemctl is-active "${svc}.service" 2>/dev/null)
-                                if [[ "$active" == "active" ]]; then
-                                    print_ok "mariadb: $svc active"
-                                else
-                                    print_warn "mariadb: $svc $active"
-                                fi
-                                break
-                            fi
-                        done
+                        _infra_report_first_unit mariadb mariadb mysql
                     fi
                     if command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -q ':3306 '; then
                         print_ok "mariadb: port 3306 open"
@@ -2588,19 +2600,7 @@ check_infrastructure() {
                     ver=$(psql --version 2>/dev/null | head -1)
                     print_ok "postgresql: $ver"
                     if command -v systemctl &>/dev/null; then
-                        local svc
-                        for svc in postgresql postgresql-12 postgresql-13 postgresql-14 postgresql-15 postgresql-16; do
-                            if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
-                                local active
-                                active=$(systemctl is-active "${svc}.service" 2>/dev/null)
-                                if [[ "$active" == "active" ]]; then
-                                    print_ok "postgresql: $svc active"
-                                else
-                                    print_warn "postgresql: $svc $active"
-                                fi
-                                break
-                            fi
-                        done
+                        _infra_report_first_unit postgresql postgresql postgresql-12 postgresql-13 postgresql-14 postgresql-15 postgresql-16
                     fi
                     if command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -q ':5432 '; then
                         print_ok "postgresql: port 5432 open"
@@ -2617,18 +2617,7 @@ check_infrastructure() {
                 if [[ $dep_found -eq 1 ]]; then
                     print_ok "redis: $dep_ver installed"
                     if command -v systemctl &>/dev/null; then
-                        local active
-                        for svc in redis-server redis; do
-                            if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
-                                active=$(systemctl is-active "${svc}.service" 2>/dev/null)
-                                if [[ "$active" == "active" ]]; then
-                                    print_ok "redis: $svc active"
-                                else
-                                    print_warn "redis: $svc $active"
-                                fi
-                                break
-                            fi
-                        done
+                        _infra_report_first_unit redis redis-server redis
                     fi
                 else
                     print_fail "redis: not installed (required by: $req_by)"
