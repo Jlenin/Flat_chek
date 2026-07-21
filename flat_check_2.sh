@@ -1359,52 +1359,81 @@ _sys_psql() {
     echo "$out" | tr -d '[:space:]'
 }
 
-_sys_database() {
-    local db="n/a" cluster="n/a" role="" lag="" n=""
-    local euid
-    euid="${EUID:-$(id -u)}"
+# --- PostgreSQL cluster helpers (used by _sys_database below) ---------------
+# Each phase of the old single-block detection gets its own name: is the
+# engine active, what role is it in, and what does its replication state
+# look like. _sys_database() below just wires the results together.
 
-    if command -v systemctl &>/dev/null; then
-        if systemctl is-active --quiet postgresql 2>/dev/null \
-            || systemctl is-active --quiet postgresql.service 2>/dev/null \
-            || systemctl list-units --type=service --state=running 2>/dev/null | grep -qE 'postgresql(@|-)'; then
-            db="postgresql active"
-            if command -v psql &>/dev/null && [[ "$euid" -eq 0 || -n "${PGUSER:-}" || -n "${PGDATABASE:-}" ]]; then
-                role=$(_sys_psql "SELECT CASE WHEN pg_is_in_recovery() THEN 'standby' ELSE 'primary' END")
-                if [[ "$role" == "primary" || "$role" == "standby" ]]; then
-                    db="postgresql active ($role)"
-                    if [[ "$role" == "primary" ]]; then
-                        n=$(_sys_psql "SELECT count(*) FROM pg_stat_replication")
-                        if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then
-                            lag=$(_sys_psql "SELECT COALESCE((EXTRACT(EPOCH FROM MAX(COALESCE(replay_lag, write_lag, flush_lag))))::int, 0) FROM pg_stat_replication")
-                            if [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]]; then
-                                lag=$(_sys_psql "SELECT COALESCE(EXTRACT(EPOCH FROM (now()-min(reply_time)))::int,0) FROM pg_stat_replication")
-                            fi
-                            [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]] && lag="0"
-                            cluster="replication=ok lag=${lag}s replicas=$n"
-                        else
-                            cluster="replication=none replicas=0"
-                        fi
-                    else
-                        # Standby: lag vs primary from local replay timestamp
-                        lag=$(_sys_psql "SELECT COALESCE(EXTRACT(EPOCH FROM (now()-pg_last_xact_replay_timestamp()))::int, 0)")
-                        [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]] && lag="n/a"
-                        if [[ "$lag" == "n/a" ]]; then
-                            cluster="replication=standby lag=n/a"
-                        else
-                            cluster="replication=standby lag=${lag}s"
-                        fi
-                    fi
-                else
-                    cluster="n/a"
-                fi
+# True if a postgresql unit is active (plain, .service, or an @-instance).
+_sys_pg_is_active() {
+    command -v systemctl &>/dev/null || return 1
+    systemctl is-active --quiet postgresql 2>/dev/null \
+        || systemctl is-active --quiet postgresql.service 2>/dev/null \
+        || systemctl list-units --type=service --state=running 2>/dev/null | grep -qE 'postgresql(@|-)'
+}
+
+# True if mariadb or mysql is the active DB engine (checked only once
+# postgresql was ruled out, same order as the original).
+_sys_mariadb_is_active() {
+    command -v systemctl &>/dev/null || return 1
+    systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null
+}
+
+# Echoes "primary" or "standby" via pg_is_in_recovery(); nothing (rc=1) if
+# psql access isn't usable or the query didn't return one of those two.
+_sys_pg_role() {
+    local euid role
+    euid="${EUID:-$(id -u)}"
+    command -v psql &>/dev/null && [[ "$euid" -eq 0 || -n "${PGUSER:-}" || -n "${PGDATABASE:-}" ]] || return 1
+    role=$(_sys_psql "SELECT CASE WHEN pg_is_in_recovery() THEN 'standby' ELSE 'primary' END")
+    [[ "$role" == "primary" || "$role" == "standby" ]] || return 1
+    echo "$role"
+}
+
+# Replication summary for a primary node.
+_sys_pg_primary_cluster_info() {
+    local n lag
+    n=$(_sys_psql "SELECT count(*) FROM pg_stat_replication")
+    if [[ ! "$n" =~ ^[0-9]+$ || "$n" -eq 0 ]]; then
+        echo "replication=none replicas=0"
+        return
+    fi
+    lag=$(_sys_psql "SELECT COALESCE((EXTRACT(EPOCH FROM MAX(COALESCE(replay_lag, write_lag, flush_lag))))::int, 0) FROM pg_stat_replication")
+    if [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]]; then
+        lag=$(_sys_psql "SELECT COALESCE(EXTRACT(EPOCH FROM (now()-min(reply_time)))::int,0) FROM pg_stat_replication")
+    fi
+    [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]] && lag="0"
+    echo "replication=ok lag=${lag}s replicas=$n"
+}
+
+# Lag summary for a standby node, relative to the primary's last replayed xact.
+_sys_pg_standby_cluster_info() {
+    local lag
+    lag=$(_sys_psql "SELECT COALESCE(EXTRACT(EPOCH FROM (now()-pg_last_xact_replay_timestamp()))::int, 0)")
+    [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]] && lag="n/a"
+    if [[ "$lag" == "n/a" ]]; then
+        echo "replication=standby lag=n/a"
+    else
+        echo "replication=standby lag=${lag}s"
+    fi
+}
+
+_sys_database() {
+    local db="n/a" cluster="n/a" role=""
+
+    if _sys_pg_is_active; then
+        db="postgresql active"
+        role=$(_sys_pg_role)
+        if [[ -n "$role" ]]; then
+            db="postgresql active ($role)"
+            if [[ "$role" == "primary" ]]; then
+                cluster=$(_sys_pg_primary_cluster_info)
             else
-                cluster="n/a"
+                cluster=$(_sys_pg_standby_cluster_info)
             fi
-        elif systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null; then
-            db="mariadb/mysql active"
-            cluster="n/a"
         fi
+    elif _sys_mariadb_is_active; then
+        db="mariadb/mysql active"
     fi
 
     # Fallback: package present but systemd unknown
