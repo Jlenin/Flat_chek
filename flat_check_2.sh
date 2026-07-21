@@ -1,48 +1,48 @@
 #!/bin/bash
-# flat_check_2.sh — FLAT/FCS health check + log collector
+# flat_check_2.sh — проверка состояния FLAT/FCS + сборщик логов
 #
-# Runs on: Debian/Ubuntu, RHEL/CentOS/ALMA/Rocky/РЕД ОС, Astra, … (dpkg/rpm + systemd)
+# Работает на: Debian/Ubuntu, RHEL/CentOS/ALMA/Rocky/РЕД ОС, Astra, … (dpkg/rpm + systemd)
 #
-# Modes:
-#   (default)     health check of installed packages
-#   -log -on/-off collect logs (online tail / offline parallel copy+time filter)
-#                 --scope brief|extended, -p product, -s service
-#   -i            interactive wizard
-#   --dev / --selftest  script self-test (simple|extended)
-#   -v            print version
+# Режимы:
+#   (по умолчанию) проверка установленных служб
+#   -log -on/-off сбор логов (online tail / offline параллельное копирование+фильтр по времени)
+#                 --scope brief|extended, -p продукт, -s служба
+#   -i            интерактивный мастер
+#   --dev / --selftest  самотест скрипта (simple|extended)
+#   -v            вывести версию
 #
-# Offline time range filters LINES by timestamp inside the file (not mtime).
-# Large plain logs (>=1MB): binary-search bounds + parallel chunk-scan of the window.
-# SoftSwitch fss-server monoliths (tens of GB) are the main target.
-# .gz and unsorted files: linear / parallel full-file chunk scan.
+# Offline-фильтр по диапазону времени отбирает СТРОКИ по timestamp внутри файла (не по mtime).
+# Крупные обычные логи (>=1MB): бинарный поиск границ + параллельное сканирование окна по чанкам.
+# Основная цель — монолиты SoftSwitch fss-server (десятки ГБ).
+# .gz и неотсортированные файлы: линейное / параллельное сканирование всего файла по чанкам.
 #
-# Internal layout (search for "# --- N."):
-#   0  globals / flags
-#   1  PKG_* product metadata
-#   2  print helpers + localization
-#   3  OS / package manager
-#   3b system metrics (CPU/MEM/disk/DB/net/certs/uptime)
-#   4  per-package health checks
-#   5  infrastructure + repositories
-#   6  log directory discovery
-#   7  PostgreSQL log discovery
-#   8  line filters by time
-#   8b standalone service-log range extraction (parce_service_log)
-#   9  collector processes / signals / safe remove
-#  10  online / offline collection
-#  11  wizard, help, argv, main
+# Внутренняя структура (искать "# --- N."):
+#   0  глобальные переменные / флаги
+#   1  метаданные продуктов PKG_*
+#   2  хелперы вывода + локализация
+#   3  ОС / пакетный менеджер
+#   3b системные метрики (CPU/MEM/диск/БД/сеть/сертификаты/аптайм)
+#   4  проверки состояния по пакетам
+#   5  инфраструктура + репозитории
+#   6  поиск директорий логов
+#   7  поиск логов PostgreSQL
+#   8  фильтры строк по времени
+#   8b автономное извлечение диапазона из лога службы (parce_service_log)
+#   9  процессы сборщика / сигналы / безопасное удаление
+#  10  online / offline сбор
+#  11  мастер, справка, argv, main
 #
-# Root safety: temporary dirs are only removed if they match
-#   YYYY.MM.DD_HH-MM_*  under the collector output directory.
-# Never use bare rm -rf on arbitrary paths from CLI input.
+# Безопасность при работе от root: временные директории удаляются только если совпадают
+#   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
+# Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
 SCRIPT_VERSION="3.5.1"
 
 set -uo pipefail
 
-# --- 0. Globals ----------------------------------------------------------------
+# --- 0. Глобальные переменные ---------------------------------------------------
 
-# Colors
+# Цвета
 C_R='\033[0;31m'
 C_G='\033[0;32m'
 C_Y='\033[1;33m'
@@ -56,11 +56,11 @@ NOT_INSTALLED=0
 VERBOSE=0
 SHOW_REPO=0
 
-# Log collector mode flags
+# Флаги режима сборщика логов
 MODE_LOG=0
 MODE_DEV=0
 MODE_INTERACTIVE=0
-# Self-test: "" | simple | extended  (--dev = extended; wizard mode 3 picks level)
+# Самотест: "" | simple | extended  (--dev = extended; в мастере уровень выбирается в режиме 3)
 SELFTEST_MODE=""
 LOG_SUBMODE="online"
 START_TCPDUMP=1
@@ -69,22 +69,22 @@ TIMEOUT_SEC=0
 FROM_TIME=""
 TO_TIME=""
 OUTPUT_DIR=""
-# Log selection: brief = app logs only; extended = + system/nginx/pg/configs (+ tcpdump online)
+# Выбор логов: brief = только логи приложений; extended = + system/nginx/pg/конфиги (+ tcpdump online)
 LOG_SCOPE="brief"
-SELECTED_PRODUCTS=()   # product names from -p / wizard
-SELECTED_SERVICES=()   # package names from -s / wizard
-SELECTED_PKGS=()       # resolved package list for collection
+SELECTED_PRODUCTS=()   # имена продуктов из -p / мастера
+SELECTED_SERVICES=()   # имена пакетов из -s / мастера
+SELECTED_PKGS=()       # итоговый список пакетов для сбора
 LIST_TARGETS=0
-# SoftSwitch extra: include mgcpclient logs (""=ask, 0=no, 1=yes)
+# Доп. для SoftSwitch: включать логи mgcpclient (""=спросить, 0=нет, 1=да)
 INCLUDE_MGCPCLIENT=""
 MGCPCLIENT_RESOLVED=0
 SKIP_UNKNOWN_FLAT_REPORTED=0
-EXTRA_LOG_DIRS=()      # optional dirs outside PKG allowlist (e.g. mgcpclient)
+EXTRA_LOG_DIRS=()      # доп. директории вне списка PKG (например, mgcpclient)
 
-# Localization
+# Локализация
 CURRENT_LANG="en"
 
-# Process tracking (log mode)
+# Отслеживание процессов (режим логов)
 TAIL_PIDS=()
 COLLECTOR_JOB_PIDS=()
 TCPDUMP_PID=""
@@ -94,33 +94,33 @@ DISCOVERED_LOG_DIRS=()
 PG_LOG_SOURCES=()
 COLLECTOR_ABORTED=0
 COLLECTOR_TIMEOUT_STOP=0
-# Offline parallel copy: 0 = auto (nproc*0.8), or set COLLECTOR_JOBS env / -j
+# Offline параллельное копирование: 0 = авто (nproc*0.8), либо задать через COLLECTOR_JOBS env / -j
 COLLECTOR_JOBS=0
-# Host-wide CPU/MEM gate (Zabbix-friendly): throttle extra workers when the whole
-# system is at/above these limits (/proc — not this script's share).
-# IMPORTANT: never deadlock — at least 1 worker is always allowed so offline
-# collection cannot hang forever on an already-busy host (common MEM≥80%).
+# Общесистемный лимит CPU/MEM (дружелюбно к Zabbix): придерживать лишние воркеры, когда вся
+# система достигла этих лимитов или превысила их (/proc — не доля этого скрипта).
+# ВАЖНО: никогда не допускать deadlock — минимум 1 воркер всегда разрешён, чтобы offline
+# сбор не мог зависнуть навечно на уже загруженном хосте (обычное дело при MEM≥80%).
 RESOURCE_CPU_LIMIT=80
 RESOURCE_MEM_LIMIT=80
-# Max seconds to wait for headroom before spawning another worker (when ≥1 already runs)
+# Максимум секунд ожидания запаса ресурсов перед запуском ещё одного воркера (когда ≥1 уже работает)
 RESOURCE_WAIT_MAX=120
-# Min size for bisect + parallel chunk extract (below → single-thread awk)
+# Минимальный размер для бисекции + параллельного извлечения чанков (ниже → однопоточный awk)
 SEEK_MIN_BYTES=$((1 * 1024 * 1024))
-# SoftSwitch-scale monoliths: larger parallel window
+# Монолиты масштаба SoftSwitch: увеличенное окно параллелизма
 SEEK_HUGE_BYTES=$((1024 * 1024 * 1024))
-# Parallel scan chunk size inside the [from,to] byte range
+# Размер чанка параллельного сканирования внутри байтового диапазона [from,to]
 SEEK_CHUNK_BYTES=$((64 * 1024 * 1024))
-# Probe chunk for timestamp samples at an offset
+# Проба-чанк для выборки timestamp по смещению
 SEEK_PROBE_BYTES=131072
-# Back off before start offset so we do not miss the first matching line
+# Отступ перед начальным смещением, чтобы не упустить первую подходящую строку
 SEEK_BACKOFF_BYTES=$((1024 * 1024))
-# Max size (bytes) of a single chunk file produced by parce_service_log()
+# Максимальный размер (байт) одного чанк-файла, создаваемого parce_service_log()
 MAX_LOG_CHUNK_SIZE=$((100 * 1024 * 1024))
-# /proc/stat snapshot for CPU delta
+# Снимок /proc/stat для расчёта дельты CPU
 _CPU_PREV_IDLE=""
 _CPU_PREV_TOTAL=""
 
-# Config paths for log extraction
+# Пути к конфигам для извлечения логов
 CONFIG_PATHS=(
     "/opt/flat/switchserver/settings.ini"
     "/opt/flat/fss-server/settings.ini"
@@ -131,12 +131,12 @@ CONFIG_PATHS=(
     "/opt/flat/flat-file/config.yml"
 )
 
-# Associative metadata arrays
-# Format: PKG_PORTS["name"]="port1,port2"
-# Format: PKG_API["name"]="/health/endpoint"
-# Format: PKG_LEGACY["name"]="oldname1,oldname2"
-# Format: PKG_PRODUCT["name"]="Product Name"
-# Format: PKG_DEPS["name"]="nginx,mariadb"
+# Ассоциативные массивы метаданных
+# Формат: PKG_PORTS["имя"]="порт1,порт2"
+# Формат: PKG_API["имя"]="/health/endpoint"
+# Формат: PKG_LEGACY["имя"]="старое_имя1,старое_имя2"
+# Формат: PKG_PRODUCT["имя"]="Имя продукта"
+# Формат: PKG_DEPS["имя"]="nginx,mariadb"
 
 declare -A PKG_PORTS
 declare -A PKG_API
@@ -144,11 +144,11 @@ declare -A PKG_LEGACY
 declare -A PKG_PRODUCT
 declare -A PKG_DEPS
 
-# Collect all unique dependencies across installed packages
-# ALL_DEPENDS["dep_name"]="pkg1,pkg2"
+# Собрать все уникальные зависимости по установленным пакетам
+# ALL_DEPENDS["имя_зависимости"]="pkg1,pkg2"
 declare -A ALL_DEPENDS
 
-# --- 1. PKG_* product metadata -------------------------------------------------
+# --- 1. Метаданные продуктов PKG_* ----------------------------------------------
 PKG_PRODUCT["acs-frontend"]="AutoCallServer"
 PKG_LEGACY["acs-frontend"]=""
 PKG_PORTS["acs-frontend"]=""
@@ -173,7 +173,7 @@ PKG_PORTS["acs-server"]="8080"
 PKG_API["acs-server"]=""
 PKG_DEPS["acs-server"]=""
 
-# ========== Product: BSS ==========
+# ========== Продукт: BSS ==========
 PKG_PRODUCT["fcs-bssimp"]="BSS"
 PKG_LEGACY["fcs-bssimp"]="bssimp"
 PKG_PORTS["fcs-bssimp"]=""
@@ -186,7 +186,7 @@ PKG_PORTS["fcs-bssexp"]=""
 PKG_API["fcs-bssexp"]=""
 PKG_DEPS["fcs-bssexp"]=""
 
-# ========== Product: Click to Call ==========
+# ========== Продукт: Click to Call ==========
 PKG_PRODUCT["c2c-backend"]="Click to Call"
 PKG_LEGACY["c2c-backend"]=""
 PKG_PORTS["c2c-backend"]="8080"
@@ -199,7 +199,7 @@ PKG_PORTS["c2c-frontend"]=""
 PKG_API["c2c-frontend"]=""
 PKG_DEPS["c2c-frontend"]="nginx"
 
-# ========== Product: Contact Center ==========
+# ========== Продукт: Contact Center ==========
 PKG_PRODUCT["fcs-span"]="Contact Center"
 PKG_LEGACY["fcs-span"]=""
 PKG_PORTS["fcs-span"]=""
@@ -398,7 +398,7 @@ PKG_PORTS["asr-analytics"]=""
 PKG_API["asr-analytics"]=""
 PKG_DEPS["asr-analytics"]=""
 
-# ========== Product: Device Manager ==========
+# ========== Продукт: Device Manager ==========
 PKG_PRODUCT["fdm-server"]="Device Manager"
 PKG_LEGACY["fdm-server"]="fdm-server"
 PKG_PORTS["fdm-server"]=""
@@ -417,7 +417,7 @@ PKG_PORTS["fcc-backend"]=""
 PKG_API["fcc-backend"]=""
 PKG_DEPS["fcc-backend"]=""
 
-# ========== Product: Gateway ==========
+# ========== Продукт: Gateway ==========
 PKG_PRODUCT["fg-frontend"]="Gateway"
 PKG_LEGACY["fg-frontend"]=""
 PKG_PORTS["fg-frontend"]=""
@@ -430,7 +430,7 @@ PKG_PORTS["fg-backend"]=""
 PKG_API["fg-backend"]=""
 PKG_DEPS["fg-backend"]=""
 
-# ========== Product: Partner Server ==========
+# ========== Продукт: Partner Server ==========
 PKG_PRODUCT["fps-backend"]="Partner Server"
 PKG_LEGACY["fps-backend"]="flatPartnerAuth"
 PKG_PORTS["fps-backend"]=""
@@ -491,7 +491,7 @@ PKG_PORTS["fps-phonebook"]=""
 PKG_API["fps-phonebook"]=""
 PKG_DEPS["fps-phonebook"]=""
 
-# ========== Product: SoftSwitch ==========
+# ========== Продукт: SoftSwitch ==========
 PKG_PRODUCT["fss-frontend"]="SoftSwitch"
 PKG_LEGACY["fss-frontend"]="softswitch-frontend"
 PKG_PORTS["fss-frontend"]=""
@@ -540,7 +540,7 @@ PKG_PORTS["fss-capagent"]=""
 PKG_API["fss-capagent"]=""
 PKG_DEPS["fss-capagent"]=""
 
-# ========== Product: Tarifficator ==========
+# ========== Продукт: Tarifficator ==========
 PKG_PRODUCT["ftr-frontend"]="Tarifficator"
 PKG_LEGACY["ftr-frontend"]="tarifficator-frontend"
 PKG_PORTS["ftr-frontend"]=""
@@ -577,7 +577,7 @@ PKG_PORTS["ftr-web"]=""
 PKG_API["ftr-web"]=""
 PKG_DEPS["ftr-web"]="nginx"
 
-# ========== Product: IVR ==========
+# ========== Продукт: IVR ==========
 PKG_PRODUCT["ivr-frontend"]="IVR"
 PKG_LEGACY["ivr-frontend"]=""
 PKG_PORTS["ivr-frontend"]=""
@@ -590,7 +590,7 @@ PKG_PORTS["ivr-backend"]=""
 PKG_API["ivr-backend"]=""
 PKG_DEPS["ivr-backend"]=""
 
-# ========== Product: LC ==========
+# ========== Продукт: LC ==========
 PKG_PRODUCT["lc-frontend"]="LC"
 PKG_LEGACY["lc-frontend"]="lc-softswitch-frontend"
 PKG_PORTS["lc-frontend"]=""
@@ -603,7 +603,7 @@ PKG_PORTS["lc-backend"]=""
 PKG_API["lc-backend"]=""
 PKG_DEPS["lc-backend"]=""
 
-# ========== Product: SMS ==========
+# ========== Продукт: SMS ==========
 PKG_PRODUCT["flat-sms"]="SMS"
 PKG_LEGACY["flat-sms"]=""
 PKG_PORTS["flat-sms"]=""
@@ -616,7 +616,7 @@ PKG_PORTS["flat-smpp"]=""
 PKG_API["flat-smpp"]=""
 PKG_DEPS["flat-smpp"]=""
 
-# ========== Product: LDAP ==========
+# ========== Продукт: LDAP ==========
 PKG_PRODUCT["fbr-frontend"]="LDAP"
 PKG_LEGACY["fbr-frontend"]="fpbf-frontend"
 PKG_PORTS["fbr-frontend"]=""
@@ -647,7 +647,7 @@ PKG_PORTS["flat-transfer-server"]=""
 PKG_API["flat-transfer-server"]=""
 PKG_DEPS["flat-transfer-server"]=""
 
-# ========== Product: SBC ==========
+# ========== Продукт: SBC ==========
 PKG_PRODUCT["sbc-backend"]="SBC"
 PKG_LEGACY["sbc-backend"]="flat.sbc.backend"
 PKG_PORTS["sbc-backend"]=""
@@ -666,7 +666,7 @@ PKG_PORTS["sbc-frontend"]=""
 PKG_API["sbc-frontend"]=""
 PKG_DEPS["sbc-frontend"]="nginx"
 
-# ========== Product: Portal ==========
+# ========== Продукт: Portal ==========
 PKG_PRODUCT["fpl-backend"]="Portal"
 PKG_LEGACY["fpl-backend"]=""
 PKG_PORTS["fpl-backend"]=""
@@ -691,15 +691,15 @@ PKG_PORTS["fsft-frontend"]=""
 PKG_API["fsft-frontend"]=""
 PKG_DEPS["fsft-frontend"]="nginx"
 
-# ========== Product: flat-file ==========
+# ========== Продукт: flat-file ==========
 PKG_PRODUCT["flat-file"]="flat-file"
 PKG_LEGACY["flat-file"]="flatFileManager,fss-file"
 PKG_PORTS["flat-file"]="8083"
 PKG_API["flat-file"]="/api/health"
 PKG_DEPS["flat-file"]="nginx"
 
-# --- 2. Print helpers ----------------------------------------------------------
-# (print_ok / print_warn / print_fail / print_info — used by health check)
+# --- 2. Хелперы вывода ----------------------------------------------------------
+# (print_ok / print_warn / print_fail / print_info — используются при проверке состояния)
 
 print_ok() {
     echo -e "${C_G}[OK]${C_N}    $1"
@@ -723,7 +723,7 @@ print_not_installed() {
     echo -e "${C_B}[INFO]${C_N}  $1 — not installed"
 }
 
-# Short aliases for log collector
+# Короткие псевдонимы для сборщика логов
 ok()  { echo -e "${C_G}[OK]${C_N}  $1"; }
 warn() { echo -e "${C_Y}[WARN]${C_N} $1"; }
 fail() { echo -e "${C_R}[FAIL]${C_N} $1"; }
@@ -731,7 +731,7 @@ info() { echo -e "${C_B}[INFO]${C_N} $1"; }
 
 die() { fail "$1"; cleanup 2>/dev/null; exit 1; }
 
-# --- 2b. Localization (_l) -----------------------------------------------------
+# --- 2b. Локализация (_l) --------------------------------------------------------
 _l() {
     local key="$1"
     case "$CURRENT_LANG" in
@@ -990,8 +990,8 @@ _l() {
     esac
 }
 
-# --- 3. OS / package manager ---------------------------------------------------
-# Detect OS and package manager
+# --- 3. ОС / пакетный менеджер ---------------------------------------------------
+# Определить ОС и пакетный менеджер
 detect_os() {
     OS_NAME="Unknown"
     OS_ID="unknown"
@@ -1006,7 +1006,7 @@ detect_os() {
         OS_FULL_VER="${PRETTY_NAME:-$NAME}"
     fi
 
-    # Distro-specific version files for more precise release info
+    # Специфичные для дистрибутива файлы версий для более точного определения релиза
     local ver_files=(
         "/etc/astra_version"
         "/etc/centos-release"
@@ -1023,15 +1023,15 @@ detect_os() {
         local ver_content
         ver_content=$(head -1 "$vf" 2>/dev/null | tr -d '\n')
         [[ -z "$ver_content" ]] && continue
-        # Update OS_NAME from release file if still unknown
+        # Обновить OS_NAME из файла релиза, если ещё не определено
         if [[ "$OS_NAME" == "Unknown" ]]; then
             OS_NAME=$(echo "$ver_content" | sed 's/ release.*//' | sed 's/ Linux//')
         fi
-        # Extract version number
+        # Извлечь номер версии
         local ver_num
         ver_num=$(echo "$ver_content" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
         [[ -n "$ver_num" ]] && OS_FULL_VER="$OS_NAME $ver_num"
-        # For Debian, /etc/debian_version has just the number
+        # Для Debian /etc/debian_version содержит только номер
         if [[ "$vf" == "/etc/debian_version" && -z "$ver_num" ]]; then
             ver_num=$(echo "$ver_content" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
             [[ -n "$ver_num" ]] && OS_FULL_VER="$OS_NAME $ver_num"
@@ -1058,8 +1058,8 @@ detect_os() {
     echo ""
 }
 
-# --- 3b. System metrics (host overview for dashboard / health JSON) ------------
-# Always prints === System === block; missing data → n/a (never skip the section).
+# --- 3b. Системные метрики (обзор хоста для дашборда / health JSON) ------------
+# Всегда печатает блок === System ===; отсутствующие данные → n/a (секция никогда не пропускается).
 
 _sys_installed_pkgs() {
     local pkg
@@ -1070,7 +1070,7 @@ _sys_installed_pkgs() {
     done
 }
 
-# Sum %cpu or %mem for PIDs (ps field: pcpu|pmem). Prints float or empty.
+# Суммирует %cpu или %mem по PID (поле ps: pcpu|pmem). Печатает число или пусто.
 _sys_pids_pct_sum() {
     local field="$1"
     shift
@@ -1085,12 +1085,12 @@ _sys_pids_pct_sum() {
     echo "$tot"
 }
 
-# Escape a string for use inside a basic extended regex (pgrep -f)
+# Экранирует строку для использования в базовом расширенном regex (pgrep -f)
 _sys_regex_escape() {
     printf '%s' "$1" | sed 's/[][(){}.^$*+?|\\]/\\&/g'
 }
 
-# Candidate process/unit names for a package (canonical + legacy aliases)
+# Кандидаты имён процесса/юнита для пакета (каноническое имя + legacy-алиасы)
 _sys_pkg_names() {
     local pkg="$1" legacy name
     echo "$pkg"
@@ -1104,7 +1104,7 @@ _sys_pkg_names() {
     done
 }
 
-# PIDs for a package name (exact + path-ish pgrep, systemd MainPID; legacy units too)
+# PID для имени пакета (точный pgrep + pgrep по похожему пути, systemd MainPID; также legacy-юниты)
 _sys_pkg_pids() {
     local pkg="$1"
     local pids=() pid name esc
@@ -1133,7 +1133,7 @@ _sys_cpu() {
     local usage="" idle us top_parts=() pkg pct
     local -a pids=()
 
-    # Prefer /proc/stat delta (defined later; resolved at call time)
+    # Предпочитать дельту /proc/stat (определяется ниже; разрешается в момент вызова)
     if declare -F _get_cpu_usage_percent >/dev/null 2>&1; then
         _get_cpu_usage_percent >/dev/null
         sleep 0.25
@@ -1179,7 +1179,7 @@ _sys_cpu() {
 _sys_memory() {
     local total used avail pct top_parts=() pkg mem
     local -a pids=()
-    # Prefer /proc/meminfo (stable columns); free -m as fallback
+    # Предпочитать /proc/meminfo (стабильные колонки); free -m как запасной вариант
     read -r total used avail < <(awk '
         /MemTotal:/ {t=$2}
         /MemAvailable:/ {a=$2}
@@ -1218,14 +1218,14 @@ _sys_disk() {
     local line fs size used avail usep mount count=0 hline hsize hused havail
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        # df -P: Filesystem 1024-blocks Used Available Capacity Mounted
+        # df -P: столбцы Filesystem 1024-blocks Used Available Capacity Mounted
         fs=$(echo "$line" | awk '{print $1}')
         size=$(echo "$line" | awk '{print $2}')
         used=$(echo "$line" | awk '{print $3}')
         avail=$(echo "$line" | awk '{print $4}')
         usep=$(echo "$line" | awk '{print $5}')
         mount=$(echo "$line" | awk '{print $6}')
-        # human-readable via df -h for display
+        # человекочитаемый вид через df -h для отображения
         hline=$(df -hP "$mount" 2>/dev/null | awk 'NR==2{print}')
         if [[ -n "$hline" ]]; then
             hsize=$(echo "$hline" | awk '{print $2}')
@@ -1279,7 +1279,7 @@ _sys_database() {
                             cluster="replication=none replicas=0"
                         fi
                     else
-                        # Standby: lag vs primary from local replay timestamp
+                        # Standby: лаг относительно primary по локальному replay timestamp
                         lag=$(_sys_psql "SELECT COALESCE(EXTRACT(EPOCH FROM (now()-pg_last_xact_replay_timestamp()))::int, 0)")
                         [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]] && lag="n/a"
                         if [[ "$lag" == "n/a" ]]; then
@@ -1300,7 +1300,7 @@ _sys_database() {
         fi
     fi
 
-    # Fallback: package present but systemd unknown
+    # Запасной вариант: пакет присутствует, но systemd не определён
     if [[ "$db" == "n/a" ]]; then
         if command -v psql &>/dev/null || [[ -d /var/lib/postgresql ]]; then
             db="postgresql present (service status n/a)"
@@ -1360,7 +1360,7 @@ _sys_certificates() {
     fi
 
     while IFS= read -r -d '' cert; do
-        # Skip CA bundle dumps and huge hashed dir noise: only leaf-looking names
+        # Пропускаем дампы CA bundle и мусор хешированных директорий: только похожие на конечные имена
         case "$(basename "$cert")" in
             ca-certificates.crt|*.0) continue ;;
         esac
@@ -1381,7 +1381,7 @@ _sys_certificates() {
         for root in "${roots[@]}"; do
             [[ -d "$root" ]] || continue
             if [[ "$root" == /etc/ssl/certs ]]; then
-                # only explicitly named certs, not hash symlinks
+                # только явно именованные сертификаты, не хеш-симлинки
                 find "$root" -maxdepth 1 -type f \( -name '*.crt' -o -name '*.pem' \) ! -name 'ca-certificates.crt' -print0 2>/dev/null
             elif [[ "$root" == /opt/flat ]]; then
                 find "$root" -maxdepth 5 \( -path '*/ssl/*' -o -path '*/certs/*' -o -path '*/tls/*' \) \
@@ -1452,7 +1452,7 @@ check_system() {
     echo "=== System ==="
     tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/flat_sys.XXXXXX" 2>/dev/null) || tmpdir="/tmp/flat_sys.$$"
     mkdir -p "$tmpdir" 2>/dev/null || true
-    # Parallel host probes while cpu/memory take their samples (sleep)
+    # Параллельные пробы хоста, пока cpu/memory снимают свои замеры (sleep)
     (_sys_disk > "$tmpdir/disk") &
     pid_disk=$!
     (_sys_database > "$tmpdir/database") &
@@ -1467,7 +1467,7 @@ check_system() {
     wait "$pid_db" 2>/dev/null || true
     wait "$pid_net" 2>/dev/null || true
     wait "$pid_certs" 2>/dev/null || true
-    # Stable dashboard order; reclaim WARN counts lost in subshells
+    # Стабильный порядок для дашборда; восстанавливаем счётчики WARN, потерянные в subshell'ах
     for f in disk database network certs; do
         if [[ -f "$tmpdir/$f" ]]; then
             cat "$tmpdir/$f"
@@ -1479,7 +1479,7 @@ check_system() {
     rm -rf -- "$tmpdir" 2>/dev/null
 }
 
-# Get package real dependencies from PM
+# Получить реальные зависимости пакета из PM
 get_pkg_depends() {
     local pkg="$1"
     local deps=""
@@ -1499,11 +1499,11 @@ get_pkg_depends() {
         deps=$(rpm -qR "$pkg" 2>/dev/null | grep -v "^rpmlib(" | grep -v "^/" | grep -v "^config" | grep -v "^config(" | grep -vi "^package" | grep -vi "^пакет" | sed 's/ .*$//' | sort -u | tr '\n' ', ' | sed 's/, $//')
     fi
 
-    # Clean: remove version constraints, alternatives, keep only package names
+    # Очистка: убрать версионные ограничения, альтернативы, оставить только имена пакетов
     echo "$deps" | tr ',' '\n' | sed 's/|.*$//' | sed 's/([^)]*)//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | grep -v '^[0-9]' | grep -v '^(' | grep -v '^)' | grep -v '^<' | grep -v '^>' | grep -v '^=' | sort -u | tr '\n' ',' | sed 's/^,//;s/,$//'
 }
 
-# Get package version from PM
+# Получить версию пакета из PM
 get_pkg_version() {
     local pkg="$1"
     local ver=""
@@ -1519,7 +1519,7 @@ get_pkg_version() {
     echo "$ver"
 }
 
-# Check if a dependency is installed
+# Проверить, установлена ли зависимость
 is_dep_installed() {
     local dep="$1"
     if [[ "$PM" == "dpkg" ]]; then
@@ -1533,7 +1533,7 @@ is_dep_installed() {
     fi
 }
 
-# Get dependency version
+# Получить версию зависимости
 get_dep_version() {
     local dep="$1"
     local ver=""
@@ -1549,20 +1549,20 @@ get_dep_version() {
     echo "$ver"
 }
 
-# Check service status for a dependency (returns description string)
+# Проверить статус службы для зависимости (возвращает строку-описание)
 check_dep_service() {
     local dep="$1"
     local svc=""
     local result=""
 
-    # Map common package names to service names
+    # Соответствие распространённых имён пакетов именам служб
     case "$dep" in
         nginx) svc="nginx" ;;
         redis|redis-server) svc="redis-server" ;;
         mariadb|mysql-server|mariadb-server) svc="mariadb" ;;
         postgresql|postgresql-*) svc="postgresql" ;;
         rabbitmq-server|rabbitmq) svc="rabbitmq-server" ;;
-        sudo) return 0 ;;  # sudo has no service
+        sudo) return 0 ;;  # у sudo нет службы
         *) return 0 ;;
     esac
 
@@ -1578,14 +1578,14 @@ check_dep_service() {
     echo "$result"
 }
 
-# Collect dependency into global ALL_DEPENDS array (dep -> "pkg1,pkg2")
+# Собрать зависимость в глобальный массив ALL_DEPENDS (dep -> "pkg1,pkg2")
 register_dep() {
     local dep="$1"
     local pkg="$2"
     dep=$(echo "$dep" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [[ -z "$dep" ]] && return
 
-    # Skip non-package dependencies (files, paths, versioned strings, self, config, RPM capabilities)
+    # Пропускаем непакетные зависимости (файлы, пути, версионные строки, сам пакет, config, RPM capabilities)
     [[ "$dep" == /* ]] && return
     [[ "$dep" == *"("* ]] && return
     [[ "$dep" == *"|"* ]] && return
@@ -1608,7 +1608,7 @@ register_dep() {
     fi
 }
 
-# Check if package is installed using PM (verbose, prints status)
+# Проверить, установлен ли пакет через PM (подробно, печатает статус)
 check_pkg_installed() {
     local pkg="$1"
     local legacy="$2"
@@ -1655,7 +1655,7 @@ check_pkg_installed() {
         fi
     fi
 
-    # Check legacy names
+    # Проверить legacy-имена
     if [[ -n "$legacy" ]]; then
         local old
         for old in $(echo "$legacy" | tr ',' ' '); do
@@ -1702,7 +1702,7 @@ has_any_trace() {
     [[ -f "/usr/lib/systemd/system/${unit}" ]] || [[ -f "/etc/systemd/system/${unit}" ]] || [[ -f "/lib/systemd/system/${unit}" ]] || [[ -d "/opt/flat/${pkg}" ]]
 }
 
-# Silent quick check if package is installed (returns 0/1, no output)
+# Тихая быстрая проверка установки пакета (возвращает 0/1, без вывода)
 is_pkg_installed() {
     is_pkg_installed_tiny "$@"
 }
@@ -1736,12 +1736,12 @@ is_pkg_installed_tiny() {
         apk info -e "$pkg" &>/dev/null && return 0
     fi
 
-    # Check traces (unit file or /opt/flat dir)
+    # Проверить следы (unit-файл или директория /opt/flat)
     has_any_trace "$pkg" && return 0
     return 1
 }
 
-# Check systemd unit
+# Проверить systemd unit
 check_systemd_unit() {
     local pkg="$1"
     local unit="${pkg}.service"
@@ -1780,7 +1780,7 @@ check_systemd_unit() {
     fi
 }
 
-# Try to find log path from known config files for a package
+# Попытаться найти путь к логу из известных конфиг-файлов пакета
 get_log_path_from_config() {
     local pkg="$1"
     local path=""
@@ -1820,23 +1820,23 @@ get_log_path_from_config() {
     echo "$path"
 }
 
-# Check log directory with freshness and config fallback
+# Проверить директорию логов со свежестью и запасным вариантом из конфига
 check_log_directory() {
     local pkg="$1"
     local log_dir="/var/log/flat/${pkg}"
     local found_log_dir=""
     local log_status=""
 
-    # Check if it's a symlink
+    # Проверить, является ли символьной ссылкой
     if [[ -L "$log_dir" ]]; then
         local target
         target=$(readlink -f "$log_dir" 2>/dev/null || readlink "$log_dir" 2>/dev/null)
         print_info "logdir: $log_dir is symlink -> $target"
-        # Use target for further checks
+        # Использовать целевой путь для дальнейших проверок
         log_dir="$target"
     fi
 
-    # Check default path
+    # Проверить путь по умолчанию
     if [[ -d "$log_dir" ]]; then
         if find -L "$log_dir" -maxdepth 1 -type f -mmin -300 2>/dev/null | head -1 | grep -q .; then
             print_ok "logdir: $log_dir exists (fresh logs)"
@@ -1857,7 +1857,7 @@ check_log_directory() {
         return 0
     fi
 
-    # Problem with default path — check if process is active
+    # Проблема с путём по умолчанию — проверить, активен ли процесс
     local is_active=0
     if pgrep -x "$pkg" &>/dev/null || pgrep -f "$pkg" &>/dev/null; then
         is_active=1
@@ -1889,9 +1889,9 @@ check_log_directory() {
         fi
     fi
 
-    # Process is active and we have a problem — try to find log path from config
-    # Only needed for empty/missing; for stale the default path exists but is old.
-    # For stale: only fallback if we know a config for this pkg (skip if unknown).
+    # Процесс активен и есть проблема — попытаться найти путь к логу из конфига
+    # Нужно только для empty/missing; для stale путь по умолчанию существует, но устарел.
+    # Для stale: запасной вариант только если известен конфиг для этого пакета (иначе пропуск).
     if [[ "$log_status" == "stale" ]]; then
         return 0
     fi
@@ -1918,7 +1918,7 @@ check_log_directory() {
     fi
 }
 
-# Check opt directory and permissions
+# Проверить директорию opt и права доступа
 check_opt_directory() {
     local pkg="$1"
     local opt_dir="/opt/flat/${pkg}"
@@ -1933,7 +1933,7 @@ check_opt_directory() {
     fi
 }
 
-# Check configuration files
+# Проверить конфигурационные файлы
 check_configs() {
     local pkg="$1"
     local nginx_avail="/etc/nginx/sites-available/${pkg}"
@@ -1959,7 +1959,7 @@ check_configs() {
     fi
 }
 
-# Check process by name or pattern
+# Проверить процесс по имени или паттерну
 check_process() {
     local pkg="$1"
     local pids
@@ -1980,7 +1980,7 @@ check_process() {
     fi
 }
 
-# Check network ports
+# Проверить сетевые порты
 check_ports() {
     local pkg="$1"
     local ports_spec="${PKG_PORTS[$pkg]:-}"
@@ -2022,7 +2022,7 @@ check_ports() {
     done
 }
 
-# Check API health
+# Проверить состояние API
 check_api_health() {
     local pkg="$1"
     local endpoint="${PKG_API[$pkg]:-}"
@@ -2051,8 +2051,8 @@ check_api_health() {
     fi
 }
 
-# --- 4. Per-package health checks ----------------------------------------------
-# Register PKG_DEPS + PM depends into ALL_DEPENDS (first pass before parallel checks)
+# --- 4. Проверки состояния по пакетам -------------------------------------------
+# Зарегистрировать PKG_DEPS + зависимости PM в ALL_DEPENDS (первый проход перед параллельными проверками)
 _register_pkg_deps() {
     local pkg="$1"
     local deps_meta="${PKG_DEPS[$pkg]:-}"
@@ -2071,12 +2071,12 @@ _register_pkg_deps() {
     fi
 }
 
-# Single package check (respects VERBOSE)
+# Проверка одного пакета (учитывает VERBOSE)
 check_single_pkg() {
     local pkg="$1"
     local legacy="${PKG_LEGACY[$pkg]:-}"
 
-    # Quick silent check for not installed packages
+    # Быстрая тихая проверка для не установленных пакетов
     if ! is_pkg_installed_tiny "$pkg" "$legacy"; then
         if [[ $VERBOSE -eq 1 ]]; then
             echo "=$pkg="
@@ -2095,7 +2095,7 @@ check_single_pkg() {
 
     echo "=$pkg="
 
-    # Package is installed (or has traces) — print full details
+    # Пакет установлен (или есть следы) — печатаем полные детали
     check_pkg_installed "$pkg" "$legacy"
     local rc=$?
 
@@ -2106,12 +2106,12 @@ check_single_pkg() {
         return 1
     fi
 
-    # Print version separately
+    # Печатаем версию отдельно
     if [[ -n "$FOUND_PKG_VER" ]]; then
         print_info "version: ${FOUND_PKG_VER}"
     fi
 
-    # Print and collect dependencies (registration usually done in first pass)
+    # Печатаем и собираем зависимости (регистрация обычно уже сделана на первом проходе)
     local deps_meta="${PKG_DEPS[$pkg]:-}"
     local deps_real=""
     if [[ -n "$deps_meta" ]]; then
@@ -2121,10 +2121,10 @@ check_single_pkg() {
         done
     fi
 
-    # Try to get real dependencies from package manager
+    # Пытаемся получить реальные зависимости из пакетного менеджера
     deps_real=$(get_pkg_depends "$pkg" 2>/dev/null)
     if [[ -n "$deps_real" ]]; then
-        # Show real depends only if different from meta
+        # Показываем реальные depends только если отличаются от meta
         if [[ "$deps_real" != "$deps_meta" ]]; then
             print_info "depends (PM): ${deps_real}"
         fi
@@ -2144,7 +2144,7 @@ check_single_pkg() {
     return 0
 }
 
-# Run checks for a single product (parallel pkgs, buffered ordered output)
+# Запуск проверок для одного продукта (параллельные пакеты, буферизованный упорядоченный вывод)
 run_product_checks() {
     local product="$1"
     local installed_count=0
@@ -2180,7 +2180,7 @@ run_product_checks() {
     echo ""
     echo "=== $product ==="
 
-    # Sort package names for stable job_idx ↔ print mapping
+    # Сортируем имена пакетов для устойчивого соответствия job_idx ↔ вывод
     IFS=$'\n' product_pkgs=($(printf '%s\n' "${product_pkgs[@]}" | sort)); unset IFS
 
     max_jobs=$(_collector_max_jobs)
@@ -2202,7 +2202,7 @@ run_product_checks() {
     done
     _collector_wait_all_jobs
 
-    # Print in package order; reclaim counters lost in subshells (Summary / Zabbix)
+    # Печатаем в порядке пакетов; восстанавливаем счётчики, потерянные в subshell'ах (Summary / Zabbix)
     job_idx=0
     for pkg in "${product_pkgs[@]}"; do
         job_idx=$((job_idx + 1))
@@ -2222,7 +2222,7 @@ run_product_checks() {
     rm -rf -- "$tmpdir" 2>/dev/null
 }
 
-# Check if a shared library file exists in standard lib paths
+# Проверить, существует ли файл разделяемой библиотеки в стандартных lib-путях
 is_lib_available() {
     local lib="$1"
     for path in /usr/lib64 /lib64 /usr/lib /lib; do
@@ -2231,8 +2231,8 @@ is_lib_available() {
     return 1
 }
 
-# --- 5. Infrastructure + repositories ------------------------------------------
-# Check all collected dependencies (Infrastructure)
+# --- 5. Инфраструктура + репозитории --------------------------------------------
+# Проверить все собранные зависимости (Infrastructure)
 check_infrastructure() {
     echo ""
     echo "=== Infrastructure ==="
@@ -2240,7 +2240,7 @@ check_infrastructure() {
     local has_any=0
     local dep_list=()
 
-    # Sort unique dependencies
+    # Сортируем уникальные зависимости
     for dep in "${!ALL_DEPENDS[@]}"; do
         dep_list+=("$dep")
         ((has_any++))
@@ -2259,7 +2259,7 @@ check_infrastructure() {
         local svc_status=""
         local dep_found=0
 
-        # Shared libraries: check file existence in lib paths (RHEL/ReOS 7.3 uses /usr/lib64/)
+        # Разделяемые библиотеки: проверяем наличие файла в lib-путях (RHEL/ReOS 7.3 использует /usr/lib64/)
         if [[ "$dep" == *.so.* ]]; then
             if is_lib_available "$dep"; then
                 print_ok "$dep: library found"
@@ -2436,14 +2436,14 @@ check_infrastructure() {
     done
 }
 
-# Check repositories
+# Проверить репозитории
 
 check_repositories() {
     echo ""
     echo "=== Repositories ==="
 
     if [[ "$PM" == "dpkg" ]]; then
-        # APT sources
+        # Источники APT
         if [[ -f /etc/apt/sources.list ]]; then
             while IFS= read -r line; do
                 [[ -z "$line" ]] && continue
@@ -2461,7 +2461,7 @@ check_repositories() {
             done < "$f"
         done
 
-        # APT priorities via apt-cache policy (if available)
+        # Приоритеты APT через apt-cache policy (если доступно)
         if command -v apt-cache &>/dev/null; then
             local policy
             policy=$(apt-cache policy 2>/dev/null | grep -E '^\s+[0-9]+' | head -20)
@@ -2475,7 +2475,7 @@ check_repositories() {
         fi
 
     elif [[ "$PM" == "rpm" ]]; then
-        # YUM/DNF repos
+        # Репозитории YUM/DNF
         if command -v yum &>/dev/null; then
             local repolist
             repolist=$(yum repolist 2>/dev/null | tail -n +2 | grep -v "^repolist" | head -30)
@@ -2497,16 +2497,16 @@ check_repositories() {
     fi
 }
 
-# Summary
+# Итоги
 print_summary() {
     echo ""
     echo "=== Summary ==="
     print_info "Installed: $INSTALLED | Errors: $ERRORS | Warnings: $WARNINGS"
 }
 
-# --- 6. Log directory discovery ------------------------------------------------
-# Allowlisted paths only: PKG_PRODUCT (+ PKG_LEGACY) via find_log_dirs_for_pkg.
-# Unknown dirs under /var/log/flat (e.g. logforflat) are skipped.
+# --- 6. Поиск директорий логов --------------------------------------------------
+# Только пути из белого списка: PKG_PRODUCT (+ PKG_LEGACY) через find_log_dirs_for_pkg.
+# Неизвестные директории внутри /var/log/flat (например, logforflat) пропускаются.
 
 _log_dir_add_unique() {
     local candidate="$1"
@@ -2523,7 +2523,7 @@ _log_dir_add_unique() {
 _log_path_to_dir() {
     local path="$1"
     [[ -z "$path" ]] && return 1
-    # Expand leading ~ only (avoid eval on config-controlled paths)
+    # Разворачиваем только ведущий ~ (избегаем eval на путях из конфига)
     [[ "$path" == "~" ]] && path="$HOME"
     [[ "$path" == "~/"* ]] && path="$HOME/${path:2}"
     if [[ -d "$path" ]]; then
@@ -2560,7 +2560,7 @@ _parse_log_path_from_config_file() {
     _log_path_to_dir "$path"
 }
 
-# Normalize product/service name for fuzzy match: lower, strip spaces/_/-
+# Нормализовать имя продукта/службы для нечёткого сравнения: в нижний регистр, убрать пробелы/_/-
 _norm_target_name() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]_-'
 }
@@ -2603,7 +2603,7 @@ _pkg_present_on_host() {
 }
 
 _pkg_add_unique_to() {
-    # $1 = nameref-like array name via eval; simpler: use global SELECTED_PKGS
+    # $1 = имя массива в стиле nameref через eval; проще: использовать глобальный SELECTED_PKGS
     local pkg="$1" e
     for e in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
         [[ "$e" == "$pkg" ]] && return 1
@@ -2612,7 +2612,7 @@ _pkg_add_unique_to() {
     return 0
 }
 
-# True if canonical product name matches user input (exact or normalized)
+# Истина, если каноническое имя продукта совпадает с вводом пользователя (точно или нормализованно)
 _product_name_matches() {
     local want="$1" have="$2"
     [[ -z "$want" || -z "$have" ]] && return 1
@@ -2621,7 +2621,7 @@ _product_name_matches() {
     return 1
 }
 
-# Resolve user product string to canonical PKG_PRODUCT value (or empty)
+# Разрешить строку продукта от пользователя в каноническое значение PKG_PRODUCT (или пусто)
 _resolve_product_canonical() {
     local want="$1" prod
     local -A seen=()
@@ -2636,7 +2636,7 @@ _resolve_product_canonical() {
     return 1
 }
 
-# Resolve service/pkg string to a PKG_PRODUCT key
+# Разрешить строку службы/пакета в ключ PKG_PRODUCT
 _resolve_service_canonical() {
     local want="$1" pkg alias
     for pkg in "${!PKG_PRODUCT[@]}"; do
@@ -2650,7 +2650,7 @@ _resolve_service_canonical() {
     return 1
 }
 
-# Fill SELECTED_PKGS from SELECTED_PRODUCTS / SELECTED_SERVICES (or all present pkgs)
+# Заполнить SELECTED_PKGS из SELECTED_PRODUCTS / SELECTED_SERVICES (либо все присутствующие пакеты)
 resolve_selected_packages() {
     SELECTED_PKGS=()
     local prod pkg canon want
@@ -2690,7 +2690,7 @@ resolve_selected_packages() {
     fi
 }
 
-# True if current selection includes SoftSwitch (product or any SoftSwitch package)
+# Истина, если текущий выбор включает SoftSwitch (продукт или любой пакет SoftSwitch)
 _selection_includes_softswitch() {
     local pkg want
     for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
@@ -2706,7 +2706,7 @@ _selection_includes_softswitch() {
     return 1
 }
 
-# Discover mgcpclient log dirs (not in PKG_PRODUCT allowlist)
+# Найти директории логов mgcpclient (не входят в белый список PKG_PRODUCT)
 _find_mgcpclient_log_dirs() {
     local d target
     local -A seen=()
@@ -2724,8 +2724,8 @@ _find_mgcpclient_log_dirs() {
     done
 }
 
-# Ask / apply SoftSwitch → mgcpclient inclusion; fills EXTRA_LOG_DIRS when yes
-# quiet=1: refill EXTRA_LOG_DIRS only, no prompt/spam (INCLUDE already decided)
+# Спросить / применить включение SoftSwitch → mgcpclient; заполняет EXTRA_LOG_DIRS при согласии
+# quiet=1: только перезаполнить EXTRA_LOG_DIRS, без запроса/спама (INCLUDE уже решён)
 _resolve_mgcpclient_option() {
     local quiet="${1:-0}"
     EXTRA_LOG_DIRS=()
@@ -2733,7 +2733,7 @@ _resolve_mgcpclient_option() {
 
     if [[ -z "${INCLUDE_MGCPCLIENT}" ]]; then
         if [[ "$quiet" -eq 1 ]]; then
-            # Second pass without a prior decision — skip silently
+            # Второй проход без предварительного решения — тихо пропускаем
             INCLUDE_MGCPCLIENT=0
         elif [[ -t 0 ]]; then
             echo ""
@@ -2772,7 +2772,7 @@ _resolve_mgcpclient_option() {
     MGCPCLIENT_RESOLVED=1
 }
 
-# Print products/services available on this host
+# Вывести продукты/службы, доступные на этом хосте
 list_log_targets() {
     local pkg prod
     local -A prod_pkgs=()
@@ -2802,7 +2802,7 @@ list_log_targets() {
     done
 }
 
-# Report unknown dirs under /var/log/flat (junk like logforflat) — once per run
+# Сообщить о неизвестных директориях внутри /var/log/flat (мусор вроде logforflat) — один раз за запуск
 _report_skipped_unknown_flat_dirs() {
     local d base
     [[ "${SKIP_UNKNOWN_FLAT_REPORTED:-0}" -eq 1 ]] && return 0
@@ -2811,7 +2811,7 @@ _report_skipped_unknown_flat_dirs() {
     for d in /var/log/flat/*/; do
         [[ -d "$d" ]] || continue
         base=$(basename "$d")
-        # mgcpclient is optional SoftSwitch extra — not "unknown junk"
+        # mgcpclient — опциональное дополнение SoftSwitch, а не «неизвестный мусор»
         [[ "$base" == "mgcpclient" ]] && continue
         if ! _is_known_log_basename "$base"; then
             info "skip unknown: $base"
@@ -2855,7 +2855,7 @@ find_log_dirs_for_pkg() {
     printf '%s\n' "${found_dirs[@]}"
 }
 
-# Build DISCOVERED_LOG_DIRS from SELECTED_PKGS (allowlist only) + EXTRA_LOG_DIRS
+# Построить DISCOVERED_LOG_DIRS из SELECTED_PKGS (только белый список) + EXTRA_LOG_DIRS
 discover_log_dirs_for_selected() {
     DISCOVERED_LOG_DIRS=()
     local pkg d
@@ -2874,14 +2874,14 @@ discover_log_dirs_for_selected() {
     done
 
     for d in "${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}"; do
-        # Include dirs that have any log-like files (incl. .gz). Online skips .gz at tail time.
+        # Включаем директории, где есть похожие на логи файлы (включая .gz). Online пропускает .gz при tail.
         _dir_has_any_log_files "$d" && result+=("$d")
     done
     DISCOVERED_LOG_DIRS=("${result[@]+"${result[@]}"}")
     printf '%s\n' "${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}"
 }
 
-# Resolve selection (CLI/wizard filters or all present pkgs) → dirs
+# Разрешить выбор (фильтры CLI/мастера либо все присутствующие пакеты) → директории
 discover_all_log_dirs() {
     resolve_selected_packages
     discover_log_dirs_for_selected
@@ -2905,15 +2905,15 @@ is_log_like_file() {
     esac
 }
 
-# True if basename looks like SoftSwitch mgcpclient dump (mgcpclient_2.txt, …)
+# Истина, если базовое имя похоже на дамп SoftSwitch mgcpclient (mgcpclient_2.txt, …)
 _is_mgcpclient_log_file() {
     local base
     base=$(basename "$1")
     [[ "$base" == mgcpclient || "$base" == mgcpclient.* || "$base" == mgcpclient_* ]]
 }
 
-# find_log_files_in_dir respects INCLUDE_MGCPCLIENT: when not 1, skip mgcpclient* files
-# Online: also skip *.gz (tail -F cannot follow gzip content)
+# find_log_files_in_dir учитывает INCLUDE_MGCPCLIENT: если не 1, пропускает файлы mgcpclient*
+# Online: также пропускаем *.gz (tail -F не может следить за содержимым gzip)
 find_log_files_in_dir() {
     local src_dir="$1" f
     [[ -d "$src_dir" ]] || return 0
@@ -2930,7 +2930,7 @@ find_log_files_in_dir() {
     \) -print0 2>/dev/null)
 }
 
-# True if dir has any collectable log-like file (including .gz) — for discovery
+# Истина, если в директории есть хоть один собираемый похожий-на-лог файл (включая .gz) — для поиска
 _dir_has_any_log_files() {
     local d="$1" f
     [[ -d "$d" ]] || return 1
@@ -2945,14 +2945,14 @@ _dir_has_any_log_files() {
     return 1
 }
 
-# True if dir has files collectable in current mode (online: no .gz)
+# Истина, если в директории есть файлы, собираемые в текущем режиме (online: без .gz)
 has_log_files() {
     local d="$1"
     [[ -d "$d" ]] || return 1
     [[ -n "$(find_log_files_in_dir "$d" | head -c 1)" ]]
 }
 
-# --- 7. PostgreSQL log discovery -----------------------------------------------
+# --- 7. Поиск логов PostgreSQL ---------------------------------------------------
 find_pg_log_files_in_dir() {
     local src_dir="$1" f
     [[ -d "$src_dir" ]] || return 0
@@ -3146,8 +3146,8 @@ _collector_should_stop() {
     [[ "${COLLECTOR_ABORTED:-0}" -eq 1 || "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]
 }
 
-# Wait until user stops online collection (Enter) or TERM (timeout / disk guard).
-# Caller must ensure non-TTY online has timeout_sec > 0 before starting tails.
+# Ждём, пока пользователь не остановит online-сбор (Enter) или не придёт TERM (timeout / диск-guard).
+# Вызывающий код должен обеспечить, что non-TTY online имеет timeout_sec > 0 перед запуском tail'ов.
 _online_wait_for_stop() {
     if [[ -t 0 ]]; then
         while [[ "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 0 && "${COLLECTOR_ABORTED:-0}" -eq 0 ]]; do
@@ -3217,7 +3217,7 @@ time_to_epoch() {
     date -d "$1" "+%s" 2>/dev/null
 }
 
-# Shared awk body: parse timestamp → epoch (YYYY-MM-DD / DD.MM.YYYY)
+# Общее тело awk: парсинг timestamp → epoch (YYYY-MM-DD / DD.MM.YYYY)
 _AWK_LINE_EPOCH='
 function line_epoch(line, ts, n, p) {
     if (match(line, /[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
@@ -3255,29 +3255,29 @@ _file_size_bytes() {
     echo "${s:-0}"
 }
 
-# Epoch of a single log line (-1 if none)
+# Epoch одной строки лога (-1, если нет)
 _epoch_of_line() {
     local line="$1" ep
     [[ -z "$line" ]] && { echo -1; return; }
-    # SoftSwitch logs may contain NULs / non-UTF8; strip before bash/awk
+    # Логи SoftSwitch могут содержать NUL / не-UTF8; убираем перед bash/awk
     line="${line//$'\0'/}"
-    # Avoid SIGPIPE+pipefail when awk exits after one line
+    # Избегаем SIGPIPE+pipefail, когда awk завершается после одной строки
     ep=$(set +o pipefail
         printf '%s\n' "$line" | LC_ALL=C awk "$_AWK_LINE_EPOCH"' { print line_epoch($0); exit }')
     echo "${ep:--1}"
 }
 
-# Read one full line at/after byte offset (does not scan the rest of the file)
+# Прочитать одну полную строку в/после байтового смещения (не сканирует остаток файла)
 _probe_line_at_offset() {
     local file="$1" off="$2" line
     local probe="${SEEK_PROBE_BYTES:-131072}"
     if [[ "$off" -le 0 ]]; then
-        # tr drops NULs so command substitution does not warn
+        # tr убирает NUL, чтобы command substitution не выдавал предупреждение
         head -n 1 "$file" 2>/dev/null | tr -d '\0'
         return 0
     fi
-    # Stream dd→tr→awk: never store raw probe (with NULs) in a bash variable
-    # LC_ALL=C: avoid "Invalid multibyte data" on binary-ish log slices
+    # Поток dd→tr→awk: никогда не храним сырую пробу (с NUL) в bash-переменной
+    # LC_ALL=C: избегаем "Invalid multibyte data" на почти-бинарных срезах лога
     line=$(set +o pipefail
         dd if="$file" bs=65536 iflag=skip_bytes,count_bytes skip="$off" count="$probe" 2>/dev/null \
             | tr -d '\0' \
@@ -3291,7 +3291,7 @@ _probe_line_at_offset() {
     return 0
 }
 
-# True if first/mid/near-end timestamps are non-decreasing (typical append-only logs)
+# Истина, если timestamp'ы начала/середины/почти-конца не убывают (типично для append-only логов)
 _logs_appear_sorted() {
     local file="$1" size="$2"
     local e1 e2 e3 near_end line1 line2 line3
@@ -3307,12 +3307,12 @@ _logs_appear_sorted() {
     [[ "$e1" -le "$e2" && "$e2" -le "$e3" ]]
 }
 
-# Binary search: approximate byte offset of first line with epoch >= target
-# For a 30GB file this is ~35 probes × ~128KB ≈ a few MB of I/O (timegrep/archeolog style).
+# Бинарный поиск: приблизительное байтовое смещение первой строки с epoch >= target
+# Для файла в 30GB это ~35 проб × ~128KB ≈ несколько МБ I/O (в стиле timegrep/archeolog).
 _binsearch_offset_ge() {
     local file="$1" target="$2" size="$3"
     local lo=0 hi="$size" mid line ep
-    # Stop when window is small; must be << typical mid-size logs (selftest ~1–2MB)
+    # Останавливаемся, когда окно мало; должно быть много меньше типичных логов среднего размера (selftest ~1–2MB)
     local window="${SEEK_PROBE_BYTES:-131072}"
 
     while [[ $((hi - lo)) -gt "$window" ]]; do
@@ -3333,7 +3333,7 @@ _binsearch_offset_ge() {
     echo "$lo"
 }
 
-# Stream filter: print lines in [from,to]; if sorted=1 stop after to (and skip before from)
+# Потоковый фильтр: печатает строки в [from,to]; если sorted=1, останавливается после to (и пропускает до from)
 _awk_filter_range_prog() {
     local sorted="${1:-0}"
     printf '%s\n' "$_AWK_LINE_EPOCH"
@@ -3352,7 +3352,7 @@ BEGIN { in_range = 0; sorted = $sorted }
 EOF
 }
 
-# Align byte offset to the start of a line (after previous \n). Avoids splitting lines across chunks.
+# Выровнять байтовое смещение на начало строки (после предыдущего \n). Не даёт разрывать строки между чанками.
 _align_to_line_start() {
     local file="$1" off="$2" size="${3:-0}"
     local prev nskip
@@ -3371,7 +3371,7 @@ _align_to_line_start() {
     echo $((off + nskip))
 }
 
-# Extract one newline-aligned byte window → part file
+# Извлечь одно выровненное по \n байтовое окно → part-файл
 _extract_chunk_worker() {
     local file="$1" off="$2" len="$3" from_epoch="$4" to_epoch="$5" sorted="$6" part="$7"
     [[ "$len" -le 0 ]] && { : > "$part"; return 0; }
@@ -3381,7 +3381,7 @@ _extract_chunk_worker() {
         > "$part" 2>/dev/null || true
 }
 
-# Dedicated seek job pool — MUST NOT reuse COLLECTOR_JOB_PIDS (nested under copy workers → hang).
+# Выделенный пул задач seek — НЕЛЬЗЯ переиспользовать COLLECTOR_JOB_PIDS (вложенность под copy-воркерами → зависание).
 _SEEK_JOB_PIDS=()
 
 _seek_kill_jobs() {
@@ -3448,7 +3448,7 @@ _seek_wait_all_jobs() {
     _SEEK_JOB_PIDS=()
 }
 
-# Parallel chunk-scan of [start_off, end_off). Hang-safe (≥1 worker); line-aligned chunks.
+# Параллельное сканирование по чанкам [start_off, end_off). Безопасно от зависания (≥1 воркер); чанки выровнены по строкам.
 _filter_byte_range_parallel() {
     local file="$1" dest="$2" from_epoch="$3" to_epoch="$4"
     local start_off="$5" end_off="$6" sorted="${7:-1}"
@@ -3459,17 +3459,17 @@ _filter_byte_range_parallel() {
     range=$((end_off - start_off))
     size=$(_file_size_bytes "$file")
     max_jobs=$(_collector_max_jobs)
-    # Nested under a copy worker: leave headroom for sibling copy jobs
+    # Вложено под copy-воркер: оставляем запас для соседних copy-задач
     [[ "$max_jobs" -gt 4 ]] && max_jobs=$(( (max_jobs + 1) / 2 ))
     [[ "$max_jobs" -lt 1 ]] && max_jobs=1
     chunk_sz="${SEEK_CHUNK_BYTES:-67108864}"
 
-    # Mid-size windows: enough chunks to use several workers
+    # Окна среднего размера: чанков достаточно, чтобы задействовать несколько воркеров
     if [[ "$range" -lt $((chunk_sz * max_jobs)) ]]; then
         chunk_sz=$(( range / max_jobs + 1 ))
         [[ "$chunk_sz" -lt $((1024 * 1024)) ]] && chunk_sz=$((1024 * 1024))
     fi
-    # ≥1GB windows: keep large chunks (SoftSwitch monoliths)
+    # Окна ≥1GB: оставляем крупные чанки (монолиты SoftSwitch)
     if [[ "$range" -ge "${SEEK_HUGE_BYTES:-1073741824}" ]]; then
         chunk_sz="${SEEK_CHUNK_BYTES:-67108864}"
         [[ "$chunk_sz" -lt $((32 * 1024 * 1024)) ]] && chunk_sz=$((32 * 1024 * 1024))
@@ -3479,7 +3479,7 @@ _filter_byte_range_parallel() {
     [[ "$n" -lt 1 ]] && n=1
     [[ "$n" -gt 256 ]] && { chunk_sz=$(( (range + 255) / 256 )); n=$(( (range + chunk_sz - 1) / chunk_sz )); }
 
-    # Line-align chunk boundaries so no log line is split/lost
+    # Выравниваем границы чанков по строкам, чтобы ни одна строка лога не была разорвана/потеряна
     bounds=("$start_off")
     for (( i=1; i<n; i++ )); do
         off=$(_align_to_line_start "$file" $((start_off + i * chunk_sz)) "$size")
@@ -3523,11 +3523,11 @@ _filter_byte_range_parallel() {
     [[ -s "$dest" ]]
 }
 
-# Filter log lines by timestamp inside file content (YYYY-MM-DD / DD.MM.YYYY)
-# Strategy (operational speed on SoftSwitch-scale monoliths):
-#   1) If plain + looks sorted + size>=SEEK_MIN: bisect from/to offsets, then parallel chunk-scan
-#   2) Else if plain + size>=SEEK_MIN: parallel chunk-scan of whole file (unsorted-safe)
-#   3) Else: single-thread awk (small files / .gz via zcat)
+# Фильтровать строки лога по timestamp внутри содержимого файла (YYYY-MM-DD / DD.MM.YYYY)
+# Стратегия (рабочая скорость на монолитах масштаба SoftSwitch):
+#   1) Если обычный файл + похож на отсортированный + size>=SEEK_MIN: бисекция смещений from/to, затем параллельное сканирование по чанкам
+#   2) Иначе если обычный файл + size>=SEEK_MIN: параллельное сканирование по чанкам всего файла (безопасно для неотсортированных)
+#   3) Иначе: однопоточный awk (маленькие файлы / .gz через zcat)
 filter_log_file_by_range() {
     local src_file="$1" dest_file="$2"
     local from_epoch="$3" to_epoch="$4"
@@ -3544,14 +3544,14 @@ filter_log_file_by_range() {
             if _logs_appear_sorted "$src_file" "$size"; then
                 sorted=1
                 start_off=$(_binsearch_offset_ge "$src_file" "$from_epoch" "$size")
-                # End: first line strictly after to (to+1), then pad forward a bit
+                # Конец: первая строка строго после to (to+1), затем небольшой запас вперёд
                 end_off=$(_binsearch_offset_ge "$src_file" "$((to_epoch + 1))" "$size")
                 if [[ "$start_off" -gt "${SEEK_BACKOFF_BYTES:-1048576}" ]]; then
                     start_off=$((start_off - SEEK_BACKOFF_BYTES))
                 else
                     start_off=0
                 fi
-                # Include some bytes after approx end (last matching lines / multiline)
+                # Включаем немного байт после примерного конца (последние подходящие строки / многострочность)
                 end_off=$((end_off + SEEK_BACKOFF_BYTES))
                 [[ "$end_off" -gt "$size" ]] && end_off=$size
                 [[ "$end_off" -le "$start_off" ]] && end_off=$size
@@ -3559,14 +3559,14 @@ filter_log_file_by_range() {
                     "$start_off" "$end_off" 1
                 return $?
             fi
-            # Unsorted but large: parallel full-file chunk scan (no early-exit across file)
+            # Неотсортированный, но большой: параллельное сканирование по чанкам всего файла (без раннего выхода)
             _filter_byte_range_parallel "$src_file" "$dest_file" "$from_epoch" "$to_epoch" \
                 0 "$size" 0
             return $?
         fi
     fi
 
-    # Small files / gzip: single stream
+    # Маленькие файлы / gzip: единый поток
     $reader "$src_file" 2>/dev/null \
         | tr -d '\0' \
         | LC_ALL=C awk -v from="$from_epoch" -v to="$to_epoch" "$(_awk_filter_range_prog 0)" \
@@ -3576,8 +3576,8 @@ filter_log_file_by_range() {
     [[ -s "$dest_file" ]]
 }
 
-# Grep-based fallback for syslog-style logs (hour patterns).
-# NEVER re-scan multi-GB files hour-by-hour — that would re-read hundreds of GB.
+# Запасной вариант на основе grep для логов в стиле syslog (почасовые паттерны).
+# НИКОГДА не пересканировать многогигабайтные файлы почасово — это означало бы перечитывание сотен ГБ.
 filter_log_file_by_range_grep() {
     local src_file="$1" dest_file="$2"
     local from_time="$3" to_time="$4"
@@ -3589,7 +3589,7 @@ filter_log_file_by_range_grep() {
 
     if [[ "$src_file" != *.gz && -f "$src_file" ]]; then
         size=$(_file_size_bytes "$src_file")
-        # Large files: awk/bisect path only — hour-loop is catastrophic
+        # Крупные файлы: только путь awk/bisect — почасовой цикл катастрофичен
         if [[ "$size" -ge "${SEEK_MIN_BYTES:-1048576}" ]]; then
             return 1
         fi
@@ -3622,26 +3622,26 @@ filter_log_file_by_range_grep() {
     [[ -s "$dest_file" ]]
 }
 
-# --- 8b. Standalone service-log range extraction (parce_service_log) ----------
-# Given a service log file (or a symlink to one) and a [from, to] time range,
-# find the byte offsets bounding that range via interpolation search — each
-# probe is aimed proportionally to where "from"/"to" should sit between the
-# two epochs already known at the current search bounds (the same way a
-# human would guess "last Sunday is about 87% into this file" after reading
-# just the first line's date, then re-aim based on how far off that guess
-# landed), instead of always splitting the remaining window in half like
-# plain bisection. Assumes the log is chronologically sorted (append-only),
-# same assumption the whole approach — and the existing bisect-based
-# filter_log_file_by_range() elsewhere in this file — rely on.
+# --- 8b. Автономное извлечение диапазона из лога службы (parce_service_log) ----
+# Получив файл лога службы (или символьную ссылку на него) и диапазон времени
+# [from, to], находит байтовые смещения, ограничивающие этот диапазон, через
+# интерполяционный поиск — каждая проба нацеливается пропорционально тому,
+# где "from"/"to" должны находиться между двумя уже известными epoch в текущих
+# границах поиска (так же, как человек предположил бы «прошлое воскресенье
+# примерно на 87% файла», прочитав дату только первой строки, а затем
+# скорректировал бы прицел по величине промаха), а не всегда делит оставшееся
+# окно пополам, как обычная бисекция. Предполагает, что лог хронологически
+# отсортирован (append-only) — на этом же предположении опирается весь подход,
+# включая существующую bisect-based filter_log_file_by_range() в другом месте этого файла.
 
-# Resolve a log path (following one symlink hop) to a real, readable,
-# non-compressed file. Echoes the resolved path.
-# NOTE: this function's stdout is its return value (the caller always uses
-# it as real_path=$(_psl_resolve_log_path ...)) — every warn() below is
-# redirected to stderr explicitly, otherwise the diagnostic text itself
-# would be captured into $(...) instead of shown to the user (the same
-# print/return-value mixing bug as elsewhere; caught here for the same
-# reason it was caught in the wizard's mode-choice step).
+# Разрешает путь к логу (следуя одному переходу по символьной ссылке) в
+# реальный, читаемый, несжатый файл. Печатает разрешённый путь.
+# ПРИМЕЧАНИЕ: stdout этой функции — её возвращаемое значение (вызывающий код
+# всегда использует её как real_path=$(_psl_resolve_log_path ...)) — каждый
+# вызов warn() ниже явно перенаправлен в stderr, иначе сам текст диагностики
+# был бы захвачен в $(...) вместо показа пользователю (та же ошибка смешения
+# print/возвращаемого значения, что и в других местах; поймана здесь по той же
+# причине, что и на шаге выбора режима в мастере).
 _psl_resolve_log_path() {
     local path="$1" real="$1"
 
@@ -3661,8 +3661,8 @@ _psl_resolve_log_path() {
     echo "$real"
 }
 
-# Accepts either an already-numeric epoch or anything `date -d` understands.
-# Same stdout-is-the-return-value caveat as _psl_resolve_log_path() above.
+# Принимает либо уже числовой epoch, либо всё, что понимает `date -d`.
+# Та же оговорка про stdout-как-возвращаемое-значение, что и у _psl_resolve_log_path() выше.
 _psl_parse_timestamp() {
     local raw="$1" ep
     if [[ "$raw" =~ ^[0-9]+$ ]]; then
@@ -3674,25 +3674,26 @@ _psl_parse_timestamp() {
     echo "$ep"
 }
 
-# Interpolation search for the smallest byte offset whose line has
-# epoch >= target ($size if no such line exists). Falls back to plain
-# bisection automatically whenever the two known bounding epochs are equal
-# (nothing to interpolate between). Same probe/parse primitives as the
-# plain-bisection _binsearch_offset_ge() above, only the choice of "mid"
-# differs.
+# Интерполяционный поиск наименьшего байтового смещения, чья строка имеет
+# epoch >= target ($size, если такой строки нет). Автоматически переходит на
+# обычную бисекцию, когда две известные граничные epoch равны (нечего
+# интерполировать). Те же примитивы пробы/парсинга, что и у обычной бисекции
+# _binsearch_offset_ge() выше, отличается только выбор "mid".
 #
-# Pure interpolation search is vulnerable to a well-known pathological
-# case: logs are rarely written at a steady rate (bursts followed by quiet
-# stretches), and when the *global* [lo,hi] density is wildly different
-# from the *local* density around the target, a straight proportional
-# guess barely narrows the window each round — it can degrade towards a
-# near-linear scan. _MIN_PROGRESS_FRAC below clamps every guess to move at
-# least that fraction of the current window, which bounds the iteration
-# count to a logarithm (same shape as plain bisection, just a bigger base)
-# no matter how skewed the timestamps are, while still using the
-# interpolated guess — and its usual much-faster convergence — whenever
-# the data is well-behaved enough for it to land inside that clamp anyway.
-_PSL_MIN_PROGRESS_FRAC=10   # guarantee >=1/10 of the window per iteration
+#
+# Чистый интерполяционный поиск подвержен известному патологическому
+# случаю: логи редко пишутся с равномерной скоростью (всплески сменяются
+# затишьями), и когда *глобальная* плотность на [lo,hi] сильно отличается от
+# *локальной* плотности возле target, прямое пропорциональное предположение
+# почти не сужает окно на каждом шаге — поиск может деградировать почти до
+# линейного сканирования. _MIN_PROGRESS_FRAC ниже ограничивает каждое
+# предположение так, чтобы оно сдвигалось хотя бы на эту долю текущего окна,
+# что ограничивает число итераций логарифмом (та же форма, что у обычной
+# бисекции, просто с большим основанием) независимо от того, насколько
+# перекошены timestamp'ы, при этом всё ещё используя интерполированное
+# предположение — и его обычно намного более быструю сходимость — там, где
+# данные ведут себя достаточно хорошо, чтобы предположение само попало в этот диапазон.
+_PSL_MIN_PROGRESS_FRAC=10   # гарантируем >=1/10 окна за одну итерацию
 
 _psl_find_offset_for_epoch() {
     local file="$1" size="$2" target="$3"
@@ -3717,18 +3718,18 @@ _psl_find_offset_for_epoch() {
 
     while [[ $((hi - lo)) -gt "$window" ]]; do
         if [[ "$hi_ep" -le "$lo_ep" ]]; then
-            # Degenerate window (identical epochs) — can't interpolate.
+            # Вырожденное окно (одинаковые epoch) — интерполировать нельзя.
             mid=$(( (lo + hi) / 2 ))
         else
-            # Done in awk (double precision) rather than bash integers: on a
-            # multi-hundred-GB file, (target-lo_ep)*(hi-lo) can overflow a
-            # 64-bit bash integer before the division brings it back down.
+            # Сделано в awk (double precision), а не в целых числах bash: на файле в
+            # несколько сотен ГБ (target-lo_ep)*(hi-lo) может переполнить 64-битное целое
+            # bash до того, как деление вернёт его в норму.
             mid=$(awk -v lo="$lo" -v hi="$hi" -v lo_ep="$lo_ep" -v hi_ep="$hi_ep" -v target="$target" \
                 'BEGIN { frac = (target - lo_ep) / (hi_ep - lo_ep); m = lo + frac * (hi - lo); printf "%d", m }')
             [[ "$mid" =~ ^[0-9]+$ ]] || mid=$(( (lo + hi) / 2 ))
 
-            # Clamp into the guaranteed-progress band near the middle —
-            # this is what keeps a skewed density from stalling the search.
+            # Ограничиваем в полосу гарантированного прогресса около середины —
+            # именно это не даёт перекошенной плотности застопорить поиск.
             span=$((hi - lo))
             min_gap=$((span / _PSL_MIN_PROGRESS_FRAC))
             [[ "$min_gap" -lt 1 ]] && min_gap=1
@@ -3753,18 +3754,18 @@ _psl_find_offset_for_epoch() {
     echo "$lo"
 }
 
-# Resolves [from_epoch, to_epoch] into a line-aligned [start_off, end_off)
-# byte range. Echoes "start_off end_off"; returns 1 if nothing matches.
+# Разрешает [from_epoch, to_epoch] в выровненный по строкам байтовый диапазон
+# [start_off, end_off). Печатает "start_off end_off"; возвращает 1, если ничего не подошло.
 #
-# _psl_find_offset_for_epoch() only narrows down to within one probe
-# "window" (SEEK_PROBE_BYTES) of the true boundary, same as the existing
-# plain-bisection _binsearch_offset_ge() — neither ever confirms the exact
-# line. So, same as filter_log_file_by_range() does around its own
-# _binsearch_offset_ge() calls, back off by SEEK_BACKOFF_BYTES on both
-# sides before aligning: the wider byte window is guaranteed to fully
-# contain the true boundary, and the content-level epoch filter applied
-# during the copy step (not this function) discards whatever extra lines
-# that slop pulls in on either side.
+# _psl_find_offset_for_epoch() лишь сужает до одного проб-"окна"
+# (SEEK_PROBE_BYTES) от истинной границы — так же, как и обычная бисекция
+# _binsearch_offset_ge() — ни одна из них никогда не подтверждает точную
+# строку. Поэтому, как и filter_log_file_by_range() делает вокруг своих
+# вызовов _binsearch_offset_ge(), отступаем на SEEK_BACKOFF_BYTES с обеих
+# сторон перед выравниванием: более широкое байтовое окно гарантированно
+# полностью содержит истинную границу, а содержательный фильтр по epoch,
+# применяемый на шаге копирования (не в этой функции), отбрасывает все
+# лишние строки, которые этот запас захватывает с любой стороны.
 _psl_locate_range() {
     local file="$1" size="$2" from_epoch="$3" to_epoch="$4"
     local start_off end_off backoff="${SEEK_BACKOFF_BYTES:-1048576}"
@@ -3785,8 +3786,8 @@ _psl_locate_range() {
     echo "$start_off $end_off"
 }
 
-# Creates a fresh, transparently-named /tmp directory to hold this
-# extraction's chunk files: /tmp/parce_<basename>_<from>-<to>.<random>/
+# Создаёт свежую, прозрачно названную директорию в /tmp для чанк-файлов
+# этого извлечения: /tmp/parce_<basename>_<from>-<to>.<random>/
 _psl_make_output_dir() {
     local file="$1" from_epoch="$2" to_epoch="$3"
     local base prefix
@@ -3797,8 +3798,8 @@ _psl_make_output_dir() {
     mktemp -d "${prefix}.XXXXXX" 2>/dev/null
 }
 
-# Splits [start_off, end_off) into MAX_LOG_CHUNK_SIZE-sized, line-aligned
-# pieces. Echoes one offset per line: N+1 boundaries bracket N chunks.
+# Разбивает [start_off, end_off) на выровненные по строкам куски размером
+# MAX_LOG_CHUNK_SIZE. Печатает по одному смещению на строку: N+1 границ образуют N чанков.
 _psl_plan_chunk_bounds() {
     local file="$1" start_off="$2" end_off="$3" size="$4"
     local chunk_sz="${MAX_LOG_CHUNK_SIZE:-104857600}" range i off prev
@@ -3819,11 +3820,11 @@ _psl_plan_chunk_bounds() {
     echo "$end_off"
 }
 
-# Copies every [off, next) piece from _psl_plan_chunk_bounds (args 5..N)
-# into its own part_NNNNN.log inside out_dir, keeping only lines inside
-# [from_epoch, to_epoch] — guards against the interpolation search landing
-# a few lines short/long of the exact boundary. Drops parts that ended up
-# empty. Echoes the number of chunk files actually written.
+# Копирует каждый кусок [off, next) из _psl_plan_chunk_bounds (аргументы
+# 5..N) в свой part_NNNNN.log внутри out_dir, оставляя только строки внутри
+# [from_epoch, to_epoch] — защита от того, что интерполяционный поиск
+# приземлился на несколько строк раньше/позже точной границы. Отбрасывает
+# части, оказавшиеся пустыми. Печатает число фактически записанных чанк-файлов.
 _psl_copy_chunks() {
     local file="$1" out_dir="$2" from_epoch="$3" to_epoch="$4"
     local -a bounds=("${@:5}")
@@ -3864,15 +3865,15 @@ _psl_copy_chunks() {
     echo "$count"
 }
 
-# Extracts the portion of a service log file whose lines fall inside
-# [ts_from, ts_to] into one or more chunk files under /tmp.
-#   $1 = path to the log file (or a symlink to it)
-#   $2 = range start — epoch seconds, or anything `date -d` accepts
-#   $3 = range end   — epoch seconds, or anything `date -d` accepts
-# On success: sets PSL_OUTPUT_PATH (the /tmp directory holding
-# part_00001.log, part_00002.log, ...) and PSL_OUTPUT_CHUNKS (how many),
-# echoes "<PSL_OUTPUT_PATH> <PSL_OUTPUT_CHUNKS>", returns 0.
-# On failure: warns with a reason, returns 1, leaves both globals unset.
+# Извлекает часть лог-файла службы, чьи строки попадают в
+# [ts_from, ts_to], в один или несколько чанк-файлов под /tmp.
+#   $1 = путь к лог-файлу (или символьной ссылке на него)
+#   $2 = начало диапазона — секунды epoch, либо всё, что понимает `date -d`
+#   $3 = конец диапазона   — секунды epoch, либо всё, что понимает `date -d`
+# При успехе: устанавливает PSL_OUTPUT_PATH (директория в /tmp с
+# part_00001.log, part_00002.log, ...) и PSL_OUTPUT_CHUNKS (их количество),
+# печатает "<PSL_OUTPUT_PATH> <PSL_OUTPUT_CHUNKS>", возвращает 0.
+# При неудаче: выводит warn с причиной, возвращает 1, оставляет обе глобальные переменные неустановленными.
 parce_service_log() {
     local log_path="$1" ts_from_raw="$2" ts_to_raw="$3"
     local real_path from_epoch to_epoch size range_str start_off end_off
@@ -3918,24 +3919,24 @@ parce_service_log() {
     echo "$PSL_OUTPUT_PATH $PSL_OUTPUT_CHUNKS"
 }
 
-# --- 8c. Service-wide log range extraction (parce_service_logs) --------------
-# Wraps parce_service_log() with everything needed to go from just a
-# *service name* to a finished set of chunk files: find where the service
-# keeps its logs, find which of its files could contain data in [from,to],
-# skip an archived copy when a live plain copy of the same file exists,
-# run parce_service_log() on every surviving file (decompressing archived-
-# only ones to a scratch copy first), then merge+re-chunk per log *type*
-# (access.log/access.log.1/access.2026-07-22.log.gz all merge together;
-# error.log never does) so the final output is a small number of tidy,
-# MAX_LOG_CHUNK_SIZE-sized files instead of one tiny file per rotated
-# original. Every intermediate file/dir is removed before returning —
-# the returned directory contains only the final result.
+# --- 8c. Извлечение диапазона из логов службы целиком (parce_service_logs) ----
+# Оборачивает parce_service_log() всем необходимым, чтобы дойти от просто
+# *имени службы* до готового набора чанк-файлов: находит, где служба
+# хранит свои логи, находит, какие из её файлов могут содержать данные в [from,to],
+# пропускает архивную копию, если существует живая обычная копия того же файла,
+# запускает parce_service_log() на каждом из уцелевших файлов (сначала распаковывая
+# файлы, существующие только в архиве, во временную копию), затем объединяет и
+# перенарезает по *типу* лога (access.log/access.log.1/access.2026-07-22.log.gz
+# объединяются вместе; error.log — никогда), так что итоговый вывод — небольшое
+# число опрятных файлов размером MAX_LOG_CHUNK_SIZE, а не один крошечный файл на
+# каждый оригинал ротации. Все промежуточные файлы/директории удаляются перед
+# возвратом — возвращённая директория содержит только финальный результат.
 
-# --- Stage 1: explicit service -> known log dir(s) map -----------------------
-# Only needed for services whose log directory name doesn't match the
-# service name (mysqld's logs live under /var/log/mysql, not /var/log/
-# mysqld) — anything where directory name == service name is already
-# covered by stages 2/3 below and doesn't need an entry here.
+# --- Этап 1: явное соответствие служба -> известная(ые) директория(и) логов ---
+# Нужно только для служб, у которых имя директории логов не совпадает с
+# именем службы (логи mysqld лежат в /var/log/mysql, а не в /var/log/
+# mysqld) — всё, где имя директории == имени службы, уже покрывается
+# этапами 2/3 ниже и не требует записи здесь.
 declare -A _PSL_SVC_LOG_DIRS=(
     [mysqld]="/var/log/mysql /var/lib/mysql"
     [mysql]="/var/log/mysql /var/lib/mysql"
@@ -3944,25 +3945,25 @@ declare -A _PSL_SVC_LOG_DIRS=(
     [redis-server]="/var/log/redis"
     [rabbitmq-server]="/var/log/rabbitmq"
 )
-# Stage 2: extra parent directories to search for a same-named subdirectory
-# (besides the standard /var/log, checked separately in stage 3). Includes
-# /var/log/flat so internal FLAT products (any name in PKG_PRODUCT) are
-# found here automatically via the same convention find_log_dirs_for_pkg()
-# already uses, without needing a per-product entry in the map above.
+# Этап 2: дополнительные родительские директории для поиска одноимённой подпапки
+# (помимо стандартного /var/log, который проверяется отдельно на этапе 3). Включает
+# /var/log/flat, поэтому внутренние продукты FLAT (любое имя из PKG_PRODUCT)
+# находятся здесь автоматически по той же конвенции, которую уже использует
+# find_log_dirs_for_pkg(), без необходимости добавлять запись на каждый продукт выше.
 _PSL_SVC_SEARCH_ROOTS=(/var/log/flat /opt /opt/flat /var/opt /usr/local/var/log)
 
-# Locates the log directory/directories for a service name. Echoes each
-# distinct directory on its own line (deduplicated); returns 1 with no
-# output if none exist. ssh/sshd, for instance, legitimately have no
-# dedicated directory on most systems (they log into syslog/auth.log) and
-# will correctly end up here.
+# Находит директорию(и) логов для имени службы. Печатает каждую
+# отдельную директорию на своей строке (без дублей); возвращает 1 без
+# вывода, если ничего не найдено. Например, ssh/sshd на большинстве систем
+# закономерно не имеют выделенной директории (они пишут в syslog/auth.log) и
+# корректно попадут именно в этот случай.
 _psl_find_service_log_dirs() {
     local service="$1"
     local -a found=()
     local d root cfg_dir
 
-    # Stage 1: explicit map, plus the config-driven paths some FLAT
-    # products already register via get_log_path_from_config().
+    # Этап 1: явное соответствие, плюс пути из конфигов, которые некоторые
+    # продукты FLAT уже регистрируют через get_log_path_from_config().
     for d in ${_PSL_SVC_LOG_DIRS[$service]:-}; do
         [[ -d "$d" ]] && found+=("$d")
     done
@@ -3972,14 +3973,14 @@ _psl_find_service_log_dirs() {
         [[ -d "$cfg_dir" ]] && found+=("$cfg_dir")
     fi
 
-    # Stage 2: same-named subdirectory under a list of parent roots.
+    # Этап 2: одноимённая подпапка внутри списка родительских корней.
     for root in "${_PSL_SVC_SEARCH_ROOTS[@]}"; do
         d="$root/$service"
         [[ -d "$d" ]] && found+=("$d")
     done
 
-    # Stage 3: the standard convention, checked explicitly so it is never
-    # skipped even if stage 2's root list above is trimmed down later.
+    # Этап 3: стандартная конвенция, проверяется явно, чтобы никогда не
+    # пропускаться, даже если список корней этапа 2 выше в будущем сократят.
     d="/var/log/$service"
     [[ -d "$d" ]] && found+=("$d")
 
@@ -3987,10 +3988,10 @@ _psl_find_service_log_dirs() {
     printf '%s\n' "${found[@]}" | sort -u
 }
 
-# Echoes "start_epoch end_epoch" for a file: birth time (or inode-change
-# time, when the filesystem/kernel doesn't expose a real birth time) as
-# the start, mtime as the end — the widest reasonable estimate of the
-# span during which this file could have received log lines.
+# Печатает "start_epoch end_epoch" для файла: время создания (или время
+# изменения inode, если файловая система/ядро не предоставляют настоящее
+# время создания) как начало, mtime как конец — самая широкая разумная оценка
+# промежутка, в течение которого файл мог получать строки лога.
 _psl_file_time_span() {
     local file="$1" birth mtime ctime start
 
@@ -4006,19 +4007,19 @@ _psl_file_time_span() {
         start="$mtime"
     fi
     [[ "$mtime" =~ ^[0-9]+$ ]] || mtime="$start"
-    # ctime (metadata-change time) can end up *after* mtime for a rotated
-    # file — e.g. logrotate renames it well after the last line was
-    # written, which bumps ctime but not mtime — clamp so the span is
-    # never inverted (that would make the overlap check in
-    # _psl_scan_candidate_files() unreliable).
+    # ctime (время изменения метаданных) может оказаться *позже* mtime для
+    # ротированного файла — например, logrotate переименовывает его заметно
+    # позже последней записанной строки, что двигает ctime, но не mtime —
+    # ограничиваем, чтобы промежуток никогда не был перевёрнутым (иначе проверка
+    # пересечения в _psl_scan_candidate_files() была бы ненадёжной).
     [[ "$start" -gt "$mtime" ]] && start="$mtime"
     echo "$start $mtime"
 }
 
-# Scans a list of directories (non-recursive: these are already the
-# service's own log dirs, not a tree to walk) for regular files whose
-# [birth/ctime, mtime] span overlaps [from_epoch, to_epoch]. Echoes one
-# matching path per line.
+# Сканирует список директорий (не рекурсивно: это уже собственные
+# директории логов службы, а не дерево для обхода) на обычные файлы, чей
+# промежуток [birth/ctime, mtime] пересекается с [from_epoch, to_epoch]. Печатает
+# по одному подходящему пути на строку.
 _psl_scan_candidate_files() {
     local from_epoch="$1" to_epoch="$2"
     shift 2
@@ -4036,8 +4037,8 @@ _psl_scan_candidate_files() {
     done
 }
 
-# Echoes just the archive extension's plain-text equivalent name (strips
-# .gz/.bz2/.xz/.zip/.Z), or the name unchanged if it isn't archived.
+# Печатает имя без архивного расширения (убирает .gz/.bz2/.xz/.zip/.Z),
+# либо имя без изменений, если оно не архивировано.
 _psl_strip_archive_ext() {
     local name="$1" ext
     for ext in .gz .bz2 .xz .zip .Z; do
@@ -4049,11 +4050,11 @@ _psl_strip_archive_ext() {
     echo "$name"
 }
 
-# Reads a candidate file list (one path per line) on stdin, drops any
-# archived file that has a live plain sibling with the identical name
-# (same directory, same name once the archive extension is stripped) —
-# same rotation instance existing twice, only the plain one should be
-# read — and prints the surviving paths.
+# Читает список кандидатов (по одному пути на строку) из stdin, отбрасывает
+# любой архивный файл, у которого есть живой обычный «близнец» с идентичным
+# именем (та же директория, то же имя после удаления архивного расширения) —
+# один и тот же экземпляр ротации существует дважды, читать нужно только
+# обычный — и печатает уцелевшие пути.
 _psl_dedupe_archive_copies() {
     local -A has_plain=()
     local -a files=()
@@ -4080,11 +4081,11 @@ _psl_dedupe_archive_copies() {
     done
 }
 
-# Computes the "log type" a rotated/archived file belongs to, so
-# access.log / access.log.1 / access.log.2.gz / access.2026-07-22.log all
-# group together while error.log stays separate. Strips (in order): the
-# archive extension, a trailing numeric or date rotation suffix, and a
-# numeric/date segment embedded right before a trailing ".log".
+# Вычисляет «тип лога», к которому относится ротированный/архивный файл, так что
+# access.log / access.log.1 / access.log.2.gz / access.2026-07-22.log все
+# группируются вместе, а error.log остаётся отдельно. Убирает (по порядку): архивное
+# расширение, конечный числовой или датированный суффикс ротации, а также
+# числовой/датированный сегмент, встроенный прямо перед конечным ".log".
 _psl_log_group_key() {
     local key
     key=$(_psl_strip_archive_ext "$(basename -- "$1")")
@@ -4097,13 +4098,13 @@ _psl_log_group_key() {
     printf '%s' "$key"
 }
 
-# If $1 is plain, echoes it unchanged. If it's archived, decompresses it
-# into $2/scratch/ and echoes that scratch copy's path instead (caller is
-# responsible for removing it once done — parce_service_log() itself
-# rejects compressed input outright, seeking inside a compressed stream
-# isn't possible). .zip is recognized for grouping/dedup purposes above
-# but not decompressed here (ambiguous inner member name) — logged and
-# skipped.
+# Если $1 обычный — печатает без изменений. Если он архивирован — распаковывает
+# его в $2/scratch/ и вместо этого печатает путь к этой временной копии (вызывающий
+# код сам отвечает за её удаление по завершении — сама parce_service_log()
+# полностью отбрасывает сжатый ввод, искать внутри сжатого потока
+# невозможно). .zip распознаётся выше для целей группировки/дедупликации,
+# но здесь не распаковывается (неоднозначное имя внутреннего элемента) — логируется
+# и пропускается.
 _psl_materialize_plain() {
     local file="$1" work_dir="$2" scratch out
 
@@ -4135,12 +4136,12 @@ _psl_materialize_plain() {
     fi
 }
 
-# Runs parce_service_log() on one candidate file and, on success, appends
-# its extracted chunk(s) to that file's group accumulator under
-# $work_dir/groups/. Cleans up parce_service_log()'s own tmp output dir
-# and any scratch-decompressed copy immediately, regardless of outcome.
-# Returns 0 if this file contributed any lines, 1 otherwise (normal for a
-# rotated file that simply has nothing in range — not an error).
+# Запускает parce_service_log() на одном файле-кандидате и при успехе добавляет
+# его извлечённый чанк(и) в аккумулятор группы этого файла под
+# $work_dir/groups/. Немедленно чистит собственную tmp-директорию вывода
+# parce_service_log() и любую распакованную во временную копию, независимо от исхода.
+# Возвращает 0, если этот файл дал хоть какие-то строки, иначе 1 (нормально для
+# ротированного файла, в котором просто нет ничего в диапазоне — это не ошибка).
 _psl_process_one_candidate() {
     local file="$1" from_epoch="$2" to_epoch="$3" work_dir="$4"
     local plain is_scratch=0 group group_file rc=1
@@ -4160,8 +4161,8 @@ _psl_process_one_candidate() {
     return "$rc"
 }
 
-# Fresh, transparently-named /tmp directory for the final per-service
-# result: /tmp/parces_<service>_<from>-<to>.<random>/
+# Свежая, прозрачно названная директория в /tmp для финального результата
+# по службе: /tmp/parces_<service>_<from>-<to>.<random>/
 _psl_make_service_output_dir() {
     local service="$1" from_epoch="$2" to_epoch="$3" base prefix
     base="${service//[^A-Za-z0-9._-]/_}"
@@ -4169,9 +4170,9 @@ _psl_make_service_output_dir() {
     mktemp -d "${prefix}.XXXXXX" 2>/dev/null
 }
 
-# Re-chunks every per-group accumulator file in $work_dir/groups/ into
-# MAX_LOG_CHUNK_SIZE-sized, line-whole pieces under $final_dir, named
-# "<group>.part_NN.log". Echoes the total number of chunk files written.
+# Перенарезает каждый файл-аккумулятор группы в $work_dir/groups/ на
+# куски размером MAX_LOG_CHUNK_SIZE, целые по строкам, в $final_dir, с именами
+# "<group>.part_NN.log". Печатает общее число записанных чанк-файлов.
 _psl_finalize_groups() {
     local work_dir="$1" final_dir="$2"
     local gfile gkey count
@@ -4187,17 +4188,17 @@ _psl_finalize_groups() {
     echo "${count:-0}"
 }
 
-# Extracts every log file of a given service that falls (even partially)
-# inside [ts_from, ts_to] into a small set of merged, size-bounded chunk
-# files under /tmp.
-#   $1 = service name (nginx, mysqld, apache2, ssh, an internal FLAT
-#        product package name, ...)
-#   $2 = range start — epoch seconds, or anything `date -d` accepts
-#   $3 = range end   — epoch seconds, or anything `date -d` accepts
-# On success: sets PSLS_OUTPUT_PATH (the /tmp directory holding
-# <type>.part_NN.log per log type — access/error/etc. never mixed) and
-# PSLS_OUTPUT_CHUNKS, echoes "<PSLS_OUTPUT_PATH> <PSLS_OUTPUT_CHUNKS>",
-# returns 0. On failure: warns with a reason, returns 1.
+# Извлекает каждый лог-файл заданной службы, который попадает (хотя бы частично)
+# в [ts_from, ts_to], в небольшой набор объединённых, ограниченных по размеру
+# чанк-файлов под /tmp.
+#   $1 = имя службы (nginx, mysqld, apache2, ssh, имя пакета внутреннего
+#        продукта FLAT, ...)
+#   $2 = начало диапазона — секунды epoch, либо всё, что понимает `date -d`
+#   $3 = конец диапазона   — секунды epoch, либо всё, что понимает `date -d`
+# При успехе: устанавливает PSLS_OUTPUT_PATH (директория в /tmp с
+# <type>.part_NN.log на каждый тип лога — access/error/и т.д. никогда не смешиваются) и
+# PSLS_OUTPUT_CHUNKS, печатает "<PSLS_OUTPUT_PATH> <PSLS_OUTPUT_CHUNKS>",
+# возвращает 0. При неудаче: выводит warn с причиной, возвращает 1.
 parce_service_logs() {
     local service="$1" ts_from_raw="$2" ts_to_raw="$3"
     local from_epoch to_epoch work_dir final_dir chunk_count processed=0
@@ -4265,19 +4266,19 @@ parce_service_logs() {
     echo "$PSLS_OUTPUT_PATH $PSLS_OUTPUT_CHUNKS"
 }
 
-# Built-in seek unit-test (used by extended selftest / --dev)
+# Встроенный юнит-тест seek (используется расширенным selftest / --dev)
 _selftest_seek_extract() {
     local dir log dest from_epoch to_epoch base n lines got sz
     dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_selfseek.XXXXXX") || return 1
     log="$dir/big.log"
     dest="$dir/out.log"
-    # Force seek+chunk path
+    # Принудительно использовать путь seek+chunk
     SEEK_MIN_BYTES=$((100 * 1024))
     SEEK_CHUNK_BYTES=$((256 * 1024))
     SEEK_BACKOFF_BYTES=$((64 * 1024))
     base=$(date -d '2026-01-15 10:00:00' +%s 2>/dev/null) || base=1768467600
     n=40000
-    # gawk strftime: fast synthetic sorted log (~1–2MB)
+    # gawk strftime: быстрый синтетический отсортированный лог (~1–2MB)
     awk -v base="$base" -v n="$n" 'BEGIN {
         for (i = 0; i < n; i++)
             printf "%s line-%d\n", strftime("%Y-%m-%d %H:%M:%S", base + i), i
@@ -4306,7 +4307,7 @@ _selftest_seek_extract() {
     return 0
 }
 
-# --- Self-test harness (simple / extended) ------------------------------------
+# --- Инфраструктура самотеста (simple / extended) ------------------------------
 _SELFTEST_PASS=0
 _SELFTEST_FAIL=0
 
@@ -4320,7 +4321,7 @@ _selftest_bad() {
     fail "selftest: $1"
 }
 
-# Simple: functions are callable / return something sane (no deep variants)
+# Simple: функции вызываемы / возвращают что-то разумное (без глубоких вариантов)
 _run_selftest_simple() {
     local ep jobs tmp dest
     info "Self-test SIMPLE (smoke: functions launch)"
@@ -4358,9 +4359,9 @@ _run_selftest_simple() {
         && _selftest_ok "_psl_find_service_log_dirs defined" \
         || _selftest_bad "_psl_find_service_log_dirs defined"
 
-    # Functional check without touching /var/log (may not be writable by
-    # whoever runs the self-test): _psl_find_service_log_dirs() must fail
-    # cleanly (no output, rc=1) for a service that plainly doesn't exist.
+    # Функциональная проверка без обращения к /var/log (может быть недоступен на запись
+    # тому, кто запускает самотест): _psl_find_service_log_dirs() должна корректно
+    # завершиться неудачей (без вывода, rc=1) для явно не существующей службы.
     if ! _psl_find_service_log_dirs "flat-selftest-no-such-service-xyz" >/dev/null 2>&1; then
         _selftest_ok "_psl_find_service_log_dirs: graceful miss"
     else
@@ -4393,13 +4394,13 @@ _run_selftest_simple() {
     _get_cpu_usage_percent >/dev/null && _selftest_ok "_get_cpu_usage_percent" || _selftest_bad "_get_cpu_usage_percent"
 }
 
-# Extended: detailed variants + full health (VERBOSE) + seek extract
+# Extended: подробные варианты + полная проверка состояния (VERBOSE) + извлечение через seek
 _run_selftest_extended() {
     local ep1 ep2 products p
     info "Self-test EXTENDED (variants + health + seek)"
     _run_selftest_simple
 
-    # Time / duration variants
+    # Варианты времени / длительности
     local t1 t2
     t1=$(parse_time_point "25.06.2026 10:00") || t1=""
     t2=$(parse_time_point "2026-06-25 10:00:00") || t2=""
@@ -4423,7 +4424,7 @@ _run_selftest_extended() {
         fi
     done
 
-    # Resource gate must allow ≥1 worker (hang-safety)
+    # Лимит ресурсов должен разрешать ≥1 воркер (защита от зависания)
     COLLECTOR_JOB_PIDS=()
     if _collector_wait_slot 2; then
         _selftest_ok "_collector_wait_slot (hang-safe)"
@@ -4431,14 +4432,14 @@ _run_selftest_extended() {
         _selftest_bad "_collector_wait_slot"
     fi
 
-    # Full seek + parallel chunk path
+    # Полный путь seek + параллельные чанки
     if _selftest_seek_extract; then
         _selftest_ok "seek+chunk extract (bisect)"
     else
         _selftest_bad "seek+chunk extract (bisect)"
     fi
 
-    # Verbose health across all known products (former -v / --dev)
+    # Подробная проверка состояния по всем известным продуктам (бывший -v / --dev)
     VERBOSE=1
     detect_os
     check_system
@@ -4478,9 +4479,9 @@ run_selftest() {
     return 1
 }
 
-# --- 8. Duration / time-point parsers + line filters by timestamp --------------
-# Offline: filter_log_file_by_range* — earlier in file near collect_postgresql.
-# Shared duration helpers:
+# --- 8. Парсеры длительности / момента времени + фильтры строк по timestamp -----
+# Offline: filter_log_file_by_range* — выше в файле, рядом с collect_postgresql.
+# Общие хелперы длительности:
 parse_duration() {
     local raw="$1"
     PARSE_RESULT_NUM=0
@@ -4509,15 +4510,15 @@ duration_to_seconds() {
 }
 
 # ============================================================
-# Parse time point: absolute date or relative offset
-#   "-2h"        → 2 hours ago
-#   "2025-06-25 10:00" → absolute date
-#   "25.06.2025 10:00" → absolute date (DD.MM.YYYY)
+# Разбор точки во времени: абсолютная дата или относительное смещение
+#   "-2h"        → 2 часа назад
+#   "2025-06-25 10:00" → абсолютная дата
+#   "25.06.2025 10:00" → абсолютная дата (DD.MM.YYYY)
 # ============================================================
 parse_time_point() {
     local raw="$1"
     local result=""
-    # Relative offset: starts with + or -
+    # Относительное смещение: начинается с + или -
     if [[ "$raw" =~ ^[+-] ]]; then
         local sign="${raw:0:1}"
         local dur="${raw:1}"
@@ -4533,15 +4534,15 @@ parse_time_point() {
         esac
         result=$(date -d "${sign}${PARSE_RESULT_NUM} ${unit_str}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
     else
-        # Absolute date: try multiple formats
+        # Абсолютная дата: пробуем несколько форматов
         result=$(date -d "$raw" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-        # Fallback: DD.MM.YYYY HH:MM → convert to YYYY-MM-DD HH:MM
+        # Запасной вариант: DD.MM.YYYY HH:MM → преобразуем в YYYY-MM-DD HH:MM
         if [[ -z "$result" && "$raw" =~ ^([0-9]{2})\.([0-9]{2})\.([0-9]{4})[[:space:]]([0-9]{2}):([0-9]{2}).*$ ]]; then
             local d="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}" y="${BASH_REMATCH[3]}"
             local hh="${BASH_REMATCH[4]}" mm="${BASH_REMATCH[5]}"
             result=$(date -d "${y}-${m}-${d} ${hh}:${mm}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
         fi
-        # Fallback: DD.MM HH:MM (current year)
+        # Запасной вариант: DD.MM HH:MM (текущий год)
         if [[ -z "$result" && "$raw" =~ ^([0-9]{2})\.([0-9]{2})[[:space:]]([0-9]{2}):([0-9]{2}).*$ ]]; then
             local d="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}"
             local hh="${BASH_REMATCH[3]}" mm="${BASH_REMATCH[4]}"
@@ -4553,10 +4554,10 @@ parse_time_point() {
     return 1
 }
 
-# --- 9. Collector processes / signals / safe remove ----------------------------
-# Root: only delete work dirs matching ARCHIVE name pattern under COLLECTOR_DIR.
+# --- 9. Процессы сборщика / сигналы / безопасное удаление -----------------------
+# Root: удалять только рабочие директории, совпадающие с шаблоном имени ARCHIVE внутри COLLECTOR_DIR.
 
-# True if path looks like our session work dir: <collector>/YYYY.MM.DD_HH-MM_*
+# Истина, если путь похож на рабочую директорию нашей сессии: <collector>/YYYY.MM.DD_HH-MM_*
 _is_safe_work_dir() {
     local path="$1" base parent
     [[ -n "$path" && -d "$path" ]] || return 1
@@ -4569,14 +4570,14 @@ _is_safe_work_dir() {
         coll=$(readlink -f "$COLLECTOR_DIR" 2>/dev/null || echo "$COLLECTOR_DIR")
         [[ "$parent" == "$coll" ]] || return 1
     fi
-    # refuse obviously dangerous roots
+    # отказываем на явно опасных корневых путях
     case "$path" in
         /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var) return 1 ;;
     esac
     return 0
 }
 
-# Remove current session dir only after safety checks (Ctrl+C / early abort)
+# Удалить директорию текущей сессии только после проверок безопасности (Ctrl+C / ранний abort)
 safe_rm_work_dir() {
     local path="${1:-${WORK_DIR:-}}"
     if _is_safe_work_dir "$path"; then
@@ -4586,7 +4587,7 @@ safe_rm_work_dir() {
     fi
 }
 
-# TERM + brief grace + KILL for a PID list (shared by collector and full cleanup)
+# TERM + короткая отсрочка + KILL для списка PID (общее для сборщика и полной очистки)
 _kill_pids_gracefully() {
     local pid
     for pid in "$@"; do
@@ -4604,7 +4605,7 @@ _kill_pids_gracefully() {
 
 cleanup_background_jobs() {
     local pid
-    # TERM, brief grace, then KILL so wait cannot hang on stuck tail/NFS
+    # TERM, короткая отсрочка, затем KILL, чтобы wait не мог зависнуть на застрявшем tail/NFS
     for pid in "${TAIL_PIDS[@]+"${TAIL_PIDS[@]}"}"; do [[ -n "$pid" ]] && kill -TERM "$pid" 2>/dev/null; done
     if [[ ${#COLLECTOR_JOB_PIDS[@]} -gt 0 ]]; then
         _kill_pids_gracefully "${COLLECTOR_JOB_PIDS[@]}"
@@ -4635,12 +4636,12 @@ cleanup_on_abort() {
     safe_rm_work_dir
 }
 
-# TERM: graceful stop (online timeout, disk guard) — interrupt read, then archive
+# TERM: аккуратная остановка (online timeout, диск-guard) — прервать чтение, затем архивировать
 _on_collect_graceful_stop() {
     COLLECTOR_TIMEOUT_STOP=1
 }
 
-# INT (Ctrl+C): abort — delete work dir, no archive
+# INT (Ctrl+C): abort — удалить рабочую директорию, без архивации
 _on_collect_abort() {
     COLLECTOR_ABORTED=1
     cleanup_on_abort
@@ -4655,7 +4656,7 @@ trap _on_collect_abort INT
 trap _on_collect_graceful_stop TERM
 trap cleanup EXIT
 
-# Disk free percent (100 - used%). Empty on failure.
+# Процент свободного места на диске (100 - используемый%). Пусто при ошибке.
 get_disk_free_percent() {
     local dir="${1:-.}"
     df -P "$dir" 2>/dev/null | awk 'NR==2 { gsub(/%/,"",$5); if ($5+0>=0) print 100-$5 }'
@@ -4665,7 +4666,7 @@ cleanup_old_work_dirs() {
     local dir="$1" keep_name="${2:-}"
     local d base
     [[ -d "$dir" ]] || return 0
-    # Only under collector output; only our naming pattern; never current keep_name
+    # Только внутри выходной директории сборщика; только наш шаблон имён; никогда текущий keep_name
     while IFS= read -r -d '' d; do
         base=$(basename "$d")
         [[ -n "$keep_name" && "$base" == "$keep_name" ]] && continue
@@ -4675,7 +4676,7 @@ cleanup_old_work_dirs() {
         -name '[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]_[0-9][0-9]-[0-9][0-9]_*' -print0 2>/dev/null)
 }
 
-# Unique archive subdirectory name for a source log dir (online + offline must match)
+# Уникальное имя поддиректории архива для исходной директории логов (online + offline должны совпадать)
 _archive_subdir_name() {
     local path="$1" name
     path=$(readlink -f "$path" 2>/dev/null || echo "$path")
@@ -4696,7 +4697,7 @@ _archive_subdir_name() {
     echo "${path#/}" | tr '/' '_'
 }
 
-# Background disk monitor: TERM → graceful stop if free space < 2%
+# Фоновый монитор диска: TERM → аккуратная остановка, если свободного места < 2%
 start_disk_watch() {
     local watch_dir="$1"
     (
@@ -4713,7 +4714,7 @@ start_disk_watch() {
     DISK_WATCH_PID=$!
 }
 
-# Unique destination path: flatten relative path so parallel same-basename files don't collide
+# Уникальный путь назначения: разворачиваем относительный путь в одну строку, чтобы параллельные файлы с одинаковым basename не конфликтовали
 _unique_dest_path() {
     local src_file="$1" dest_dir="$2" src_dir="${3:-}"
     local rel base dest_path n=0
@@ -4739,7 +4740,7 @@ _start_tail_one_file() {
     local dest_path pid
     dest_path=$(_unique_dest_path "$src_file" "$dest_dir" "$src_dir")
     mkdir -p "$dest_dir" || return 1
-    # Lower priority; keep nice/ionice on the same & line so $! is the tail chain
+    # Понижаем приоритет; держим nice/ionice в той же &-строке, чтобы $! указывал на цепочку tail
     if command -v nice >/dev/null 2>&1 && command -v ionice >/dev/null 2>&1; then
         nice -n 10 ionice -c3 tail -F -n 0 "$src_file" > "$dest_path" 2>/dev/null &
     elif command -v nice >/dev/null 2>&1; then
@@ -4821,17 +4822,17 @@ _collector_max_jobs() {
     fi
     cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
     [[ -z "$cores" || "$cores" -lt 1 ]] && cores=4
-    # Default worker cap from cores; spawning still gated by host-wide RESOURCE_* limits
+    # Лимит воркеров по умолчанию от числа ядер; запуск всё равно ограничен общесистемными лимитами RESOURCE_*
     n=$(( cores * ${RESOURCE_CPU_LIMIT:-80} / 100 ))
     [[ "$n" -lt 1 ]] && n=1
     [[ "$n" -gt 32 ]] && n=32
     echo "$n"
 }
 
-# Memory used percent for whole host (100 - MemAvailable/MemTotal*100)
+# Процент использованной памяти по всему хосту (100 - MemAvailable/MemTotal*100)
 _get_mem_usage_percent() {
     local pct
-    # Prefer MemAvailable; fall back to MemFree (Git Bash / odd kernels may lack Available)
+    # Предпочитать MemAvailable; запасной вариант MemFree (в Git Bash / нестандартных ядрах может не быть Available)
     pct=$(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} /MemFree:/ {f=$2} END {
         if (t+0 <= 0) { print 0; exit }
         if (a+0 <= 0) a = f
@@ -4840,7 +4841,7 @@ _get_mem_usage_percent() {
     echo "${pct:-0}"
 }
 
-# System CPU busy percent via /proc/stat delta (first call primes, returns 0)
+# Процент занятости CPU системы через дельту /proc/stat (первый вызов инициализирует, возвращает 0)
 _get_cpu_usage_percent() {
     local user nice system idle iowait irq softirq steal guest guest_nice
     local idle_all non_idle total diff_idle diff_total pct
@@ -4872,7 +4873,7 @@ _get_cpu_usage_percent() {
     echo "$pct"
 }
 
-# True if whole-host CPU and memory are under configured limits
+# Истина, если CPU и память всего хоста в пределах настроенных лимитов
 _collector_resources_ok() {
     local cpu mem cpu_lim mem_lim
     cpu_lim=${RESOURCE_CPU_LIMIT:-80}
@@ -4884,7 +4885,7 @@ _collector_resources_ok() {
     fi
     cpu=$(_get_cpu_usage_percent)
     [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
-    # First /proc/stat sample always returns 0 — always take a second sample
+    # Первая проба /proc/stat всегда возвращает 0 — всегда берём вторую пробу
     if [[ "$cpu" -eq 0 ]]; then
         sleep 0.2
         cpu=$(_get_cpu_usage_percent)
@@ -4893,16 +4894,16 @@ _collector_resources_ok() {
     [[ "$cpu" -lt "$cpu_lim" ]]
 }
 
-# Wait for a free job slot. Host-wide gate throttles *additional* workers when
-# CPU/MEM ≥ limit, but never blocks forever:
-#   - 0 running workers → always allow 1 (progress guarantee; avoids hang on busy hosts)
-#   - ≥1 running → wait for headroom or a finished job, up to RESOURCE_WAIT_MAX
+# Ждать свободный слот для задачи. Общесистемный лимит придерживает *дополнительные*
+# воркеры, когда CPU/MEM ≥ лимита, но никогда не блокирует навечно:
+#   - 0 запущенных воркеров → всегда разрешить 1 (гарантия прогресса; избегаем зависания на загруженных хостах)
+#   - ≥1 запущено → ждать запаса ресурсов или завершения задачи, до RESOURCE_WAIT_MAX
 _collector_wait_slot() {
     local max_jobs="$1" pid alive
     local waited=0
     local max_wait="${RESOURCE_WAIT_MAX:-120}"
     local gate_warned=0
-    # Prime CPU counter
+    # Инициализируем счётчик CPU
     _get_cpu_usage_percent >/dev/null
     while true; do
         alive=()
@@ -4919,7 +4920,7 @@ _collector_wait_slot() {
             if _collector_resources_ok; then
                 return 0
             fi
-            # No workers yet → must start one or we deadlock on busy hosts (MEM often ≥80%)
+            # Воркеров пока нет → нужно запустить хотя бы один, иначе deadlock на загруженных хостах (MEM часто ≥80%)
             if [[ ${#COLLECTOR_JOB_PIDS[@]} -eq 0 ]]; then
                 if [[ "$gate_warned" -eq 0 ]]; then
                     info "host CPU/MEM at/above ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}% — starting 1 worker (avoid hang)"
@@ -4927,7 +4928,7 @@ _collector_wait_slot() {
                 fi
                 return 0
             fi
-            # Already have workers: wait for load to drop or a job to finish
+            # Воркеры уже есть: ждём снижения нагрузки или завершения задачи
             if [[ "$waited" -ge "$max_wait" ]]; then
                 if [[ "$gate_warned" -eq 0 ]]; then
                     info "host load gate wait ${max_wait}s — allowing another worker"
@@ -4965,7 +4966,7 @@ _collector_kill_jobs() {
     COLLECTOR_JOB_PIDS=()
 }
 
-# Process copy job results; arrays job_labels[job_idx]=source_label
+# Обработать результаты задач копирования; массивы job_labels[job_idx]=source_label
 _process_copy_job_results() {
     local result_dir="$1" use_content_filter="$2"
     local -n pjob_labels=$3
@@ -5038,8 +5039,8 @@ _process_copy_job_results() {
     echo "$copied"
 }
 
-# Shared job pool over a pre-built file list (one pool — no nested workers).
-# Namerefs MUST use distinct local names: caller often passes arrays named cp_files etc.
+# Общий пул задач над заранее собранным списком файлов (один пул — без вложенных воркеров).
+# Nameref'ы ДОЛЖНЫ использовать уникальные локальные имена: вызывающий код часто передаёт массивы с именами вроде cp_files и т.п.
 _copy_log_files_parallel() {
     local from_time="${1:-}" to_time="${2:-}"
     local -n _ref_files=$3
@@ -5113,8 +5114,8 @@ _copy_log_files_parallel() {
     return 0
 }
 
-# Copy/filter one log file; write status line to result_file
-# Status: OK|<lines>|<base> | OK_GREP|<lines>|<base> | OK_CP|<base> | SKIP|<base> | WARN|<base>|<reason>
+# Скопировать/отфильтровать один лог-файл; записать строку статуса в result_file
+# Статус: OK|<lines>|<base> | OK_GREP|<lines>|<base> | OK_CP|<base> | SKIP|<base> | WARN|<base>|<reason>
 _copy_one_existing_log() {
     local f="$1" src_dir="$2" dest_dir="$3"
     local use_content_filter="$4" from_epoch="$5" to_epoch="$6"
@@ -5188,7 +5189,7 @@ copy_existing_logs() {
     fi
 }
 
-# Flatten all log dirs into one shared job pool (avoids nested worker pools)
+# Развернуть все директории логов в один общий пул задач (избегаем вложенных пулов воркеров)
 copy_all_log_dirs_parallel() {
     local work_root="$1"
     local from_time="${2:-}"
@@ -5318,7 +5319,7 @@ collect_configs() {
     [[ "$count" -gt 0 ]] && info "$(_l config_collected): $count"
 }
 
-# --- 10. Online / offline collection -------------------------------------------
+# --- 10. Online / offline сбор --------------------------------------------------
 run_log_collection() {
     local mode="$1"
     local timeout_raw="${2:-}"
@@ -5341,7 +5342,7 @@ run_log_collection() {
     [[ -w "$COLLECTOR_DIR" ]] || die "$(_l err_perm): $COLLECTOR_DIR"
 
     ARCHIVE_NAME="$(date '+%Y.%m.%d_%H-%M_')$(hostname)"
-    # Remove stale dirs BEFORE creating current work dir (never delete ARCHIVE_NAME)
+    # Удаляем устаревшие директории ДО создания текущей рабочей директории (никогда не удаляем ARCHIVE_NAME)
     cleanup_old_work_dirs "$COLLECTOR_DIR" "$ARCHIVE_NAME"
     WORK_DIR="$COLLECTOR_DIR/$ARCHIVE_NAME"
     mkdir -p "$WORK_DIR" || die "Cannot create work dir: $WORK_DIR"
@@ -5372,7 +5373,7 @@ run_log_collection() {
     fi
 
     mapfile -t ALL_LOG_DIRS < <(discover_log_dirs_for_selected)
-    # mapfile may leave one empty element when no output
+    # mapfile может оставить один пустой элемент, если вывода не было
     if [[ ${#ALL_LOG_DIRS[@]} -eq 1 && -z "${ALL_LOG_DIRS[0]:-}" ]]; then
         ALL_LOG_DIRS=()
     fi
@@ -5390,13 +5391,13 @@ run_log_collection() {
     [[ "$LOG_SCOPE" == "extended" ]] && collect_infra=1
 
     if [[ "$mode" == "online" ]]; then
-        # Non-interactive online without -t would exit immediately after starting tails
+        # Неинтерактивный online без -t завершился бы сразу после запуска tail'ов
         if [[ ! -t 0 && "$timeout_sec" -le 0 ]]; then
             safe_rm_work_dir "$WORK_DIR"
             die "$(_l err_online_need_t)"
         fi
 
-        # Disk guard before spawning tails (check immediately inside start_disk_watch)
+        # Диск-guard перед запуском tail'ов (проверка сразу внутри start_disk_watch)
         start_disk_watch "$WORK_DIR"
 
         local logdir dest_name
@@ -5409,7 +5410,7 @@ run_log_collection() {
                 [[ -f "$sysfile" ]] && start_tail_for_file "$sysfile" "$WORK_DIR/system" "system"
             done
 
-            # Nginx logs for FLAT — collect if nginx is present (plain logs only online)
+            # Логи Nginx для FLAT — собираем, если nginx присутствует (online только обычные логи)
             if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
                 local ngx_dir="/var/log/nginx"
                 if [[ -d "$ngx_dir" ]]; then
@@ -5457,16 +5458,16 @@ run_log_collection() {
         info "$(_l log_stopping)"
         cleanup
     else
-        # Offline: disk space guard (graceful stop + archive, same as online)
+        # Offline: диск-guard (аккуратная остановка + архивация, как и в online)
         start_disk_watch "$WORK_DIR"
 
-        # Parse from/to for offline range collection
+        # Разбор from/to для offline-сбора по диапазону
         local from_time="" to_time=""
         if [[ -n "$FROM_TIME" ]]; then
             from_time=$(parse_time_point "$FROM_TIME") || die "Invalid --from: '$FROM_TIME'"
         fi
         if [[ -n "$TO_TIME" ]]; then
-            # Mixed mode: +3h with --from = from_time + 3 hours
+            # Смешанный режим: +3h вместе с --from = from_time + 3 часа
             if [[ "$TO_TIME" =~ ^[+] && -n "$from_time" ]]; then
                 local offset="${TO_TIME:1}"
                 if ! parse_duration "$offset"; then
@@ -5482,7 +5483,7 @@ run_log_collection() {
                 to_time=$(parse_time_point "$TO_TIME") || die "Invalid --to: '$TO_TIME'"
             fi
         fi
-        # Legacy: -t in offline mode = --from -${value}
+        # Legacy: -t в offline-режиме = --from -${value}
         if [[ -z "$from_time" && -n "$timeout_raw" ]]; then
             from_time=$(parse_time_point "-${timeout_raw}") || true
         fi
@@ -5502,7 +5503,7 @@ run_log_collection() {
                 copy_system_log_by_range "$sysfile" "$WORK_DIR/system" "$from_time" "$to_time" "system"
             done
 
-            # Nginx logs for FLAT — collect if nginx is present
+            # Логи Nginx для FLAT — собираем, если nginx присутствует
             if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
                 local ngx_dir="/var/log/nginx"
                 if [[ -d "$ngx_dir" ]]; then
@@ -5541,12 +5542,12 @@ run_log_collection() {
     cd "$COLLECTOR_DIR" || die "Cannot enter $COLLECTOR_DIR"
     if command -v pigz &>/dev/null; then
         cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
-        # Host-wide headroom: use (limit-20)% of cores so pigz alone stays under Zabbix-ish load
+        # Общесистемный запас: используем (лимит-20)% ядер, чтобы один pigz не превышал Zabbix-подобную нагрузку
         cores=$(( cores * (${RESOURCE_CPU_LIMIT:-80} - 20) / 100 ))
         [[ "$cores" -lt 1 ]] && cores=1
         _get_cpu_usage_percent >/dev/null
         local _pigz_wait=0
-        # Bounded wait only — never block archive forever on busy host
+        # Только ограниченное ожидание — никогда не блокировать архивацию навечно на загруженном хосте
         while ! _collector_resources_ok && [[ "$_pigz_wait" -lt 30 ]]; do
             sleep 1
             _pigz_wait=$((_pigz_wait + 1))
@@ -5563,9 +5564,9 @@ run_log_collection() {
     info "$(_l done_msg)"
 }
 
-# --- 11. Wizard / help / argv / main -------------------------------------------
+# --- 11. Мастер / справка / argv / main ------------------------------------------
 
-# Interactive product/service picker; sets SELECTED_PRODUCTS / SELECTED_SERVICES
+# Интерактивный выбор продукта/службы; устанавливает SELECTED_PRODUCTS / SELECTED_SERVICES
 _wizard_select_log_targets() {
     local -a prods=()
     local -A prod_pkgs=()
@@ -5622,7 +5623,7 @@ _wizard_select_log_targets() {
         [[ ${#SELECTED_PRODUCTS[@]} -eq 0 ]] && SELECTED_PRODUCTS=("${prods[@]}")
     fi
 
-    # Optional service refine: always offer when at least one product selected
+    # Опциональное уточнение по службам: предлагаем всегда, если выбран хоть один продукт
     echo ""
     echo -n "$(_l wiz_refine_services)"
     read -r refine 2>/dev/null || true
@@ -5682,16 +5683,16 @@ _wizard_select_log_targets() {
 }
 
 run_interactive_wizard() {
-    # Reset modes so a prior -log/--dev on argv cannot leak into health-check choice
+    # Сбрасываем режимы, чтобы предыдущий -log/--dev из argv не протёк в выбор проверки состояния
     MODE_LOG=0
     MODE_DEV=0
     SELFTEST_MODE=""
-    # Init before read — set -u aborts on EOF if vars were never assigned
+    # Инициализация до read — set -u прервёт выполнение при EOF, если переменные не были назначены
     local lang_choice="" mode_choice="" submode_choice="" scope_choice=""
     local tcpdump_choice="" range_choice="" repo_choice="" out_dir=""
     local selftest_choice=""
 
-    # Step 1: Language
+    # Шаг 1: Язык
     echo ""
     echo "=== Language / Язык ==="
     echo "  1 — Русский"
@@ -5700,7 +5701,7 @@ run_interactive_wizard() {
     read -r lang_choice 2>/dev/null || true
     if [[ "$lang_choice" == "1" ]]; then CURRENT_LANG="ru"; else CURRENT_LANG="en"; fi
 
-    # Step 2: Mode
+    # Шаг 2: Режим
     echo ""
     echo "$(_l wiz_title_mode)"
     echo "$(_l wiz_mode_1)"
@@ -5714,7 +5715,7 @@ run_interactive_wizard() {
             MODE_LOG=1
             MODE_DEV=0
             SELFTEST_MODE=""
-            # Step 3: Online / Offline
+            # Шаг 3: Online / Offline
             echo ""
             echo "$(_l wiz_title_type)"
             echo "$(_l wiz_type_1)"
@@ -5723,7 +5724,7 @@ run_interactive_wizard() {
             read -r submode_choice 2>/dev/null || true
             [[ "$submode_choice" == "2" ]] && LOG_SUBMODE="offline" || LOG_SUBMODE="online"
 
-            # Scope: brief / extended
+            # Область: brief / extended
             echo ""
             echo "$(_l wiz_title_scope)"
             echo "$(_l wiz_scope_1)"
@@ -5732,7 +5733,7 @@ run_interactive_wizard() {
             read -r scope_choice 2>/dev/null || true
             [[ "$scope_choice" == "2" ]] && LOG_SCOPE="extended" || LOG_SCOPE="brief"
 
-            # Time settings
+            # Настройки времени
             if [[ "$LOG_SUBMODE" == "online" ]]; then
                 echo ""
                 echo -n "$(_l wiz_timeout)"
@@ -5746,7 +5747,7 @@ run_interactive_wizard() {
                     START_TCPDUMP=0
                 fi
             else
-                # Offline: range selection
+                # Offline: выбор диапазона
                 echo ""
                 echo "$(_l wiz_title_range)"
                 echo "$(_l wiz_range_1)"
@@ -5780,11 +5781,11 @@ run_interactive_wizard() {
                 esac
             fi
 
-            # Product / service selection
+            # Выбор продукта / службы
             detect_os
             _wizard_select_log_targets
 
-            # Output directory
+            # Директория вывода
             echo -n "$(_l wiz_output_dir)"
             read -r out_dir 2>/dev/null || true
             [[ -n "$out_dir" ]] && OUTPUT_DIR="$out_dir"
@@ -5804,7 +5805,7 @@ run_interactive_wizard() {
             esac
             ;;
         *)
-            # Default: health check
+            # По умолчанию: проверка состояния
             MODE_LOG=0
             MODE_DEV=0
             SELFTEST_MODE=""
@@ -6111,7 +6112,7 @@ parse_args() {
 main() {
     parse_args "$@"
 
-    # -i: interactive wizard
+    # -i: интерактивный мастер
     if [[ $MODE_INTERACTIVE -eq 1 ]]; then
         run_interactive_wizard
     fi
@@ -6122,7 +6123,7 @@ main() {
         exit 0
     fi
 
-    # Self-test: --dev / --selftest / wizard mode 3
+    # Самотест: --dev / --selftest / режим 3 мастера
     if [[ -n "${SELFTEST_MODE:-}" ]]; then
         run_selftest "$SELFTEST_MODE"
         exit $?
@@ -6132,14 +6133,14 @@ main() {
         exit $?
     fi
 
-    # -log: log collection only
+    # -log: только сбор логов
     if [[ $MODE_LOG -eq 1 ]]; then
         run_log_collection "$LOG_SUBMODE" "$TIMEOUT_RAW"
         [[ $SHOW_REPO -eq 1 ]] && { detect_os; check_repositories; }
         exit 0
     fi
 
-    # DEFAULT: health check only (original flat_check behavior)
+    # ПО УМОЛЧАНИЮ: только проверка состояния (исходное поведение flat_check)
     detect_os
     check_system
     local products=("AutoCallServer" "BSS" "Click to Call" "Contact Center" "Device Manager" "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS" "LDAP" "SBC" "Portal" "flat-file")
