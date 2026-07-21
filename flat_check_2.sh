@@ -3918,6 +3918,353 @@ parce_service_log() {
     echo "$PSL_OUTPUT_PATH $PSL_OUTPUT_CHUNKS"
 }
 
+# --- 8c. Service-wide log range extraction (parce_service_logs) --------------
+# Wraps parce_service_log() with everything needed to go from just a
+# *service name* to a finished set of chunk files: find where the service
+# keeps its logs, find which of its files could contain data in [from,to],
+# skip an archived copy when a live plain copy of the same file exists,
+# run parce_service_log() on every surviving file (decompressing archived-
+# only ones to a scratch copy first), then merge+re-chunk per log *type*
+# (access.log/access.log.1/access.2026-07-22.log.gz all merge together;
+# error.log never does) so the final output is a small number of tidy,
+# MAX_LOG_CHUNK_SIZE-sized files instead of one tiny file per rotated
+# original. Every intermediate file/dir is removed before returning —
+# the returned directory contains only the final result.
+
+# --- Stage 1: explicit service -> known log dir(s) map -----------------------
+# Only needed for services whose log directory name doesn't match the
+# service name (mysqld's logs live under /var/log/mysql, not /var/log/
+# mysqld) — anything where directory name == service name is already
+# covered by stages 2/3 below and doesn't need an entry here.
+declare -A _PSL_SVC_LOG_DIRS=(
+    [mysqld]="/var/log/mysql /var/lib/mysql"
+    [mysql]="/var/log/mysql /var/lib/mysql"
+    [mariadb]="/var/log/mysql /var/lib/mysql"
+    [httpd]="/var/log/httpd"
+    [redis-server]="/var/log/redis"
+    [rabbitmq-server]="/var/log/rabbitmq"
+)
+# Stage 2: extra parent directories to search for a same-named subdirectory
+# (besides the standard /var/log, checked separately in stage 3). Includes
+# /var/log/flat so internal FLAT products (any name in PKG_PRODUCT) are
+# found here automatically via the same convention find_log_dirs_for_pkg()
+# already uses, without needing a per-product entry in the map above.
+_PSL_SVC_SEARCH_ROOTS=(/var/log/flat /opt /opt/flat /var/opt /usr/local/var/log)
+
+# Locates the log directory/directories for a service name. Echoes each
+# distinct directory on its own line (deduplicated); returns 1 with no
+# output if none exist. ssh/sshd, for instance, legitimately have no
+# dedicated directory on most systems (they log into syslog/auth.log) and
+# will correctly end up here.
+_psl_find_service_log_dirs() {
+    local service="$1"
+    local -a found=()
+    local d root cfg_dir
+
+    # Stage 1: explicit map, plus the config-driven paths some FLAT
+    # products already register via get_log_path_from_config().
+    for d in ${_PSL_SVC_LOG_DIRS[$service]:-}; do
+        [[ -d "$d" ]] && found+=("$d")
+    done
+    cfg_dir=$(get_log_path_from_config "$service" 2>/dev/null)
+    if [[ -n "$cfg_dir" ]]; then
+        cfg_dir=$(eval echo "$cfg_dir" 2>/dev/null)
+        [[ -d "$cfg_dir" ]] && found+=("$cfg_dir")
+    fi
+
+    # Stage 2: same-named subdirectory under a list of parent roots.
+    for root in "${_PSL_SVC_SEARCH_ROOTS[@]}"; do
+        d="$root/$service"
+        [[ -d "$d" ]] && found+=("$d")
+    done
+
+    # Stage 3: the standard convention, checked explicitly so it is never
+    # skipped even if stage 2's root list above is trimmed down later.
+    d="/var/log/$service"
+    [[ -d "$d" ]] && found+=("$d")
+
+    [[ ${#found[@]} -eq 0 ]] && return 1
+    printf '%s\n' "${found[@]}" | sort -u
+}
+
+# Echoes "start_epoch end_epoch" for a file: birth time (or inode-change
+# time, when the filesystem/kernel doesn't expose a real birth time) as
+# the start, mtime as the end — the widest reasonable estimate of the
+# span during which this file could have received log lines.
+_psl_file_time_span() {
+    local file="$1" birth mtime ctime start
+
+    birth=$(stat -c '%W' "$file" 2>/dev/null)
+    ctime=$(stat -c '%Z' "$file" 2>/dev/null)
+    mtime=$(stat -c '%Y' "$file" 2>/dev/null)
+
+    if [[ "$birth" =~ ^[0-9]+$ ]] && [[ "$birth" -gt 0 ]]; then
+        start="$birth"
+    elif [[ "$ctime" =~ ^[0-9]+$ ]]; then
+        start="$ctime"
+    else
+        start="$mtime"
+    fi
+    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime="$start"
+    # ctime (metadata-change time) can end up *after* mtime for a rotated
+    # file — e.g. logrotate renames it well after the last line was
+    # written, which bumps ctime but not mtime — clamp so the span is
+    # never inverted (that would make the overlap check in
+    # _psl_scan_candidate_files() unreliable).
+    [[ "$start" -gt "$mtime" ]] && start="$mtime"
+    echo "$start $mtime"
+}
+
+# Scans a list of directories (non-recursive: these are already the
+# service's own log dirs, not a tree to walk) for regular files whose
+# [birth/ctime, mtime] span overlaps [from_epoch, to_epoch]. Echoes one
+# matching path per line.
+_psl_scan_candidate_files() {
+    local from_epoch="$1" to_epoch="$2"
+    shift 2
+    local -a dirs=("$@")
+    local dir f fstart fend
+
+    for dir in "${dirs[@]}"; do
+        [[ -d "$dir" ]] || continue
+        while IFS= read -r -d '' f; do
+            [[ -f "$f" ]] || continue
+            read -r fstart fend < <(_psl_file_time_span "$f")
+            [[ "$fstart" =~ ^[0-9]+$ && "$fend" =~ ^[0-9]+$ ]] || continue
+            [[ "$fstart" -le "$to_epoch" && "$fend" -ge "$from_epoch" ]] && echo "$f"
+        done < <(find -L "$dir" -maxdepth 1 -type f -print0 2>/dev/null)
+    done
+}
+
+# Echoes just the archive extension's plain-text equivalent name (strips
+# .gz/.bz2/.xz/.zip/.Z), or the name unchanged if it isn't archived.
+_psl_strip_archive_ext() {
+    local name="$1" ext
+    for ext in .gz .bz2 .xz .zip .Z; do
+        if [[ "$name" == *"$ext" ]]; then
+            echo "${name%"$ext"}"
+            return 0
+        fi
+    done
+    echo "$name"
+}
+
+# Reads a candidate file list (one path per line) on stdin, drops any
+# archived file that has a live plain sibling with the identical name
+# (same directory, same name once the archive extension is stripped) —
+# same rotation instance existing twice, only the plain one should be
+# read — and prints the surviving paths.
+_psl_dedupe_archive_copies() {
+    local -A has_plain=()
+    local -a files=()
+    local f dir base identity key
+
+    mapfile -t files
+
+    for f in "${files[@]}"; do
+        dir=$(dirname -- "$f")
+        base=$(basename -- "$f")
+        identity=$(_psl_strip_archive_ext "$base")
+        [[ "$base" == "$identity" ]] && has_plain["$dir/$identity"]=1
+    done
+
+    for f in "${files[@]}"; do
+        dir=$(dirname -- "$f")
+        base=$(basename -- "$f")
+        identity=$(_psl_strip_archive_ext "$base")
+        if [[ "$base" != "$identity" ]]; then
+            key="$dir/$identity"
+            [[ -n "${has_plain[$key]:-}" ]] && continue
+        fi
+        echo "$f"
+    done
+}
+
+# Computes the "log type" a rotated/archived file belongs to, so
+# access.log / access.log.1 / access.log.2.gz / access.2026-07-22.log all
+# group together while error.log stays separate. Strips (in order): the
+# archive extension, a trailing numeric or date rotation suffix, and a
+# numeric/date segment embedded right before a trailing ".log".
+_psl_log_group_key() {
+    local key
+    key=$(_psl_strip_archive_ext "$(basename -- "$1")")
+    key=$(printf '%s' "$key" | sed -E \
+        -e 's/\.[0-9]+$//' \
+        -e 's/[-.][0-9]{4}-?[0-9]{2}-?[0-9]{2}$//')
+    key=$(printf '%s' "$key" | sed -E \
+        -e 's/[-.][0-9]{4}-[0-9]{2}-[0-9]{2}(\.log)$/\1/' \
+        -e 's/\.[0-9]+(\.log)$/\1/')
+    printf '%s' "$key"
+}
+
+# If $1 is plain, echoes it unchanged. If it's archived, decompresses it
+# into $2/scratch/ and echoes that scratch copy's path instead (caller is
+# responsible for removing it once done — parce_service_log() itself
+# rejects compressed input outright, seeking inside a compressed stream
+# isn't possible). .zip is recognized for grouping/dedup purposes above
+# but not decompressed here (ambiguous inner member name) — logged and
+# skipped.
+_psl_materialize_plain() {
+    local file="$1" work_dir="$2" scratch out
+
+    case "$file" in
+        *.gz)  : ;;
+        *.bz2) : ;;
+        *.xz)  : ;;
+        *.zip|*.Z)
+            warn "parce_service_logs: skipping unsupported archive format: $file" >&2
+            return 1
+            ;;
+        *) echo "$file"; return 0 ;;
+    esac
+
+    scratch="$work_dir/scratch"
+    mkdir -p "$scratch" 2>/dev/null || return 1
+    out="$scratch/$(basename -- "$file").$$.${RANDOM}.plain"
+    case "$file" in
+        *.gz)  gunzip -c -- "$file" ;;
+        *.bz2) bunzip2 -c -- "$file" ;;
+        *.xz)  unxz -c -- "$file" ;;
+    esac > "$out" 2>/dev/null
+
+    if [[ -s "$out" ]]; then
+        echo "$out"
+    else
+        rm -f -- "$out" 2>/dev/null
+        return 1
+    fi
+}
+
+# Runs parce_service_log() on one candidate file and, on success, appends
+# its extracted chunk(s) to that file's group accumulator under
+# $work_dir/groups/. Cleans up parce_service_log()'s own tmp output dir
+# and any scratch-decompressed copy immediately, regardless of outcome.
+# Returns 0 if this file contributed any lines, 1 otherwise (normal for a
+# rotated file that simply has nothing in range — not an error).
+_psl_process_one_candidate() {
+    local file="$1" from_epoch="$2" to_epoch="$3" work_dir="$4"
+    local plain is_scratch=0 group group_file rc=1
+
+    plain=$(_psl_materialize_plain "$file" "$work_dir") || return 1
+    [[ "$plain" != "$file" ]] && is_scratch=1
+
+    if parce_service_log "$plain" "$from_epoch" "$to_epoch" >/dev/null 2>&1; then
+        group=$(_psl_log_group_key "$file")
+        group_file="$work_dir/groups/${group}.log"
+        mkdir -p "$work_dir/groups" 2>/dev/null
+        cat "$PSL_OUTPUT_PATH"/part_*.log >> "$group_file" 2>/dev/null
+        rc=0
+    fi
+    rm -rf -- "${PSL_OUTPUT_PATH:-}" 2>/dev/null
+    [[ "$is_scratch" -eq 1 ]] && rm -f -- "$plain" 2>/dev/null
+    return "$rc"
+}
+
+# Fresh, transparently-named /tmp directory for the final per-service
+# result: /tmp/parces_<service>_<from>-<to>.<random>/
+_psl_make_service_output_dir() {
+    local service="$1" from_epoch="$2" to_epoch="$3" base prefix
+    base="${service//[^A-Za-z0-9._-]/_}"
+    prefix="/tmp/parces_${base}_${from_epoch}-${to_epoch}"
+    mktemp -d "${prefix}.XXXXXX" 2>/dev/null
+}
+
+# Re-chunks every per-group accumulator file in $work_dir/groups/ into
+# MAX_LOG_CHUNK_SIZE-sized, line-whole pieces under $final_dir, named
+# "<group>.part_NN.log". Echoes the total number of chunk files written.
+_psl_finalize_groups() {
+    local work_dir="$1" final_dir="$2"
+    local gfile gkey count
+
+    for gfile in "$work_dir"/groups/*.log; do
+        [[ -s "$gfile" ]] || continue
+        gkey=$(basename -- "$gfile"); gkey="${gkey%.log}"
+        split -C "${MAX_LOG_CHUNK_SIZE:-104857600}" -d --numeric-suffixes=1 \
+            --additional-suffix=.log -- "$gfile" "$final_dir/${gkey}.part_" 2>/dev/null
+    done
+
+    count=$(find "$final_dir" -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l)
+    echo "${count:-0}"
+}
+
+# Extracts every log file of a given service that falls (even partially)
+# inside [ts_from, ts_to] into a small set of merged, size-bounded chunk
+# files under /tmp.
+#   $1 = service name (nginx, mysqld, apache2, ssh, an internal FLAT
+#        product package name, ...)
+#   $2 = range start — epoch seconds, or anything `date -d` accepts
+#   $3 = range end   — epoch seconds, or anything `date -d` accepts
+# On success: sets PSLS_OUTPUT_PATH (the /tmp directory holding
+# <type>.part_NN.log per log type — access/error/etc. never mixed) and
+# PSLS_OUTPUT_CHUNKS, echoes "<PSLS_OUTPUT_PATH> <PSLS_OUTPUT_CHUNKS>",
+# returns 0. On failure: warns with a reason, returns 1.
+parce_service_logs() {
+    local service="$1" ts_from_raw="$2" ts_to_raw="$3"
+    local from_epoch to_epoch work_dir final_dir chunk_count processed=0
+    local f
+    local -a dirs=() candidates=() kept=()
+
+    unset PSLS_OUTPUT_PATH PSLS_OUTPUT_CHUNKS
+
+    [[ -n "$service" ]] || { warn "parce_service_logs: no service name given"; return 1; }
+    from_epoch=$(_psl_parse_timestamp "$ts_from_raw") || return 1
+    to_epoch=$(_psl_parse_timestamp "$ts_to_raw") || return 1
+    if [[ "$from_epoch" -gt "$to_epoch" ]]; then
+        warn "parce_service_logs: start timestamp is after end timestamp"
+        return 1
+    fi
+
+    mapfile -t dirs < <(_psl_find_service_log_dirs "$service")
+    if [[ ${#dirs[@]} -eq 0 ]]; then
+        warn "parce_service_logs: no log directory found for service '$service'"
+        return 1
+    fi
+    info "parce_service_logs: $service log dirs: ${dirs[*]}"
+
+    mapfile -t candidates < <(_psl_scan_candidate_files "$from_epoch" "$to_epoch" "${dirs[@]}")
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        warn "parce_service_logs: no files for '$service' overlap the requested range"
+        return 1
+    fi
+    mapfile -t kept < <(printf '%s\n' "${candidates[@]}" | _psl_dedupe_archive_copies)
+
+    work_dir=$(mktemp -d "/tmp/parces_work_${service}.XXXXXX" 2>/dev/null) || {
+        warn "parce_service_logs: cannot create scratch dir under /tmp"
+        return 1
+    }
+
+    for f in "${kept[@]}"; do
+        _psl_process_one_candidate "$f" "$from_epoch" "$to_epoch" "$work_dir" \
+            && processed=$((processed + 1))
+    done
+
+    if [[ "$processed" -eq 0 ]]; then
+        warn "parce_service_logs: no lines matched inside the requested range for '$service'"
+        rm -rf -- "$work_dir" 2>/dev/null
+        return 1
+    fi
+
+    final_dir=$(_psl_make_service_output_dir "$service" "$from_epoch" "$to_epoch")
+    if [[ -z "$final_dir" || ! -d "$final_dir" ]]; then
+        warn "parce_service_logs: cannot create output dir under /tmp"
+        rm -rf -- "$work_dir" 2>/dev/null
+        return 1
+    fi
+
+    chunk_count=$(_psl_finalize_groups "$work_dir" "$final_dir")
+    rm -rf -- "$work_dir" 2>/dev/null
+
+    if [[ ! "$chunk_count" =~ ^[0-9]+$ ]] || [[ "$chunk_count" -eq 0 ]]; then
+        warn "parce_service_logs: nothing to output for '$service'"
+        rm -rf -- "$final_dir" 2>/dev/null
+        return 1
+    fi
+
+    PSLS_OUTPUT_PATH="$final_dir"
+    PSLS_OUTPUT_CHUNKS="$chunk_count"
+    echo "$PSLS_OUTPUT_PATH $PSLS_OUTPUT_CHUNKS"
+}
+
 # Built-in seek unit-test (used by extended selftest / --dev)
 _selftest_seek_extract() {
     local dir log dest from_epoch to_epoch base n lines got sz
@@ -4004,6 +4351,21 @@ _run_selftest_simple() {
     declare -F parce_service_log >/dev/null 2>&1 \
         && _selftest_ok "parce_service_log defined" \
         || _selftest_bad "parce_service_log defined"
+    declare -F parce_service_logs >/dev/null 2>&1 \
+        && _selftest_ok "parce_service_logs defined" \
+        || _selftest_bad "parce_service_logs defined"
+    declare -F _psl_find_service_log_dirs >/dev/null 2>&1 \
+        && _selftest_ok "_psl_find_service_log_dirs defined" \
+        || _selftest_bad "_psl_find_service_log_dirs defined"
+
+    # Functional check without touching /var/log (may not be writable by
+    # whoever runs the self-test): _psl_find_service_log_dirs() must fail
+    # cleanly (no output, rc=1) for a service that plainly doesn't exist.
+    if ! _psl_find_service_log_dirs "flat-selftest-no-such-service-xyz" >/dev/null 2>&1; then
+        _selftest_ok "_psl_find_service_log_dirs: graceful miss"
+    else
+        _selftest_bad "_psl_find_service_log_dirs: graceful miss"
+    fi
 
     tmp=$(mktemp "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
     dest="${tmp}.out"
