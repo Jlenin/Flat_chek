@@ -5191,11 +5191,48 @@ run_log_collection() {
 # --- 11. Wizard / help / argv / main -------------------------------------------
 
 # Interactive product/service picker; sets SELECTED_PRODUCTS / SELECTED_SERVICES
+# Print a numbered list beforehand, then read+parse the user's choice into
+# a selection from that same list: "a"/"A"/"а"/"А" (or empty input) selects
+# everything; comma-separated indices pick specific items (invalid tokens
+# warn and are skipped); if nothing valid was picked, falls back to
+# "everything" — same as an explicit "all". This is the read+parse step
+# that used to be copy-pasted for the products list and the services list
+# below; the numbered-list *printing* differs between the two (different
+# per-item annotation) and stays in each caller.
+# Args: label (for the "Invalid <label> choice" warning), source array
+# name, destination array name.
+_wizard_pick_from_list() {
+    local label="$1"
+    local -n _wpfl_src=$2
+    local -n _wpfl_dst=$3
+    local choice="" part
+    local -a _parts=()
+
+    read -r choice 2>/dev/null || true
+    choice="${choice:-a}"
+
+    _wpfl_dst=()
+    if [[ "$choice" == "a" || "$choice" == "A" || "$choice" == "а" || "$choice" == "А" ]]; then
+        _wpfl_dst=("${_wpfl_src[@]}")
+    else
+        IFS=',' read -ra _parts <<< "$choice"
+        for part in "${_parts[@]}"; do
+            part="${part// /}"
+            [[ -z "$part" ]] && continue
+            if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#_wpfl_src[@]} ]]; then
+                _wpfl_dst+=("${_wpfl_src[$((part - 1))]}")
+            else
+                warn "Invalid $label choice: $part"
+            fi
+        done
+        [[ ${#_wpfl_dst[@]} -eq 0 ]] && _wpfl_dst=("${_wpfl_src[@]}")
+    fi
+}
+
 _wizard_select_log_targets() {
     local -a prods=()
     local -A prod_pkgs=()
-    local pkg prod i choice="" refine=""
-    local -a idx_map=()
+    local pkg prod i refine=""
     local -a svc_list=()
 
     SELECTED_PRODUCTS=()
@@ -5222,30 +5259,11 @@ _wizard_select_log_targets() {
     i=1
     for prod in "${prods[@]}"; do
         echo "  $i — $prod (${prod_pkgs[$prod]})"
-        idx_map+=("$prod")
         i=$((i + 1))
     done
     echo "$(_l wiz_products_all)"
     echo -n "$(_l wiz_products_prompt)"
-    read -r choice 2>/dev/null || true
-    choice="${choice:-a}"
-
-    if [[ "$choice" == "a" || "$choice" == "A" || "$choice" == "а" || "$choice" == "А" ]]; then
-        SELECTED_PRODUCTS=("${prods[@]}")
-    else
-        local part
-        IFS=',' read -ra _parts <<< "$choice"
-        for part in "${_parts[@]}"; do
-            part="${part// /}"
-            [[ -z "$part" ]] && continue
-            if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#idx_map[@]} ]]; then
-                SELECTED_PRODUCTS+=("${idx_map[$((part - 1))]}")
-            else
-                warn "Invalid product choice: $part"
-            fi
-        done
-        [[ ${#SELECTED_PRODUCTS[@]} -eq 0 ]] && SELECTED_PRODUCTS=("${prods[@]}")
-    fi
+    _wizard_pick_from_list product prods SELECTED_PRODUCTS
 
     # Optional service refine: always offer when at least one product selected
     echo ""
@@ -5260,33 +5278,14 @@ _wizard_select_log_targets() {
         done
         echo "$(_l wiz_title_services)"
         i=1
-        idx_map=()
         for pkg in "${svc_list[@]}"; do
             echo "  $i — $pkg [${PKG_PRODUCT[$pkg]}]"
-            idx_map+=("$pkg")
             i=$((i + 1))
         done
         echo "$(_l wiz_services_all)"
         echo -n "$(_l wiz_services_prompt)"
-        read -r choice 2>/dev/null || true
-        choice="${choice:-a}"
+        _wizard_pick_from_list service svc_list SELECTED_SERVICES
         SELECTED_PRODUCTS=()
-        SELECTED_SERVICES=()
-        if [[ "$choice" == "a" || "$choice" == "A" || "$choice" == "а" || "$choice" == "А" ]]; then
-            SELECTED_SERVICES=("${svc_list[@]}")
-        else
-            IFS=',' read -ra _parts <<< "$choice"
-            for part in "${_parts[@]}"; do
-                part="${part// /}"
-                [[ -z "$part" ]] && continue
-                if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#idx_map[@]} ]]; then
-                    SELECTED_SERVICES+=("${idx_map[$((part - 1))]}")
-                else
-                    warn "Invalid service choice: $part"
-                fi
-            done
-            [[ ${#SELECTED_SERVICES[@]} -eq 0 ]] && SELECTED_SERVICES=("${svc_list[@]}")
-        fi
     fi
 
     resolve_selected_packages
@@ -5306,17 +5305,14 @@ _wizard_select_log_targets() {
     done
 }
 
-run_interactive_wizard() {
-    # Reset modes so a prior -log/--dev on argv cannot leak into health-check choice
-    MODE_LOG=0
-    MODE_DEV=0
-    SELFTEST_MODE=""
-    # Init before read — set -u aborts on EOF if vars were never assigned
-    local lang_choice="" mode_choice="" submode_choice="" scope_choice=""
-    local tcpdump_choice="" range_choice="" repo_choice="" out_dir=""
-    local selftest_choice=""
+# --- Wizard dialog steps (each reads exactly one prompt) --------------------
+# Locals are pre-initialized to "" before every read: under `set -u`, a
+# `read` that hits EOF (non-interactive stdin) can leave the target
+# variable unbound rather than empty, and any later `[[ "$var" == ... ]]`
+# on a never-assigned local would abort the script.
 
-    # Step 1: Language
+_wizard_step_language() {
+    local lang_choice=""
     echo ""
     echo "=== Language / Язык ==="
     echo "  1 — Русский"
@@ -5324,119 +5320,168 @@ run_interactive_wizard() {
     echo -n "$(_l ask_lang_prompt)"
     read -r lang_choice 2>/dev/null || true
     if [[ "$lang_choice" == "1" ]]; then CURRENT_LANG="ru"; else CURRENT_LANG="en"; fi
+}
 
-    # Step 2: Mode
+# Sets global WIZARD_MODE_CHOICE for the caller's dispatch — NOT echoed:
+# this function already prints prompt text to the same stdout, so
+# returning the choice via $(...) would capture that text too.
+_wizard_step_mode() {
+    WIZARD_MODE_CHOICE=""
     echo ""
     echo "$(_l wiz_title_mode)"
     echo "$(_l wiz_mode_1)"
     echo "$(_l wiz_mode_2)"
     echo "$(_l wiz_mode_3)"
     echo -n "$(_l wiz_mode_prompt)"
-    read -r mode_choice 2>/dev/null || true
+    read -r WIZARD_MODE_CHOICE 2>/dev/null || true
+}
 
-    case "$mode_choice" in
+_wizard_step_online_offline() {
+    local submode_choice=""
+    echo ""
+    echo "$(_l wiz_title_type)"
+    echo "$(_l wiz_type_1)"
+    echo "$(_l wiz_type_2)"
+    echo -n "$(_l wiz_type_prompt)"
+    read -r submode_choice 2>/dev/null || true
+    [[ "$submode_choice" == "2" ]] && LOG_SUBMODE="offline" || LOG_SUBMODE="online"
+}
+
+_wizard_step_scope() {
+    local scope_choice=""
+    echo ""
+    echo "$(_l wiz_title_scope)"
+    echo "$(_l wiz_scope_1)"
+    echo "$(_l wiz_scope_2)"
+    echo -n "$(_l wiz_scope_prompt)"
+    read -r scope_choice 2>/dev/null || true
+    [[ "$scope_choice" == "2" ]] && LOG_SCOPE="extended" || LOG_SCOPE="brief"
+}
+
+# Online: timeout, plus (extended scope only) a tcpdump opt-out.
+_wizard_step_online_time_settings() {
+    local tcpdump_choice=""
+    echo ""
+    echo -n "$(_l wiz_timeout)"
+    read -r TIMEOUT_RAW 2>/dev/null || true
+    TIMEOUT_RAW="${TIMEOUT_RAW:-}"
+    if [[ "$LOG_SCOPE" == "extended" ]]; then
+        echo -n "$(_l wiz_tcpdump)"
+        read -r tcpdump_choice 2>/dev/null || true
+        [[ "$tcpdump_choice" == "n" || "$tcpdump_choice" == "N" || "$tcpdump_choice" == "н" || "$tcpdump_choice" == "Н" ]] && START_TCPDUMP=0
+    else
+        START_TCPDUMP=0
+    fi
+}
+
+# Offline: pick a range mode (duration-back / explicit from+to / from+offset).
+_wizard_step_offline_time_settings() {
+    local range_choice=""
+    echo ""
+    echo "$(_l wiz_title_range)"
+    echo "$(_l wiz_range_1)"
+    echo "$(_l wiz_range_2)"
+    echo "$(_l wiz_range_3)"
+    echo "$(_l wiz_range_all)"
+    echo -n "$(_l wiz_range_prompt)"
+    read -r range_choice 2>/dev/null || true
+    case "$range_choice" in
+        1)
+            echo -n "$(_l wiz_for_how_long)"
+            read -r TIMEOUT_RAW 2>/dev/null || true
+            TIMEOUT_RAW="${TIMEOUT_RAW:-}"
+            ;;
         2)
-            MODE_LOG=1
-            MODE_DEV=0
-            SELFTEST_MODE=""
-            # Step 3: Online / Offline
-            echo ""
-            echo "$(_l wiz_title_type)"
-            echo "$(_l wiz_type_1)"
-            echo "$(_l wiz_type_2)"
-            echo -n "$(_l wiz_type_prompt)"
-            read -r submode_choice 2>/dev/null || true
-            [[ "$submode_choice" == "2" ]] && LOG_SUBMODE="offline" || LOG_SUBMODE="online"
-
-            # Scope: brief / extended
-            echo ""
-            echo "$(_l wiz_title_scope)"
-            echo "$(_l wiz_scope_1)"
-            echo "$(_l wiz_scope_2)"
-            echo -n "$(_l wiz_scope_prompt)"
-            read -r scope_choice 2>/dev/null || true
-            [[ "$scope_choice" == "2" ]] && LOG_SCOPE="extended" || LOG_SCOPE="brief"
-
-            # Time settings
-            if [[ "$LOG_SUBMODE" == "online" ]]; then
-                echo ""
-                echo -n "$(_l wiz_timeout)"
-                read -r TIMEOUT_RAW 2>/dev/null || true
-                TIMEOUT_RAW="${TIMEOUT_RAW:-}"
-                if [[ "$LOG_SCOPE" == "extended" ]]; then
-                    echo -n "$(_l wiz_tcpdump)"
-                    read -r tcpdump_choice 2>/dev/null || true
-                    [[ "$tcpdump_choice" == "n" || "$tcpdump_choice" == "N" || "$tcpdump_choice" == "н" || "$tcpdump_choice" == "Н" ]] && START_TCPDUMP=0
-                else
-                    START_TCPDUMP=0
-                fi
-            else
-                # Offline: range selection
-                echo ""
-                echo "$(_l wiz_title_range)"
-                echo "$(_l wiz_range_1)"
-                echo "$(_l wiz_range_2)"
-                echo "$(_l wiz_range_3)"
-                echo "$(_l wiz_range_all)"
-                echo -n "$(_l wiz_range_prompt)"
-                read -r range_choice 2>/dev/null || true
-                case "$range_choice" in
-                    1)
-                        echo -n "$(_l wiz_for_how_long)"
-                        read -r TIMEOUT_RAW 2>/dev/null || true
-                        TIMEOUT_RAW="${TIMEOUT_RAW:-}"
-                        ;;
-                    2)
-                        echo -n "$(_l wiz_from_dt)"
-                        read -r FROM_TIME 2>/dev/null || true
-                        FROM_TIME="${FROM_TIME:-}"
-                        echo -n "$(_l wiz_to_dt)"
-                        read -r TO_TIME 2>/dev/null || true
-                        TO_TIME="${TO_TIME:-}"
-                        ;;
-                    3)
-                        echo -n "$(_l wiz_from_dt2)"
-                        read -r FROM_TIME 2>/dev/null || true
-                        FROM_TIME="${FROM_TIME:-}"
-                        echo -n "$(_l wiz_for_offset)"
-                        read -r TO_TIME 2>/dev/null || true
-                        TO_TIME="${TO_TIME:-}"
-                        ;;
-                esac
-            fi
-
-            # Product / service selection
-            detect_os
-            _wizard_select_log_targets
-
-            # Output directory
-            echo -n "$(_l wiz_output_dir)"
-            read -r out_dir 2>/dev/null || true
-            [[ -n "$out_dir" ]] && OUTPUT_DIR="$out_dir"
+            echo -n "$(_l wiz_from_dt)"
+            read -r FROM_TIME 2>/dev/null || true
+            FROM_TIME="${FROM_TIME:-}"
+            echo -n "$(_l wiz_to_dt)"
+            read -r TO_TIME 2>/dev/null || true
+            TO_TIME="${TO_TIME:-}"
             ;;
         3)
-            MODE_LOG=0
-            MODE_DEV=0
-            echo ""
-            echo "$(_l wiz_title_selftest)"
-            echo "$(_l wiz_selftest_1)"
-            echo "$(_l wiz_selftest_2)"
-            echo -n "$(_l wiz_selftest_prompt)"
-            read -r selftest_choice 2>/dev/null || true
-            case "$selftest_choice" in
-                2) SELFTEST_MODE="extended"; MODE_DEV=1 ;;
-                *) SELFTEST_MODE="simple" ;;
-            esac
+            echo -n "$(_l wiz_from_dt2)"
+            read -r FROM_TIME 2>/dev/null || true
+            FROM_TIME="${FROM_TIME:-}"
+            echo -n "$(_l wiz_for_offset)"
+            read -r TO_TIME 2>/dev/null || true
+            TO_TIME="${TO_TIME:-}"
             ;;
-        *)
-            # Default: health check
-            MODE_LOG=0
-            MODE_DEV=0
-            SELFTEST_MODE=""
-            echo -n "$(_l wiz_show_repo)"
-            read -r repo_choice 2>/dev/null || true
-            [[ "$repo_choice" == "y" || "$repo_choice" == "Y" || "$repo_choice" == "д" || "$repo_choice" == "Д" ]] && SHOW_REPO=1
-            ;;
+    esac
+}
+
+_wizard_step_output_dir() {
+    local out_dir=""
+    echo -n "$(_l wiz_output_dir)"
+    read -r out_dir 2>/dev/null || true
+    [[ -n "$out_dir" ]] && OUTPUT_DIR="$out_dir"
+}
+
+# Mode 2: configure log collection end to end — online/offline, scope,
+# time settings, product/service selection, output dir.
+_wizard_configure_log_mode() {
+    MODE_LOG=1
+    MODE_DEV=0
+    SELFTEST_MODE=""
+
+    _wizard_step_online_offline
+    _wizard_step_scope
+
+    if [[ "$LOG_SUBMODE" == "online" ]]; then
+        _wizard_step_online_time_settings
+    else
+        _wizard_step_offline_time_settings
+    fi
+
+    # Product / service selection
+    detect_os
+    _wizard_select_log_targets
+
+    _wizard_step_output_dir
+}
+
+# Mode 3: configure self-test mode (simple/extended).
+_wizard_configure_selftest() {
+    local selftest_choice=""
+    MODE_LOG=0
+    MODE_DEV=0
+    echo ""
+    echo "$(_l wiz_title_selftest)"
+    echo "$(_l wiz_selftest_1)"
+    echo "$(_l wiz_selftest_2)"
+    echo -n "$(_l wiz_selftest_prompt)"
+    read -r selftest_choice 2>/dev/null || true
+    case "$selftest_choice" in
+        2) SELFTEST_MODE="extended"; MODE_DEV=1 ;;
+        *) SELFTEST_MODE="simple" ;;
+    esac
+}
+
+# Default mode: health check, with an optional repositories section.
+_wizard_configure_healthcheck() {
+    local repo_choice=""
+    MODE_LOG=0
+    MODE_DEV=0
+    SELFTEST_MODE=""
+    echo -n "$(_l wiz_show_repo)"
+    read -r repo_choice 2>/dev/null || true
+    [[ "$repo_choice" == "y" || "$repo_choice" == "Y" || "$repo_choice" == "д" || "$repo_choice" == "Д" ]] && SHOW_REPO=1
+}
+
+run_interactive_wizard() {
+    # Reset modes so a prior -log/--dev on argv cannot leak into health-check choice
+    MODE_LOG=0
+    MODE_DEV=0
+    SELFTEST_MODE=""
+
+    _wizard_step_language
+
+    _wizard_step_mode
+
+    case "$WIZARD_MODE_CHOICE" in
+        2) _wizard_configure_log_mode ;;
+        3) _wizard_configure_selftest ;;
+        *) _wizard_configure_healthcheck ;;
     esac
 }
 
