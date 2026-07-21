@@ -1220,10 +1220,10 @@ get_sys_cpu_rhel() {
     echo "$us"
 }
 
-get_sys_cpu_centos()    { get_sys_cpu_rhel; }
-get_sys_cpu_oracle()    { get_sys_cpu_rhel; }
-get_sys_cpu_rocky()     { get_sys_cpu_rhel; }
-get_sys_cpu_almalinux() { get_sys_cpu_rhel; }
+get_sys_cpu_centos()    { get_sys_cpu_rhel; }   # CentOS is a RHEL rebuild
+get_sys_cpu_oracle()    { get_sys_cpu_rhel; }   # Oracle Linux is a RHEL rebuild
+get_sys_cpu_rocky()     { get_sys_cpu_rhel; }   # Rocky Linux is a RHEL rebuild
+get_sys_cpu_almalinux() { get_sys_cpu_rhel; }   # AlmaLinux is a RHEL rebuild
 
 # Arch always tracks latest procps-ng — same output shape as Debian family.
 get_sys_cpu_arch() { get_sys_cpu_debian; }
@@ -1724,6 +1724,7 @@ register_dep() {
 #   2 = legacy name found instead  3 = not found at all
 # check_pkg_installed() below only ever calls these through a $PM dispatch.
 
+# Debian family: dpkg-query gives version + full install status in one call.
 check_pkg_installed_dpkg() {
     local pkg="$1" legacy="$2" old found ver status
 
@@ -1757,6 +1758,7 @@ check_pkg_installed_dpkg() {
     return 3
 }
 
+# RHEL family: rpm -q only confirms presence, version comes from a second query.
 check_pkg_installed_rpm() {
     local pkg="$1" legacy="$2" old ver
 
@@ -1779,6 +1781,7 @@ check_pkg_installed_rpm() {
     return 3
 }
 
+# Arch: pacman -Q prints "name version" on one line for an installed package.
 check_pkg_installed_pacman() {
     local pkg="$1" legacy="$2" old ver
 
@@ -1801,6 +1804,7 @@ check_pkg_installed_pacman() {
     return 3
 }
 
+# Alpine: apk info -e only confirms presence, no separate version query used here.
 check_pkg_installed_apk() {
     local pkg="$1" legacy="$2" old
 
@@ -2578,63 +2582,77 @@ check_infrastructure() {
 
 # Check repositories
 
+# --- Per-PM repository listing ----------------------------------------------
+# One self-contained function per package manager — each reads that PM's own
+# repo config files/tools only. check_repositories() below just prints the
+# section header and dispatches on $PM.
+
+# Debian family: sources.list(.d) entries, then apt-cache policy priorities.
+check_repositories_dpkg() {
+    local f line policy
+
+    if [[ -f /etc/apt/sources.list ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* ]] && continue
+            print_info "[apt] $line"
+        done < /etc/apt/sources.list
+    fi
+
+    for f in /etc/apt/sources.list.d/*.list; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* ]] && continue
+            print_info "[apt] $line"
+        done < "$f"
+    done
+
+    if command -v apt-cache &>/dev/null; then
+        policy=$(apt-cache policy 2>/dev/null | grep -E '^\s+[0-9]+' | head -20)
+        if [[ -n "$policy" ]]; then
+            echo ""
+            print_info "APT priorities:"
+            echo "$policy" | while IFS= read -r line; do
+                print_info "  $line"
+            done
+        fi
+    fi
+}
+
+# RHEL family: `yum repolist` output, then raw *.repo files under yum.repos.d.
+check_repositories_rpm() {
+    local f line repolist
+
+    if command -v yum &>/dev/null; then
+        repolist=$(yum repolist 2>/dev/null | tail -n +2 | grep -v "^repolist" | head -30)
+        if [[ -n "$repolist" ]]; then
+            echo "$repolist" | while IFS= read -r line; do
+                print_info "[yum] $line"
+            done
+        fi
+    fi
+
+    for f in /etc/yum.repos.d/*.repo; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* ]] && continue
+            print_info "[yum] $line"
+        done < "$f"
+    done
+}
+
+# Print configured package repositories for the detected PM (dpkg/rpm only —
+# pacman/apk repo listing was never implemented, same as before this split).
 check_repositories() {
     echo ""
     echo "=== Repositories ==="
 
-    if [[ "$PM" == "dpkg" ]]; then
-        # APT sources
-        if [[ -f /etc/apt/sources.list ]]; then
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                [[ "$line" == \#* ]] && continue
-                print_info "[apt] $line"
-            done < /etc/apt/sources.list
-        fi
-
-        for f in /etc/apt/sources.list.d/*.list; do
-            [[ -f "$f" ]] || continue
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                [[ "$line" == \#* ]] && continue
-                print_info "[apt] $line"
-            done < "$f"
-        done
-
-        # APT priorities via apt-cache policy (if available)
-        if command -v apt-cache &>/dev/null; then
-            local policy
-            policy=$(apt-cache policy 2>/dev/null | grep -E '^\s+[0-9]+' | head -20)
-            if [[ -n "$policy" ]]; then
-                echo ""
-                print_info "APT priorities:"
-                echo "$policy" | while IFS= read -r line; do
-                    print_info "  $line"
-                done
-            fi
-        fi
-
-    elif [[ "$PM" == "rpm" ]]; then
-        # YUM/DNF repos
-        if command -v yum &>/dev/null; then
-            local repolist
-            repolist=$(yum repolist 2>/dev/null | tail -n +2 | grep -v "^repolist" | head -30)
-            if [[ -n "$repolist" ]]; then
-                echo "$repolist" | while IFS= read -r line; do
-                    print_info "[yum] $line"
-                done
-            fi
-        fi
-
-        for f in /etc/yum.repos.d/*.repo; do
-            [[ -f "$f" ]] || continue
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                [[ "$line" == \#* ]] && continue
-                print_info "[yum] $line"
-            done < "$f"
-        done
-    fi
+    case "$PM" in
+        dpkg) check_repositories_dpkg ;;
+        rpm)  check_repositories_rpm ;;
+    esac
 }
 
 # Summary
