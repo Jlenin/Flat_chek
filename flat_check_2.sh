@@ -4901,19 +4901,12 @@ collect_configs() {
 }
 
 # --- 10. Online / offline collection -------------------------------------------
-run_log_collection() {
+# Resolve OUTPUT_DIR into COLLECTOR_DIR/WORK_DIR/ARCHIVE_NAME. These stay
+# plain globals on purpose — start_disk_watch/cleanup/signal handlers read
+# $WORK_DIR directly, same as before this split. Removes stale prior work
+# dirs first (never touches the one we're about to create).
+_prepare_collection_workdir() {
     local mode="$1"
-    local timeout_raw="${2:-}"
-    local timeout_sec=0
-
-    if [[ -n "$timeout_raw" ]]; then
-        if ! parse_duration "$timeout_raw"; then
-            die "Invalid timeout: '$timeout_raw'. Use: 5h, 30m, 1d, 300s or 300"
-        fi
-        if [[ "$mode" == "online" ]]; then
-            timeout_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
-        fi
-    fi
 
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     COLLECTOR_DIR="${OUTPUT_DIR:-$SCRIPT_DIR}"
@@ -4930,6 +4923,12 @@ run_log_collection() {
 
     info "$(_l mode_log): $mode / scope=$LOG_SCOPE (flat_check_2 v${SCRIPT_VERSION})"
     info "$(_l workdir): $WORK_DIR"
+}
+
+# Resolve SELECTED_PKGS and the global ALL_LOG_DIRS array. Returns 1 (after
+# removing the just-created WORK_DIR) if there is nothing to collect.
+_resolve_collection_targets() {
+    local mode="$1" logdir
 
     detect_os
     command -v tail &>/dev/null || die "$(_l err_cmd_notfound): tail"
@@ -4967,158 +4966,168 @@ run_log_collection() {
     for logdir in "${ALL_LOG_DIRS[@]}"; do
         info "  → $logdir"
     done
+}
 
-    local collect_infra=0
-    [[ "$LOG_SCOPE" == "extended" ]] && collect_infra=1
+# Online: start tail -F on every dir in the global ALL_LOG_DIRS (+ infra
+# logs when collect_infra=1), optionally tcpdump, then block until
+# stop/timeout. Returns 1 (after removing WORK_DIR) if nothing ever
+# started tailing.
+_run_online_collection() {
+    local timeout_raw="$1" timeout_sec="$2" collect_infra="$3"
+    local logdir dest_name sysfile
 
-    if [[ "$mode" == "online" ]]; then
-        # Non-interactive online without -t would exit immediately after starting tails
-        if [[ ! -t 0 && "$timeout_sec" -le 0 ]]; then
-            safe_rm_work_dir "$WORK_DIR"
-            die "$(_l err_online_need_t)"
-        fi
-
-        # Disk guard before spawning tails (check immediately inside start_disk_watch)
-        start_disk_watch "$WORK_DIR"
-
-        local logdir dest_name
-        for logdir in "${ALL_LOG_DIRS[@]}"; do
-            dest_name=$(_archive_subdir_name "$logdir")
-            start_tail_for_dir "$logdir" "$WORK_DIR/$dest_name" "" "$dest_name"
-        done
-        if [[ "$collect_infra" -eq 1 ]]; then
-            for sysfile in /var/log/messages /var/log/syslog; do
-                [[ -f "$sysfile" ]] && start_tail_for_file "$sysfile" "$WORK_DIR/system" "system"
-            done
-
-            # Nginx logs for FLAT — collect if nginx is present (plain logs only online)
-            if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
-                local ngx_dir="/var/log/nginx"
-                if [[ -d "$ngx_dir" ]]; then
-                    while IFS= read -r -d '' ngx_file; do
-                        start_tail_for_file "$ngx_file" "$WORK_DIR/nginx" "nginx"
-                    done < <(find -L "$ngx_dir" -maxdepth 1 -type f \( -name '*flat*.log' -o -name '*access*.log' -o -name '*error*.log' \) ! -name '*.gz' -print0 2>/dev/null)
-                fi
-            fi
-
-            collect_postgresql_logs "$WORK_DIR" "online"
-        fi
-
-        if [[ ${#TAIL_PIDS[@]} -eq 0 ]]; then
-            warn "$(_l err_no_logfiles)"
-            safe_rm_work_dir "$WORK_DIR"
-            return 1
-        fi
-        ok "$(_l tail_running): ${#TAIL_PIDS[@]}"
-
-        if [[ "$collect_infra" -eq 1 && "$START_TCPDUMP" -eq 1 ]]; then
-            if command -v tcpdump &>/dev/null; then
-                nohup tcpdump -i any -s 0 -w "$WORK_DIR/tcpdump_$(hostname).pcap" >/dev/null 2>&1 &
-                TCPDUMP_PID=$!; sleep 1
-                if kill -0 "$TCPDUMP_PID" 2>/dev/null; then ok "$(_l tcpdump_started) $TCPDUMP_PID)"
-                else warn "$(_l tcpdump_fail)"; TCPDUMP_PID=""; fi
-            else warn "$(_l tcpdump_notfound)"; fi
-        fi
-
-        echo ""
-        info "$(_l log_running)"
-        info "$(_l log_running_online_note)"
-        [[ "$timeout_sec" -gt 0 ]] && info "$(_l log_autostop) ${timeout_raw} (${timeout_sec}s)"
-        if [[ "$timeout_sec" -gt 0 ]]; then
-            ( sleep "$timeout_sec"; kill -TERM $$ 2>/dev/null ) &
-            TIMEOUT_KILL_PID=$!
-        fi
-        _online_wait_for_stop
-        [[ -n "${TIMEOUT_KILL_PID:-}" ]] && kill "$TIMEOUT_KILL_PID" 2>/dev/null && wait "$TIMEOUT_KILL_PID" 2>/dev/null
-        TIMEOUT_KILL_PID=""
-        echo ""
-        if [[ "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]; then
-            info "$(_l log_autostop) ${timeout_raw} (${timeout_sec}s)"
-            COLLECTOR_TIMEOUT_STOP=0
-        fi
-        info "$(_l log_stopping)"
-        cleanup
-    else
-        # Offline: disk space guard (graceful stop + archive, same as online)
-        start_disk_watch "$WORK_DIR"
-
-        # Parse from/to for offline range collection
-        local from_time="" to_time=""
-        if [[ -n "$FROM_TIME" ]]; then
-            from_time=$(parse_time_point "$FROM_TIME") || die "Invalid --from: '$FROM_TIME'"
-        fi
-        if [[ -n "$TO_TIME" ]]; then
-            # Mixed mode: +3h with --from = from_time + 3 hours
-            if [[ "$TO_TIME" =~ ^[+] && -n "$from_time" ]]; then
-                local offset="${TO_TIME:1}"
-                if ! parse_duration "$offset"; then
-                    die "Invalid --to offset: '$TO_TIME'"
-                fi
-                local from_epoch add_sec
-                from_epoch=$(date -d "$from_time" "+%s" 2>/dev/null)
-                [[ -z "$from_epoch" ]] && die "Invalid --from for offset: '$FROM_TIME'"
-                add_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
-                to_time=$(date -d "@$(( from_epoch + add_sec ))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-                [[ -z "$to_time" ]] && die "Invalid --to offset: '$TO_TIME'"
-            else
-                to_time=$(parse_time_point "$TO_TIME") || die "Invalid --to: '$TO_TIME'"
-            fi
-        fi
-        # Legacy: -t in offline mode = --from -${value}
-        if [[ -z "$from_time" && -n "$timeout_raw" ]]; then
-            from_time=$(parse_time_point "-${timeout_raw}") || true
-        fi
-
-        if [[ -n "$from_time" && -n "$to_time" ]]; then
-            info "Extracting log lines from $from_time to $to_time (by content timestamp)"
-        elif [[ -n "$from_time" ]]; then
-            info "Extracting log lines from $from_time to now (by content timestamp)"
-        else
-            info "$(_l log_all)"
-        fi
-        info "Parallel copy workers: $(_collector_max_jobs) (host-wide CPU/MEM gate ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}%)"
-        copy_all_log_dirs_parallel "$WORK_DIR" "$from_time" "$to_time"
-        if [[ "$collect_infra" -eq 1 ]]; then
-            for sysfile in /var/log/messages /var/log/syslog; do
-                _collector_should_stop && break
-                copy_system_log_by_range "$sysfile" "$WORK_DIR/system" "$from_time" "$to_time" "system"
-            done
-
-            # Nginx logs for FLAT — collect if nginx is present
-            if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
-                local ngx_dir="/var/log/nginx"
-                if [[ -d "$ngx_dir" ]]; then
-                    local ngx_dest="$WORK_DIR/nginx"
-                    while IFS= read -r -d '' ngx_file; do
-                        _collector_should_stop && break
-                        if [[ -n "$from_time" || -n "$to_time" ]]; then
-                            copy_system_log_by_range "$ngx_file" "$ngx_dest" "$from_time" "$to_time" "nginx"
-                        else
-                            mkdir -p "$ngx_dest"
-                            cp -p "$ngx_file" "$ngx_dest/$(basename "$ngx_file")" 2>/dev/null && ok "nginx: $(_l sys_copied) $(basename "$ngx_file")"
-                        fi
-                    done < <(find -L "$ngx_dir" -maxdepth 1 -type f \( -name '*flat*.log' -o -name '*access*.log' -o -name '*error*.log' \) -print0 2>/dev/null)
-                    rmdir "$ngx_dest" 2>/dev/null
-                fi
-            fi
-
-            if ! _collector_should_stop; then
-                collect_postgresql_logs "$WORK_DIR" "offline" "$from_time" "$to_time"
-            fi
-        fi
-
-        if [[ "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]; then
-            info "$(_l log_autostop) disk/timeout"
-            COLLECTOR_TIMEOUT_STOP=0
-        fi
-        ok "$(_l log_copydone)"
+    # Non-interactive online without -t would exit immediately after starting tails
+    if [[ ! -t 0 && "$timeout_sec" -le 0 ]]; then
+        safe_rm_work_dir "$WORK_DIR"
+        die "$(_l err_online_need_t)"
     fi
 
+    # Disk guard before spawning tails (check immediately inside start_disk_watch)
+    start_disk_watch "$WORK_DIR"
+
+    for logdir in "${ALL_LOG_DIRS[@]}"; do
+        dest_name=$(_archive_subdir_name "$logdir")
+        start_tail_for_dir "$logdir" "$WORK_DIR/$dest_name" "" "$dest_name"
+    done
     if [[ "$collect_infra" -eq 1 ]]; then
-        collect_configs "$WORK_DIR"
+        for sysfile in /var/log/messages /var/log/syslog; do
+            [[ -f "$sysfile" ]] && start_tail_for_file "$sysfile" "$WORK_DIR/system" "system"
+        done
+
+        # Nginx logs for FLAT — collect if nginx is present (plain logs only online)
+        if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
+            local ngx_dir="/var/log/nginx"
+            if [[ -d "$ngx_dir" ]]; then
+                while IFS= read -r -d '' ngx_file; do
+                    start_tail_for_file "$ngx_file" "$WORK_DIR/nginx" "nginx"
+                done < <(find -L "$ngx_dir" -maxdepth 1 -type f \( -name '*flat*.log' -o -name '*access*.log' -o -name '*error*.log' \) ! -name '*.gz' -print0 2>/dev/null)
+            fi
+        fi
+
+        collect_postgresql_logs "$WORK_DIR" "online"
     fi
-    prune_empty_collected_files "$WORK_DIR"
-    report_collected_log_stats "$WORK_DIR" "$mode"
+
+    if [[ ${#TAIL_PIDS[@]} -eq 0 ]]; then
+        warn "$(_l err_no_logfiles)"
+        safe_rm_work_dir "$WORK_DIR"
+        return 1
+    fi
+    ok "$(_l tail_running): ${#TAIL_PIDS[@]}"
+
+    if [[ "$collect_infra" -eq 1 && "$START_TCPDUMP" -eq 1 ]]; then
+        if command -v tcpdump &>/dev/null; then
+            nohup tcpdump -i any -s 0 -w "$WORK_DIR/tcpdump_$(hostname).pcap" >/dev/null 2>&1 &
+            TCPDUMP_PID=$!; sleep 1
+            if kill -0 "$TCPDUMP_PID" 2>/dev/null; then ok "$(_l tcpdump_started) $TCPDUMP_PID)"
+            else warn "$(_l tcpdump_fail)"; TCPDUMP_PID=""; fi
+        else warn "$(_l tcpdump_notfound)"; fi
+    fi
+
+    echo ""
+    info "$(_l log_running)"
+    info "$(_l log_running_online_note)"
+    [[ "$timeout_sec" -gt 0 ]] && info "$(_l log_autostop) ${timeout_raw} (${timeout_sec}s)"
+    if [[ "$timeout_sec" -gt 0 ]]; then
+        ( sleep "$timeout_sec"; kill -TERM $$ 2>/dev/null ) &
+        TIMEOUT_KILL_PID=$!
+    fi
+    _online_wait_for_stop
+    [[ -n "${TIMEOUT_KILL_PID:-}" ]] && kill "$TIMEOUT_KILL_PID" 2>/dev/null && wait "$TIMEOUT_KILL_PID" 2>/dev/null
+    TIMEOUT_KILL_PID=""
+    echo ""
+    if [[ "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]; then
+        info "$(_l log_autostop) ${timeout_raw} (${timeout_sec}s)"
+        COLLECTOR_TIMEOUT_STOP=0
+    fi
+    info "$(_l log_stopping)"
+    cleanup
+}
+
+# Offline: parallel-copy every dir in the global ALL_LOG_DIRS within an
+# optional from/to time range (+ infra logs when collect_infra=1).
+_run_offline_collection() {
+    local timeout_raw="$1" collect_infra="$2"
+    local from_time="" to_time="" sysfile
+
+    # Offline: disk space guard (graceful stop + archive, same as online)
+    start_disk_watch "$WORK_DIR"
+
+    # Parse from/to for offline range collection
+    if [[ -n "$FROM_TIME" ]]; then
+        from_time=$(parse_time_point "$FROM_TIME") || die "Invalid --from: '$FROM_TIME'"
+    fi
+    if [[ -n "$TO_TIME" ]]; then
+        # Mixed mode: +3h with --from = from_time + 3 hours
+        if [[ "$TO_TIME" =~ ^[+] && -n "$from_time" ]]; then
+            local offset="${TO_TIME:1}"
+            if ! parse_duration "$offset"; then
+                die "Invalid --to offset: '$TO_TIME'"
+            fi
+            local from_epoch add_sec
+            from_epoch=$(date -d "$from_time" "+%s" 2>/dev/null)
+            [[ -z "$from_epoch" ]] && die "Invalid --from for offset: '$FROM_TIME'"
+            add_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
+            to_time=$(date -d "@$(( from_epoch + add_sec ))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            [[ -z "$to_time" ]] && die "Invalid --to offset: '$TO_TIME'"
+        else
+            to_time=$(parse_time_point "$TO_TIME") || die "Invalid --to: '$TO_TIME'"
+        fi
+    fi
+    # Legacy: -t in offline mode = --from -${value}
+    if [[ -z "$from_time" && -n "$timeout_raw" ]]; then
+        from_time=$(parse_time_point "-${timeout_raw}") || true
+    fi
+
+    if [[ -n "$from_time" && -n "$to_time" ]]; then
+        info "Extracting log lines from $from_time to $to_time (by content timestamp)"
+    elif [[ -n "$from_time" ]]; then
+        info "Extracting log lines from $from_time to now (by content timestamp)"
+    else
+        info "$(_l log_all)"
+    fi
+    info "Parallel copy workers: $(_collector_max_jobs) (host-wide CPU/MEM gate ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}%)"
+    copy_all_log_dirs_parallel "$WORK_DIR" "$from_time" "$to_time"
+    if [[ "$collect_infra" -eq 1 ]]; then
+        for sysfile in /var/log/messages /var/log/syslog; do
+            _collector_should_stop && break
+            copy_system_log_by_range "$sysfile" "$WORK_DIR/system" "$from_time" "$to_time" "system"
+        done
+
+        # Nginx logs for FLAT — collect if nginx is present
+        if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
+            local ngx_dir="/var/log/nginx"
+            if [[ -d "$ngx_dir" ]]; then
+                local ngx_dest="$WORK_DIR/nginx"
+                while IFS= read -r -d '' ngx_file; do
+                    _collector_should_stop && break
+                    if [[ -n "$from_time" || -n "$to_time" ]]; then
+                        copy_system_log_by_range "$ngx_file" "$ngx_dest" "$from_time" "$to_time" "nginx"
+                    else
+                        mkdir -p "$ngx_dest"
+                        cp -p "$ngx_file" "$ngx_dest/$(basename "$ngx_file")" 2>/dev/null && ok "nginx: $(_l sys_copied) $(basename "$ngx_file")"
+                    fi
+                done < <(find -L "$ngx_dir" -maxdepth 1 -type f \( -name '*flat*.log' -o -name '*access*.log' -o -name '*error*.log' \) -print0 2>/dev/null)
+                rmdir "$ngx_dest" 2>/dev/null
+            fi
+        fi
+
+        if ! _collector_should_stop; then
+            collect_postgresql_logs "$WORK_DIR" "offline" "$from_time" "$to_time"
+        fi
+    fi
+
+    if [[ "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]; then
+        info "$(_l log_autostop) disk/timeout"
+        COLLECTOR_TIMEOUT_STOP=0
+    fi
+    ok "$(_l log_copydone)"
+}
+
+# Compress the global WORK_DIR into ARCHIVE_NAME.tar.gz inside
+# COLLECTOR_DIR, using pigz with a host-aware thread count/backoff when
+# available.
+_archive_collection_workdir() {
+    local cores _pigz_wait=0
 
     cd "$COLLECTOR_DIR" || die "Cannot enter $COLLECTOR_DIR"
     if command -v pigz &>/dev/null; then
@@ -5127,7 +5136,6 @@ run_log_collection() {
         cores=$(( cores * (${RESOURCE_CPU_LIMIT:-80} - 20) / 100 ))
         [[ "$cores" -lt 1 ]] && cores=1
         _get_cpu_usage_percent >/dev/null
-        local _pigz_wait=0
         # Bounded wait only — never block archive forever on busy host
         while ! _collector_resources_ok && [[ "$_pigz_wait" -lt 30 ]]; do
             sleep 1
@@ -5142,6 +5150,41 @@ run_log_collection() {
     fi
     echo ""
     ok "$(_l archive_at): $COLLECTOR_DIR/$ARCHIVE_NAME.tar.gz"
+}
+
+run_log_collection() {
+    local mode="$1"
+    local timeout_raw="${2:-}"
+    local timeout_sec=0
+
+    if [[ -n "$timeout_raw" ]]; then
+        if ! parse_duration "$timeout_raw"; then
+            die "Invalid timeout: '$timeout_raw'. Use: 5h, 30m, 1d, 300s or 300"
+        fi
+        if [[ "$mode" == "online" ]]; then
+            timeout_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
+        fi
+    fi
+
+    _prepare_collection_workdir "$mode"
+    _resolve_collection_targets "$mode" || return 1
+
+    local collect_infra=0
+    [[ "$LOG_SCOPE" == "extended" ]] && collect_infra=1
+
+    if [[ "$mode" == "online" ]]; then
+        _run_online_collection "$timeout_raw" "$timeout_sec" "$collect_infra" || return 1
+    else
+        _run_offline_collection "$timeout_raw" "$collect_infra"
+    fi
+
+    if [[ "$collect_infra" -eq 1 ]]; then
+        collect_configs "$WORK_DIR"
+    fi
+    prune_empty_collected_files "$WORK_DIR"
+    report_collected_log_stats "$WORK_DIR" "$mode"
+
+    _archive_collection_workdir
     info "$(_l done_msg)"
 }
 
