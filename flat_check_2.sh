@@ -1846,6 +1846,54 @@ has_any_trace() {
     [[ -f "/usr/lib/systemd/system/${unit}" ]] || [[ -f "/etc/systemd/system/${unit}" ]] || [[ -f "/lib/systemd/system/${unit}" ]] || [[ -d "/opt/flat/${pkg}" ]]
 }
 
+# --- Per-PM silent presence checks ------------------------------------------
+# One self-contained function per package manager for the silent (no output)
+# fast path: main name, then each comma-separated legacy name, using only
+# that PM's own query tool. Returns 0 if found, 1 otherwise.
+# is_pkg_installed_tiny() below tries the matching one via $PM, then always
+# falls back to has_any_trace() regardless of PM/result.
+
+# Debian family: dpkg-query's Status field alone is enough, no version needed.
+is_pkg_installed_tiny_dpkg() {
+    local pkg="$1" legacy="$2" old
+
+    dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed' && return 0
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        dpkg-query -W -f='${Status}\n' "$old" 2>/dev/null | grep -q 'install ok installed' && return 0
+    done
+    return 1
+}
+
+# RHEL family: rpm -q's exit code alone is enough for a presence check.
+is_pkg_installed_tiny_rpm() {
+    local pkg="$1" legacy="$2" old
+
+    rpm -q "$pkg" &>/dev/null && return 0
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        rpm -q "$old" &>/dev/null && return 0
+    done
+    return 1
+}
+
+# Arch: pacman -Q's exit code alone is enough for a presence check.
+is_pkg_installed_tiny_pacman() {
+    local pkg="$1" legacy="$2" old
+
+    pacman -Q "$pkg" &>/dev/null && return 0
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        pacman -Q "$old" &>/dev/null && return 0
+    done
+    return 1
+}
+
+# Alpine: apk info -e's exit code alone is enough; no legacy loop here in
+# the original monolith either — apk-family FLAT packages have none.
+is_pkg_installed_tiny_apk() {
+    local pkg="$1"
+    apk info -e "$pkg" &>/dev/null && return 0
+    return 1
+}
+
 # Silent quick check if package is installed (returns 0/1, no output)
 is_pkg_installed() {
     is_pkg_installed_tiny "$@"
@@ -1855,30 +1903,12 @@ is_pkg_installed_tiny() {
     local pkg="$1"
     local legacy="$2"
 
-    if [[ "$PM" == "dpkg" ]]; then
-        dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed' && return 0
-        if [[ -n "$legacy" ]]; then
-            for old in $(echo "$legacy" | tr ',' ' '); do
-                dpkg-query -W -f='${Status}\n' "$old" 2>/dev/null | grep -q 'install ok installed' && return 0
-            done
-        fi
-    elif [[ "$PM" == "rpm" ]]; then
-        rpm -q "$pkg" &>/dev/null && return 0
-        if [[ -n "$legacy" ]]; then
-            for old in $(echo "$legacy" | tr ',' ' '); do
-                rpm -q "$old" &>/dev/null && return 0
-            done
-        fi
-    elif [[ "$PM" == "pacman" ]]; then
-        pacman -Q "$pkg" &>/dev/null && return 0
-        if [[ -n "$legacy" ]]; then
-            for old in $(echo "$legacy" | tr ',' ' '); do
-                pacman -Q "$old" &>/dev/null && return 0
-            done
-        fi
-    elif [[ "$PM" == "apk" ]]; then
-        apk info -e "$pkg" &>/dev/null && return 0
-    fi
+    case "$PM" in
+        dpkg)   is_pkg_installed_tiny_dpkg "$pkg" "$legacy" && return 0 ;;
+        rpm)    is_pkg_installed_tiny_rpm "$pkg" "$legacy" && return 0 ;;
+        pacman) is_pkg_installed_tiny_pacman "$pkg" "$legacy" && return 0 ;;
+        apk)    is_pkg_installed_tiny_apk "$pkg" && return 0 ;;
+    esac
 
     # Check traces (unit file or /opt/flat dir)
     has_any_trace "$pkg" && return 0
