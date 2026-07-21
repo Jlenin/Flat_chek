@@ -1586,74 +1586,114 @@ check_system() {
     rm -rf -- "$tmpdir" 2>/dev/null
 }
 
-# Get package real dependencies from PM
+# --- Per-PM raw dependency listing -------------------------------------------
+# One self-contained function per package manager: echoes the raw,
+# unfiltered dependency string for an installed package using only that
+# PM's own tool(s); echoes nothing if the package isn't installed.
+# get_pkg_depends() below dispatches on $PM, then runs the PM-agnostic
+# cleanup (strip version constraints/alternatives, dedupe) common to both.
+
+# Debian family: dpkg -s Depends: line, falling back to apt-cache depends.
+get_pkg_depends_dpkg() {
+    local pkg="$1" deps=""
+
+    dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed' || return
+    deps=$(dpkg -s "$pkg" 2>/dev/null | grep "^Depends:" | sed 's/^Depends: //')
+    if [[ -z "$deps" ]]; then
+        deps=$(apt-cache depends "$pkg" 2>/dev/null | grep -E "^\s+Depends:" | sed 's/.*Depends: //' | tr '\n' ', ' | sed 's/, $//')
+    fi
+    echo "$deps"
+}
+
+# RHEL family: rpm -qR raw requires list, filtered down to real package names.
+get_pkg_depends_rpm() {
+    local pkg="$1" deps=""
+
+    rpm -q "$pkg" &>/dev/null || return
+    deps=$(rpm -qR "$pkg" 2>/dev/null | grep -v "^rpmlib(" | grep -v "^/" | grep -v "^config" | grep -v "^config(" | grep -vi "^package" | grep -vi "^пакет" | sed 's/ .*$//' | sort -u | tr '\n' ', ' | sed 's/, $//')
+    echo "$deps"
+}
+
+# Get package real dependencies from PM (dpkg/rpm only — pacman/apk FLAT
+# packages never declared real deps here either, same as before this split)
 get_pkg_depends() {
     local pkg="$1"
     local deps=""
 
-    if [[ "$PM" == "dpkg" ]]; then
-        if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
-            return
-        fi
-        deps=$(dpkg -s "$pkg" 2>/dev/null | grep "^Depends:" | sed 's/^Depends: //')
-        if [[ -z "$deps" ]]; then
-            deps=$(apt-cache depends "$pkg" 2>/dev/null | grep -E "^\s+Depends:" | sed 's/.*Depends: //' | tr '\n' ', ' | sed 's/, $//')
-        fi
-    elif [[ "$PM" == "rpm" ]]; then
-        if ! rpm -q "$pkg" &>/dev/null; then
-            return
-        fi
-        deps=$(rpm -qR "$pkg" 2>/dev/null | grep -v "^rpmlib(" | grep -v "^/" | grep -v "^config" | grep -v "^config(" | grep -vi "^package" | grep -vi "^пакет" | sed 's/ .*$//' | sort -u | tr '\n' ', ' | sed 's/, $//')
-    fi
+    case "$PM" in
+        dpkg) deps=$(get_pkg_depends_dpkg "$pkg") ;;
+        rpm)  deps=$(get_pkg_depends_rpm "$pkg") ;;
+    esac
 
     # Clean: remove version constraints, alternatives, keep only package names
     echo "$deps" | tr ',' '\n' | sed 's/|.*$//' | sed 's/([^)]*)//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | grep -v '^[0-9]' | grep -v '^(' | grep -v '^)' | grep -v '^<' | grep -v '^>' | grep -v '^=' | sort -u | tr '\n' ',' | sed 's/^,//;s/,$//'
 }
 
-# Get package version from PM
-get_pkg_version() {
-    local pkg="$1"
-    local ver=""
+# --- Per-PM version query ----------------------------------------------------
+# One self-contained function per package manager: echoes the installed
+# version string for a name (package or dependency — same lookup either
+# way), or nothing if not found/not applicable.
+# get_pkg_version()/get_dep_version() are two names for the same dispatch;
+# they used to be two copies of one another, one per caller.
 
-    if [[ "$PM" == "dpkg" ]]; then
-        ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
-    elif [[ "$PM" == "rpm" ]]; then
-        ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null)
-    elif [[ "$PM" == "pacman" ]]; then
-        ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
-    fi
+# Debian family: dpkg-query prints the Version field directly.
+_pkg_version_dpkg() {
+    dpkg-query -W -f='${Version}' "$1" 2>/dev/null
+}
+
+# RHEL family: rpm has no single-field version query, so combine VERSION+RELEASE.
+_pkg_version_rpm() {
+    rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null
+}
+
+# Arch: pacman -Q prints "name version" on one line; version is the 2nd field.
+_pkg_version_pacman() {
+    pacman -Q "$1" 2>/dev/null | awk '{print $2}'
+}
+
+_pkg_version() {
+    local name="$1" ver=""
+
+    case "$PM" in
+        dpkg)   ver=$(_pkg_version_dpkg "$name") ;;
+        rpm)    ver=$(_pkg_version_rpm "$name") ;;
+        pacman) ver=$(_pkg_version_pacman "$name") ;;
+    esac
 
     echo "$ver"
 }
 
-# Check if a dependency is installed
+# Get package version from PM
+get_pkg_version() { _pkg_version "$1"; }
+
+# Get dependency version from PM (same lookup as get_pkg_version)
+get_dep_version() { _pkg_version "$1"; }
+
+# --- Per-PM dependency presence check ----------------------------------------
+# Debian family: dpkg-query's Status field alone is enough.
+_dep_installed_dpkg() {
+    dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+# RHEL family: rpm -q's exit code alone is enough.
+_dep_installed_rpm() {
+    rpm -q "$1" &>/dev/null
+}
+
+# Arch: pacman -Q's exit code alone is enough.
+_dep_installed_pacman() {
+    pacman -Q "$1" &>/dev/null
+}
+
+# Check if a dependency is installed (dpkg/rpm/pacman only, same as before)
 is_dep_installed() {
     local dep="$1"
-    if [[ "$PM" == "dpkg" ]]; then
-        dpkg-query -W -f='${Status}\n' "$dep" 2>/dev/null | grep -q 'install ok installed'
-    elif [[ "$PM" == "rpm" ]]; then
-        rpm -q "$dep" &>/dev/null
-    elif [[ "$PM" == "pacman" ]]; then
-        pacman -Q "$dep" &>/dev/null
-    else
-        return 1
-    fi
-}
-
-# Get dependency version
-get_dep_version() {
-    local dep="$1"
-    local ver=""
-
-    if [[ "$PM" == "dpkg" ]]; then
-        ver=$(dpkg-query -W -f='${Version}' "$dep" 2>/dev/null)
-    elif [[ "$PM" == "rpm" ]]; then
-        ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$dep" 2>/dev/null)
-    elif [[ "$PM" == "pacman" ]]; then
-        ver=$(pacman -Q "$dep" 2>/dev/null | awk '{print $2}')
-    fi
-
-    echo "$ver"
+    case "$PM" in
+        dpkg)   _dep_installed_dpkg "$dep" ;;
+        rpm)    _dep_installed_rpm "$dep" ;;
+        pacman) _dep_installed_pacman "$dep" ;;
+        *)      return 1 ;;
+    esac
 }
 
 # Check service status for a dependency (returns description string)
