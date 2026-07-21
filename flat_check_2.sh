@@ -2393,7 +2393,7 @@ run_product_checks() {
     local installed_count=0
     local total_count=0
     local product_pkgs=()
-    local pkg legacy max_jobs tmpdir job_idx=0 w e
+    local pkg legacy max_jobs tmpdir job_idx=0 dw de di dn
 
     for pkg in "${!PKG_PRODUCT[@]}"; do
         if [[ "${PKG_PRODUCT[$pkg]:-}" == "$product" ]]; then
@@ -2439,27 +2439,36 @@ run_product_checks() {
         job_idx=$((job_idx + 1))
         (
             renice -n 5 $$ >/dev/null 2>&1 || true
+            # Snapshot counters before the check — NOT "local" (this is a bare
+            # subshell, not a function body); the delta is written below to a
+            # file separate from check_single_pkg's own human-readable output,
+            # so the parent can reclaim exactly what was incremented in here
+            # without having to re-derive it by grepping printed [WARN]/[FAIL]
+            # text (fragile: depends on message wording never changing).
+            _pj_w0=$WARNINGS; _pj_e0=$ERRORS; _pj_i0=$INSTALLED; _pj_n0=$NOT_INSTALLED
             check_single_pkg "$pkg"
+            printf '%d %d %d %d\n' \
+                "$((WARNINGS - _pj_w0))" "$((ERRORS - _pj_e0))" \
+                "$((INSTALLED - _pj_i0))" "$((NOT_INSTALLED - _pj_n0))" \
+                > "$tmpdir/$job_idx.stat" 2>/dev/null
         ) > "$tmpdir/$job_idx" 2>&1 &
         COLLECTOR_JOB_PIDS+=($!)
     done
     _collector_wait_all_jobs
 
-    # Print in package order; reclaim counters lost in subshells (Summary / Zabbix)
+    # Print in package order; reclaim counters lost in subshells (Summary /
+    # Zabbix) from each job's own delta file, not by parsing printed text.
     job_idx=0
     for pkg in "${product_pkgs[@]}"; do
         job_idx=$((job_idx + 1))
         [[ -f "$tmpdir/$job_idx" ]] || continue
         cat "$tmpdir/$job_idx"
-        w=$(grep -c '\[WARN\]' "$tmpdir/$job_idx" 2>/dev/null || true)
-        e=$(grep -c '\[FAIL\]' "$tmpdir/$job_idx" 2>/dev/null || true)
-        [[ "$w" =~ ^[0-9]+$ ]] && WARNINGS=$((WARNINGS + w))
-        [[ "$e" =~ ^[0-9]+$ ]] && ERRORS=$((ERRORS + e))
-        if grep -qE '\[OK\].*pkg:.*installed' "$tmpdir/$job_idx" 2>/dev/null \
-            || grep -qE '\[WARN\].*pkg:.*legacy' "$tmpdir/$job_idx" 2>/dev/null; then
-            ((INSTALLED++))
-        elif grep -q '— not installed' "$tmpdir/$job_idx" 2>/dev/null; then
-            ((NOT_INSTALLED++))
+        if [[ -f "$tmpdir/$job_idx.stat" ]]; then
+            read -r dw de di dn < "$tmpdir/$job_idx.stat"
+            [[ "$dw" =~ ^-?[0-9]+$ ]] && WARNINGS=$((WARNINGS + dw))
+            [[ "$de" =~ ^-?[0-9]+$ ]] && ERRORS=$((ERRORS + de))
+            [[ "$di" =~ ^-?[0-9]+$ ]] && INSTALLED=$((INSTALLED + di))
+            [[ "$dn" =~ ^-?[0-9]+$ ]] && NOT_INSTALLED=$((NOT_INSTALLED + dn))
         fi
     done
     rm -rf -- "$tmpdir" 2>/dev/null
