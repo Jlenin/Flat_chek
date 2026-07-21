@@ -27,6 +27,7 @@
 #   6  log directory discovery
 #   7  PostgreSQL log discovery
 #   8  line filters by time
+#   8b standalone service-log range extraction (parce_service_log)
 #   9  collector processes / signals / safe remove
 #  10  online / offline collection
 #  11  wizard, help, argv, main
@@ -113,6 +114,8 @@ SEEK_CHUNK_BYTES=$((64 * 1024 * 1024))
 SEEK_PROBE_BYTES=131072
 # Back off before start offset so we do not miss the first matching line
 SEEK_BACKOFF_BYTES=$((1024 * 1024))
+# Max size (bytes) of a single chunk file produced by parce_service_log()
+MAX_LOG_CHUNK_SIZE=$((100 * 1024 * 1024))
 # /proc/stat snapshot for CPU delta
 _CPU_PREV_IDLE=""
 _CPU_PREV_TOTAL=""
@@ -3619,6 +3622,302 @@ filter_log_file_by_range_grep() {
     [[ -s "$dest_file" ]]
 }
 
+# --- 8b. Standalone service-log range extraction (parce_service_log) ----------
+# Given a service log file (or a symlink to one) and a [from, to] time range,
+# find the byte offsets bounding that range via interpolation search — each
+# probe is aimed proportionally to where "from"/"to" should sit between the
+# two epochs already known at the current search bounds (the same way a
+# human would guess "last Sunday is about 87% into this file" after reading
+# just the first line's date, then re-aim based on how far off that guess
+# landed), instead of always splitting the remaining window in half like
+# plain bisection. Assumes the log is chronologically sorted (append-only),
+# same assumption the whole approach — and the existing bisect-based
+# filter_log_file_by_range() elsewhere in this file — rely on.
+
+# Resolve a log path (following one symlink hop) to a real, readable,
+# non-compressed file. Echoes the resolved path.
+# NOTE: this function's stdout is its return value (the caller always uses
+# it as real_path=$(_psl_resolve_log_path ...)) — every warn() below is
+# redirected to stderr explicitly, otherwise the diagnostic text itself
+# would be captured into $(...) instead of shown to the user (the same
+# print/return-value mixing bug as elsewhere; caught here for the same
+# reason it was caught in the wizard's mode-choice step).
+_psl_resolve_log_path() {
+    local path="$1" real="$1"
+
+    [[ -n "$path" ]] || { warn "parce_service_log: no log path given" >&2; return 1; }
+    if [[ -L "$path" ]]; then
+        real=$(readlink -f "$path" 2>/dev/null)
+        [[ -n "$real" ]] || { warn "parce_service_log: broken symlink: $path" >&2; return 1; }
+    fi
+    [[ -f "$real" ]] || { warn "parce_service_log: not a regular file: $path" >&2; return 1; }
+    [[ -r "$real" ]] || { warn "parce_service_log: not readable: $real" >&2; return 1; }
+    case "$real" in
+        *.gz|*.bz2|*.xz|*.zip)
+            warn "parce_service_log: compressed logs are not byte-seekable: $real" >&2
+            return 1
+            ;;
+    esac
+    echo "$real"
+}
+
+# Accepts either an already-numeric epoch or anything `date -d` understands.
+# Same stdout-is-the-return-value caveat as _psl_resolve_log_path() above.
+_psl_parse_timestamp() {
+    local raw="$1" ep
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        echo "$raw"
+        return 0
+    fi
+    ep=$(time_to_epoch "$raw")
+    [[ "$ep" =~ ^[0-9]+$ ]] || { warn "parce_service_log: cannot parse timestamp '$raw'" >&2; return 1; }
+    echo "$ep"
+}
+
+# Interpolation search for the smallest byte offset whose line has
+# epoch >= target ($size if no such line exists). Falls back to plain
+# bisection automatically whenever the two known bounding epochs are equal
+# (nothing to interpolate between). Same probe/parse primitives as the
+# plain-bisection _binsearch_offset_ge() above, only the choice of "mid"
+# differs.
+#
+# Pure interpolation search is vulnerable to a well-known pathological
+# case: logs are rarely written at a steady rate (bursts followed by quiet
+# stretches), and when the *global* [lo,hi] density is wildly different
+# from the *local* density around the target, a straight proportional
+# guess barely narrows the window each round — it can degrade towards a
+# near-linear scan. _MIN_PROGRESS_FRAC below clamps every guess to move at
+# least that fraction of the current window, which bounds the iteration
+# count to a logarithm (same shape as plain bisection, just a bigger base)
+# no matter how skewed the timestamps are, while still using the
+# interpolated guess — and its usual much-faster convergence — whenever
+# the data is well-behaved enough for it to land inside that clamp anyway.
+_PSL_MIN_PROGRESS_FRAC=10   # guarantee >=1/10 of the window per iteration
+
+_psl_find_offset_for_epoch() {
+    local file="$1" size="$2" target="$3"
+    local window="${SEEK_PROBE_BYTES:-131072}"
+    local lo=0 hi="$size" lo_ep hi_ep mid mid_ep line span min_gap
+
+    line=$(_probe_line_at_offset "$file" "$lo") || line=""
+    lo_ep=$(_epoch_of_line "$line")
+    [[ "$lo_ep" =~ ^[0-9]+$ ]] || lo_ep=0
+    if [[ "$lo_ep" -ge "$target" ]]; then
+        echo 0
+        return 0
+    fi
+
+    line=$(_probe_line_at_offset "$file" "$((size > window ? size - window : 0))") || line=""
+    hi_ep=$(_epoch_of_line "$line")
+    [[ "$hi_ep" =~ ^[0-9]+$ ]] || hi_ep="$lo_ep"
+    if [[ "$hi_ep" -lt "$target" ]]; then
+        echo "$size"
+        return 0
+    fi
+
+    while [[ $((hi - lo)) -gt "$window" ]]; do
+        if [[ "$hi_ep" -le "$lo_ep" ]]; then
+            # Degenerate window (identical epochs) — can't interpolate.
+            mid=$(( (lo + hi) / 2 ))
+        else
+            # Done in awk (double precision) rather than bash integers: on a
+            # multi-hundred-GB file, (target-lo_ep)*(hi-lo) can overflow a
+            # 64-bit bash integer before the division brings it back down.
+            mid=$(awk -v lo="$lo" -v hi="$hi" -v lo_ep="$lo_ep" -v hi_ep="$hi_ep" -v target="$target" \
+                'BEGIN { frac = (target - lo_ep) / (hi_ep - lo_ep); m = lo + frac * (hi - lo); printf "%d", m }')
+            [[ "$mid" =~ ^[0-9]+$ ]] || mid=$(( (lo + hi) / 2 ))
+
+            # Clamp into the guaranteed-progress band near the middle —
+            # this is what keeps a skewed density from stalling the search.
+            span=$((hi - lo))
+            min_gap=$((span / _PSL_MIN_PROGRESS_FRAC))
+            [[ "$min_gap" -lt 1 ]] && min_gap=1
+            [[ $((mid - lo)) -lt "$min_gap" ]] && mid=$((lo + min_gap))
+            [[ $((hi - mid)) -lt "$min_gap" ]] && mid=$((hi - min_gap))
+        fi
+
+        line=$(_probe_line_at_offset "$file" "$mid") || { lo=$((mid + 1)); continue; }
+        mid_ep=$(_epoch_of_line "$line")
+        if [[ ! "$mid_ep" =~ ^[0-9]+$ ]] || [[ "$mid_ep" -lt 0 ]]; then
+            lo=$((mid + 4096))
+            [[ "$lo" -ge "$hi" ]] && break
+            continue
+        fi
+
+        if [[ "$mid_ep" -lt "$target" ]]; then
+            lo="$mid"; lo_ep="$mid_ep"
+        else
+            hi="$mid"; hi_ep="$mid_ep"
+        fi
+    done
+    echo "$lo"
+}
+
+# Resolves [from_epoch, to_epoch] into a line-aligned [start_off, end_off)
+# byte range. Echoes "start_off end_off"; returns 1 if nothing matches.
+#
+# _psl_find_offset_for_epoch() only narrows down to within one probe
+# "window" (SEEK_PROBE_BYTES) of the true boundary, same as the existing
+# plain-bisection _binsearch_offset_ge() — neither ever confirms the exact
+# line. So, same as filter_log_file_by_range() does around its own
+# _binsearch_offset_ge() calls, back off by SEEK_BACKOFF_BYTES on both
+# sides before aligning: the wider byte window is guaranteed to fully
+# contain the true boundary, and the content-level epoch filter applied
+# during the copy step (not this function) discards whatever extra lines
+# that slop pulls in on either side.
+_psl_locate_range() {
+    local file="$1" size="$2" from_epoch="$3" to_epoch="$4"
+    local start_off end_off backoff="${SEEK_BACKOFF_BYTES:-1048576}"
+
+    start_off=$(_psl_find_offset_for_epoch "$file" "$size" "$from_epoch")
+    [[ "$start_off" -gt "$backoff" ]] && start_off=$((start_off - backoff)) || start_off=0
+    start_off=$(_align_to_line_start "$file" "$start_off" "$size")
+
+    end_off=$(_psl_find_offset_for_epoch "$file" "$size" "$((to_epoch + 1))")
+    end_off=$((end_off + backoff))
+    [[ "$end_off" -gt "$size" ]] && end_off="$size"
+    end_off=$(_align_to_line_start "$file" "$end_off" "$size")
+
+    if [[ "$end_off" -le "$start_off" ]]; then
+        warn "parce_service_log: no lines fall inside the requested time range" >&2
+        return 1
+    fi
+    echo "$start_off $end_off"
+}
+
+# Creates a fresh, transparently-named /tmp directory to hold this
+# extraction's chunk files: /tmp/parce_<basename>_<from>-<to>.<random>/
+_psl_make_output_dir() {
+    local file="$1" from_epoch="$2" to_epoch="$3"
+    local base prefix
+
+    base=$(basename -- "$file")
+    base="${base//[^A-Za-z0-9._-]/_}"
+    prefix="/tmp/parce_${base}_${from_epoch}-${to_epoch}"
+    mktemp -d "${prefix}.XXXXXX" 2>/dev/null
+}
+
+# Splits [start_off, end_off) into MAX_LOG_CHUNK_SIZE-sized, line-aligned
+# pieces. Echoes one offset per line: N+1 boundaries bracket N chunks.
+_psl_plan_chunk_bounds() {
+    local file="$1" start_off="$2" end_off="$3" size="$4"
+    local chunk_sz="${MAX_LOG_CHUNK_SIZE:-104857600}" range i off prev
+
+    range=$((end_off - start_off))
+    [[ "$chunk_sz" -gt 0 ]] || chunk_sz="$range"
+    echo "$start_off"
+    prev="$start_off"
+    i=1
+    while [[ $((start_off + i * chunk_sz)) -lt "$end_off" ]]; do
+        off=$(_align_to_line_start "$file" $((start_off + i * chunk_sz)) "$size")
+        if [[ "$off" -gt "$prev" && "$off" -lt "$end_off" ]]; then
+            echo "$off"
+            prev="$off"
+        fi
+        i=$((i + 1))
+    done
+    echo "$end_off"
+}
+
+# Copies every [off, next) piece from _psl_plan_chunk_bounds (args 5..N)
+# into its own part_NNNNN.log inside out_dir, keeping only lines inside
+# [from_epoch, to_epoch] — guards against the interpolation search landing
+# a few lines short/long of the exact boundary. Drops parts that ended up
+# empty. Echoes the number of chunk files actually written.
+_psl_copy_chunks() {
+    local file="$1" out_dir="$2" from_epoch="$3" to_epoch="$4"
+    local -a bounds=("${@:5}")
+    local n=$((${#bounds[@]} - 1))
+    local max_jobs i off next len part idx=0 count=0
+
+    max_jobs=$(_collector_max_jobs)
+    _SEEK_JOB_PIDS=()
+
+    for (( i=0; i<n; i++ )); do
+        off="${bounds[$i]}"
+        next="${bounds[$((i + 1))]}"
+        len=$((next - off))
+        [[ "$len" -le 0 ]] && continue
+        idx=$((idx + 1))
+        part=$(printf '%s/part_%05d.log' "$out_dir" "$idx")
+        if ! _seek_wait_slot "$max_jobs"; then
+            _seek_kill_jobs
+            break
+        fi
+        (
+            renice -n 10 $$ >/dev/null 2>&1 || true
+            ionice -c 2 -n 7 -p $$ >/dev/null 2>&1 || true
+            _extract_chunk_worker "$file" "$off" "$len" "$from_epoch" "$to_epoch" 1 "$part"
+        ) &
+        _SEEK_JOB_PIDS+=($!)
+    done
+    _seek_wait_all_jobs
+
+    for part in "$out_dir"/part_*.log; do
+        [[ -e "$part" ]] || continue
+        if [[ -s "$part" ]]; then
+            count=$((count + 1))
+        else
+            rm -f -- "$part" 2>/dev/null
+        fi
+    done
+    echo "$count"
+}
+
+# Extracts the portion of a service log file whose lines fall inside
+# [ts_from, ts_to] into one or more chunk files under /tmp.
+#   $1 = path to the log file (or a symlink to it)
+#   $2 = range start — epoch seconds, or anything `date -d` accepts
+#   $3 = range end   — epoch seconds, or anything `date -d` accepts
+# On success: sets PSL_OUTPUT_PATH (the /tmp directory holding
+# part_00001.log, part_00002.log, ...) and PSL_OUTPUT_CHUNKS (how many),
+# echoes "<PSL_OUTPUT_PATH> <PSL_OUTPUT_CHUNKS>", returns 0.
+# On failure: warns with a reason, returns 1, leaves both globals unset.
+parce_service_log() {
+    local log_path="$1" ts_from_raw="$2" ts_to_raw="$3"
+    local real_path from_epoch to_epoch size range_str start_off end_off
+    local out_dir chunk_count
+    local -a bounds=()
+
+    unset PSL_OUTPUT_PATH PSL_OUTPUT_CHUNKS
+
+    real_path=$(_psl_resolve_log_path "$log_path") || return 1
+    from_epoch=$(_psl_parse_timestamp "$ts_from_raw") || return 1
+    to_epoch=$(_psl_parse_timestamp "$ts_to_raw") || return 1
+    if [[ "$from_epoch" -gt "$to_epoch" ]]; then
+        warn "parce_service_log: start timestamp is after end timestamp"
+        return 1
+    fi
+
+    size=$(_file_size_bytes "$real_path")
+    if [[ "$size" -le 0 ]]; then
+        warn "parce_service_log: $real_path is empty or unreadable"
+        return 1
+    fi
+
+    _logs_appear_sorted "$real_path" "$size" \
+        || warn "parce_service_log: $real_path does not look chronologically sorted — results may be incomplete"
+
+    range_str=$(_psl_locate_range "$real_path" "$size" "$from_epoch" "$to_epoch") || return 1
+    read -r start_off end_off <<< "$range_str"
+
+    out_dir=$(_psl_make_output_dir "$real_path" "$from_epoch" "$to_epoch")
+    [[ -n "$out_dir" && -d "$out_dir" ]] || { warn "parce_service_log: cannot create output dir under /tmp"; return 1; }
+
+    mapfile -t bounds < <(_psl_plan_chunk_bounds "$real_path" "$start_off" "$end_off" "$size")
+    chunk_count=$(_psl_copy_chunks "$real_path" "$out_dir" "$from_epoch" "$to_epoch" "${bounds[@]}")
+
+    if [[ ! "$chunk_count" =~ ^[0-9]+$ ]] || [[ "$chunk_count" -eq 0 ]]; then
+        warn "parce_service_log: no lines matched inside the requested range"
+        rm -rf -- "$out_dir" 2>/dev/null
+        return 1
+    fi
+
+    PSL_OUTPUT_PATH="$out_dir"
+    PSL_OUTPUT_CHUNKS="$chunk_count"
+    echo "$PSL_OUTPUT_PATH $PSL_OUTPUT_CHUNKS"
+}
+
 # Built-in seek unit-test (used by extended selftest / --dev)
 _selftest_seek_extract() {
     local dir log dest from_epoch to_epoch base n lines got sz
@@ -3702,6 +4001,9 @@ _run_selftest_simple() {
     declare -F _filter_byte_range_parallel >/dev/null 2>&1 \
         && _selftest_ok "_filter_byte_range_parallel defined" \
         || _selftest_bad "_filter_byte_range_parallel defined"
+    declare -F parce_service_log >/dev/null 2>&1 \
+        && _selftest_ok "parce_service_log defined" \
+        || _selftest_bad "parce_service_log defined"
 
     tmp=$(mktemp "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
     dest="${tmp}.out"
@@ -3712,6 +4014,18 @@ _run_selftest_simple() {
         _selftest_bad "tiny filter_log_file_by_range"
     fi
     rm -f -- "$tmp" "$dest" 2>/dev/null
+
+    tmp=$(mktemp "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    printf '2026-01-15 12:00:00 hello\n2026-01-15 13:00:00 world\n2026-01-15 14:00:00 bye\n' > "$tmp"
+    if parce_service_log "$tmp" "2026-01-15 12:30:00" "2026-01-15 13:30:00" >/dev/null \
+        && [[ "${PSL_OUTPUT_CHUNKS:-0}" -eq 1 ]] \
+        && [[ "$(cat "${PSL_OUTPUT_PATH:-/nonexistent}"/part_*.log 2>/dev/null | wc -l)" -eq 1 ]]; then
+        _selftest_ok "tiny parce_service_log"
+    else
+        _selftest_bad "tiny parce_service_log"
+    fi
+    rm -rf -- "${PSL_OUTPUT_PATH:-}" 2>/dev/null
+    rm -f -- "$tmp" 2>/dev/null
 
     _get_mem_usage_percent >/dev/null && _selftest_ok "_get_mem_usage_percent" || _selftest_bad "_get_mem_usage_percent"
     _get_cpu_usage_percent >/dev/null && _selftest_ok "_get_cpu_usage_percent" || _selftest_bad "_get_cpu_usage_percent"
