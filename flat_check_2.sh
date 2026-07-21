@@ -1055,6 +1055,45 @@ detect_os() {
     echo ""
 }
 
+# Canonical distro id for OS-specific dispatch (get_sys_cpu_<id>, etc.).
+# Same detection order as detect_os(): /etc/os-release first, then legacy
+# release files for systems that don't ship os-release. Pure — no globals,
+# no output, just echoes one of:
+#   debian ubuntu astra centos rhel oracle rocky almalinux arch alpine unknown
+get_os_release() {
+    local id=""
+
+    if [[ -f /etc/os-release ]]; then
+        id=$(. /etc/os-release 2>/dev/null; echo "${ID:-}")
+        id="${id,,}"
+    fi
+
+    if [[ -z "$id" ]]; then
+        if   [[ -f /etc/astra_version ]];     then id="astra"
+        elif [[ -f /etc/centos-release ]];    then id="centos"
+        elif [[ -f /etc/rocky-release ]];      then id="rocky"
+        elif [[ -f /etc/almalinux-release ]];  then id="almalinux"
+        elif [[ -f /etc/oracle-release ]];     then id="oracle"
+        elif [[ -f /etc/redhat-release ]];     then id="rhel"
+        elif [[ -f /etc/alpine-release ]];     then id="alpine"
+        elif [[ -f /etc/arch-release ]];       then id="arch"
+        elif [[ -f /etc/debian_version ]];     then id="debian"
+        fi
+    fi
+
+    # Normalize the couple of aliases os-release uses that don't match our
+    # release-file naming above (Oracle Linux ID is "ol"; RHEL is "redhat"
+    # on very old releases). Anything else is passed through as-is and
+    # falls into the generic branch of the caller's dispatch.
+    case "$id" in
+        ol)     id="oracle" ;;
+        redhat) id="rhel" ;;
+        "")     id="unknown" ;;
+    esac
+
+    echo "$id"
+}
+
 # --- 3b. System metrics (host overview for dashboard / health JSON) ------------
 # Always prints === System === block; missing data → n/a (never skip the section).
 
@@ -1126,34 +1165,105 @@ _sys_pkg_pids() {
     fi
 }
 
-_sys_cpu() {
-    local usage="" idle us top_parts=() pkg pct
-    local -a pids=()
+# --- 3b-1. Per-OS CPU load probes -------------------------------------------
+# Each probe echoes an integer/decimal usage percentage on stdout and
+# returns 0, or returns 1 with no stdout when it cannot get a reading.
+# _sys_cpu() below only ever calls these through get_os_release() dispatch.
 
-    # Prefer /proc/stat delta (defined later; resolved at call time)
-    if declare -F _get_cpu_usage_percent >/dev/null 2>&1; then
-        _get_cpu_usage_percent >/dev/null
-        sleep 0.25
-        usage=$(_get_cpu_usage_percent)
-        [[ "$usage" =~ ^[0-9]+$ ]] || usage=""
+# /proc/stat is a kernel interface, identical on every Linux distro we
+# support — this is the one non-OS-specific building block every probe
+# below is allowed to share, exactly like they'd all share `uname -r`.
+_sys_cpu_via_procstat() {
+    declare -F _get_cpu_usage_percent >/dev/null 2>&1 || return 1
+    _get_cpu_usage_percent >/dev/null   # prime the delta window
+    sleep 0.25
+    local pct
+    pct=$(_get_cpu_usage_percent)
+    [[ "$pct" =~ ^[0-9]+$ ]] || return 1
+    echo "$pct"
+}
+
+# Debian family (Debian/Ubuntu/Astra all ship procps-ng >= 3.3.10):
+# `top -bn1` prints "%Cpu(s):  3.2 us,  1.1 sy, ..., 95.3 id, ..."
+get_sys_cpu_debian() {
+    _sys_cpu_via_procstat && return 0
+
+    command -v top &>/dev/null || return 1
+    local line idle
+    line=$(top -bn1 2>/dev/null | grep -m1 '^%Cpu(s):')
+    [[ -n "$line" ]] || return 1
+    idle=$(grep -oE '[0-9]+([.,][0-9]+)?[[:space:]]*id' <<<"$line" | grep -oE '^[0-9]+([.,][0-9]+)?' | tr ',' '.')
+    [[ -n "$idle" ]] || return 1
+    awk -v i="$idle" 'BEGIN{printf "%.1f", 100-i}'
+}
+
+get_sys_cpu_ubuntu() { get_sys_cpu_debian; }   # same procps-ng family as Debian
+get_sys_cpu_astra()  { get_sys_cpu_debian; }   # Astra Linux is Debian-based
+
+# RHEL family (RHEL/CentOS/Oracle/Rocky/AlmaLinux are the same userland):
+# older procps prints "Cpu(s):  10.0%us,  2.0%sy, ..., 87.0%id, ..." — no
+# leading '%' on the line and no space before each field's own '%'.
+get_sys_cpu_rhel() {
+    _sys_cpu_via_procstat && return 0
+
+    command -v top &>/dev/null || return 1
+    local line idle us
+    line=$(top -bn1 2>/dev/null | grep -m1 -E '^Cpu\(s\):')
+    [[ -n "$line" ]] || return 1
+    idle=$(grep -oE '[0-9]+([.,][0-9]+)?%id' <<<"$line" | grep -oE '^[0-9]+([.,][0-9]+)?' | tr ',' '.')
+    if [[ -n "$idle" ]]; then
+        awk -v i="$idle" 'BEGIN{printf "%.1f", 100-i}'
+        return 0
     fi
-    if [[ -z "$usage" ]]; then
-        usage=$(top -bn1 2>/dev/null | grep -E 'Cpu\(s\)|%Cpu' | head -1)
-        if [[ -n "$usage" ]]; then
-            idle=$(echo "$usage" | grep -oE '[0-9]+([.,][0-9]+)?[[:space:]]*%?id' | head -1 | grep -oE '[0-9]+([.,][0-9]+)?' | tr ',' '.')
-            us=$(echo "$usage" | grep -oE '[0-9]+([.,][0-9]+)?[[:space:]]*%?us' | head -1 | grep -oE '[0-9]+([.,][0-9]+)?' | tr ',' '.')
-            if [[ -n "$idle" ]]; then
-                usage=$(awk -v i="$idle" 'BEGIN{printf "%.1f", 100-i}')
-            elif [[ -n "$us" ]]; then
-                usage=$(echo "$us" | tr ',' '.')
-            else
-                usage=""
-            fi
-        else
-            usage=""
-        fi
-    fi
-    if [[ -n "$usage" ]]; then
+    us=$(grep -oE '[0-9]+([.,][0-9]+)?%us' <<<"$line" | grep -oE '^[0-9]+([.,][0-9]+)?' | tr ',' '.')
+    [[ -n "$us" ]] || return 1
+    echo "$us"
+}
+
+get_sys_cpu_centos()    { get_sys_cpu_rhel; }
+get_sys_cpu_oracle()    { get_sys_cpu_rhel; }
+get_sys_cpu_rocky()     { get_sys_cpu_rhel; }
+get_sys_cpu_almalinux() { get_sys_cpu_rhel; }
+
+# Arch always tracks latest procps-ng — same output shape as Debian family.
+get_sys_cpu_arch() { get_sys_cpu_debian; }
+
+# Alpine is musl/busybox: `top -bn1` output is not stable enough to parse
+# across busybox versions, and sysstat/mpstat isn't part of the base image.
+# /proc/stat is still a kernel interface, so it alone is the whole probe —
+# no format-guessing fallback here, on purpose.
+get_sys_cpu_alpine() {
+    _sys_cpu_via_procstat
+}
+
+# Unknown/unsupported distro: try everything we know, in order of reliability.
+get_sys_cpu_generic() {
+    _sys_cpu_via_procstat && return 0
+    get_sys_cpu_debian && return 0
+    get_sys_cpu_rhel
+}
+
+# --- 3b-2. CPU section (host overview) --------------------------------------
+_sys_cpu() {
+    local os usage pkg pct
+    local -a top_parts=() pids=()
+
+    os=$(get_os_release)
+    case "$os" in
+        debian)    usage=$(get_sys_cpu_debian) ;;
+        ubuntu)    usage=$(get_sys_cpu_ubuntu) ;;
+        astra)     usage=$(get_sys_cpu_astra) ;;
+        centos)    usage=$(get_sys_cpu_centos) ;;
+        rhel)      usage=$(get_sys_cpu_rhel) ;;
+        oracle)    usage=$(get_sys_cpu_oracle) ;;
+        rocky)     usage=$(get_sys_cpu_rocky) ;;
+        almalinux) usage=$(get_sys_cpu_almalinux) ;;
+        arch)      usage=$(get_sys_cpu_arch) ;;
+        alpine)    usage=$(get_sys_cpu_alpine) ;;
+        *)         usage=$(get_sys_cpu_generic) ;;
+    esac
+
+    if [[ "$usage" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         print_info "cpu: usage=${usage}%"
     else
         print_info "cpu: usage=n/a"
