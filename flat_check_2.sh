@@ -2814,7 +2814,9 @@ _report_skipped_unknown_flat_dirs() {
         # mgcpclient — опциональное дополнение SoftSwitch, а не «неизвестный мусор»
         [[ "$base" == "mgcpclient" ]] && continue
         if ! _is_known_log_basename "$base"; then
-            info "skip unknown: $base"
+            # На stderr: discover_log_dirs_for_selected() читается через
+            # command substitution (mapfile), stdout здесь — только пути
+            info "skip unknown: $base" >&2
         fi
     done
 }
