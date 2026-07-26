@@ -4268,6 +4268,166 @@ parce_service_logs() {
     echo "$PSLS_OUTPUT_PATH $PSLS_OUTPUT_CHUNKS"
 }
 
+# --- 8d. Applying parce_service_log(s) to already-discovered directories -----
+# run_log_collection() already knows exactly which directories to look at
+# for the selected packages — discover_log_dirs_for_selected() is built on
+# FLAT's own PKG_PRODUCT/PKG_LEGACY/config knowledge, which is more precise
+# than guessing a directory from a bare service name the way
+# _psl_find_service_log_dirs() has to. What online and offline collection
+# *do* with a directory's files once found, though, is exactly what
+# parce_service_log(s) already solved: skip an archived file when a live
+# plain twin exists, and (offline only) extract by time range, merged by
+# log type into size-bounded chunks instead of one tiny file per rotated
+# original. The functions below reuse those already-tested building blocks
+# against a caller-supplied directory instead of re-discovering it by name
+# — this is the "search" logic online and offline collection share.
+
+# NUL-delimited passthrough filter: drops an archived file (paths arrive
+# NUL-separated on stdin, e.g. from find_log_files_in_dir()) whenever a
+# live plain file with the identical name (modulo the archive extension)
+# is also present. Thin adapter so callers already working with NUL-safe
+# file streams — as the rest of the collector does — can reuse the
+# newline-based _psl_dedupe_archive_copies() from the parce_service_log(s)
+# module without giving up NUL-safety at the edges.
+_log_dedupe_files_stream() {
+    local -a files=()
+    while IFS= read -r -d '' f; do files+=("$f"); done
+    [[ ${#files[@]} -eq 0 ]] && return 0
+    printf '%s\n' "${files[@]}" | _psl_dedupe_archive_copies | while IFS= read -r f; do
+        printf '%s\0' "$f"
+    done
+}
+
+# The exact candidate file list both start_tail_for_dir() (online) and
+# _log_extract_dir_by_range() (offline) iterate over: find_log_files_in_dir()'s
+# existing name/mgcpclient/online-.gz rules, plus the archive-vs-plain
+# dedup above.
+_log_candidate_files_for_dir() {
+    _log_dedupe_files_stream < <(find_log_files_in_dir "$1")
+}
+
+# True if a file's [birth/ctime, mtime] span could contain data inside
+# [from_epoch, to_epoch] — the same estimate parce_service_logs() uses to
+# decide whether one of a service's files is worth opening at all. An
+# unknown span is never skipped here (better to let the content-level
+# filter inside parce_service_log() decide than to guess wrong up front).
+_log_file_in_range() {
+    local file="$1" from_epoch="$2" to_epoch="$3" fstart fend
+    read -r fstart fend < <(_psl_file_time_span "$file")
+    [[ "$fstart" =~ ^[0-9]+$ && "$fend" =~ ^[0-9]+$ ]] || return 0
+    [[ "$fstart" -le "$to_epoch" && "$fend" -ge "$from_epoch" ]]
+}
+
+# Extracts (or, with no time range, plain-copies) one file into its log-
+# type group accumulator under $work_dir/groups/ — the very accumulator
+# parce_service_logs() itself writes to, so _psl_finalize_groups() can
+# re-chunk it later without caring whether the source was a service name
+# or an already-known directory. Mirrors _psl_process_one_candidate(),
+# with one difference: empty from_epoch/to_epoch means "collect
+# everything" (offline with no --from/--to at all), which skips the
+# epoch filter entirely instead of forcing every line through it for
+# nothing.
+_log_extract_one_file() {
+    local file="$1" from_epoch="$2" to_epoch="$3" work_dir="$4"
+    local plain is_scratch=0 group group_file rc=1
+
+    plain=$(_psl_materialize_plain "$file" "$work_dir") || return 1
+    [[ "$plain" != "$file" ]] && is_scratch=1
+
+    group=$(_psl_log_group_key "$file")
+    group_file="$work_dir/groups/${group}.log"
+    mkdir -p "$work_dir/groups" 2>/dev/null
+
+    if [[ -z "$from_epoch" && -z "$to_epoch" ]]; then
+        cat "$plain" >> "$group_file" 2>/dev/null && rc=0
+    elif parce_service_log "$plain" "$from_epoch" "$to_epoch" >/dev/null 2>&1; then
+        cat "$PSL_OUTPUT_PATH"/part_*.log >> "$group_file" 2>/dev/null
+        rc=0
+    fi
+    rm -rf -- "${PSL_OUTPUT_PATH:-}" 2>/dev/null
+    [[ "$is_scratch" -eq 1 ]] && rm -f -- "$plain" 2>/dev/null
+    return "$rc"
+}
+
+# Runs _log_extract_one_file() over every candidate in one already-
+# discovered source directory, then re-chunks the result into $dest_dir.
+# Empty from_epoch/to_epoch means no time filter at all (offline with no
+# --from/--to given). Returns 1 if nothing ended up in $dest_dir — normal
+# when a directory's files simply have nothing in range, not an error.
+_log_extract_dir_by_range() {
+    local src_dir="$1" dest_dir="$2" from_epoch="$3" to_epoch="$4"
+    local work_dir f processed=0 chunk_count
+
+    work_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_logdir.XXXXXX") || return 1
+
+    while IFS= read -r -d '' f; do
+        _collector_should_stop && { rm -rf -- "$work_dir"; return 130; }
+        if [[ -n "$from_epoch" || -n "$to_epoch" ]]; then
+            _log_file_in_range "$f" "${from_epoch:-0}" "${to_epoch:-9999999999}" || continue
+        fi
+        _log_extract_one_file "$f" "$from_epoch" "$to_epoch" "$work_dir" \
+            && processed=$((processed + 1))
+    done < <(_log_candidate_files_for_dir "$src_dir")
+
+    if [[ "$processed" -eq 0 ]]; then
+        rm -rf -- "$work_dir" 2>/dev/null
+        return 1
+    fi
+
+    mkdir -p "$dest_dir" || { rm -rf -- "$work_dir"; return 1; }
+    chunk_count=$(_psl_finalize_groups "$work_dir" "$dest_dir")
+    rm -rf -- "$work_dir" 2>/dev/null
+    [[ "$chunk_count" -gt 0 ]]
+}
+
+# Runs _log_extract_dir_by_range() for every directory in the global
+# ALL_LOG_DIRS, one background job per directory on the same resource-
+# aware collector job pool the rest of the offline path already uses
+# (COLLECTOR_JOB_PIDS/_collector_wait_slot) — parce_service_log()'s own
+# inner chunk-extraction workers use the separate _SEEK_JOB_PIDS pool, the
+# same nested-pools pattern _copy_log_files_parallel()/
+# _filter_byte_range_parallel() already rely on elsewhere in this file.
+# Directories that end up with nothing in range get an "absent" note
+# instead of a silently empty folder.
+_log_extract_all_dirs_by_range() {
+    local work_root="$1" from_epoch="$2" to_epoch="$3"
+    local logdir dest_name max_jobs result_dir rf idx=0 ctx="plain"
+    local -a labels=()
+
+    [[ -n "$from_epoch" || -n "$to_epoch" ]] && ctx="period"
+    max_jobs=$(_collector_max_jobs)
+    result_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_logscan.XXXXXX") || return 1
+    COLLECTOR_JOB_PIDS=()
+
+    for logdir in "${ALL_LOG_DIRS[@]}"; do
+        _collector_should_stop && { _collector_kill_jobs; rm -rf -- "$result_dir"; return 130; }
+        if ! _collector_wait_slot "$max_jobs"; then
+            _collector_kill_jobs
+            rm -rf -- "$result_dir"
+            return 130
+        fi
+        dest_name=$(_archive_subdir_name "$logdir")
+        labels+=("$dest_name")
+        idx=$((idx + 1))
+        rf="$result_dir/$idx"
+        (
+            renice -n 10 $$ >/dev/null 2>&1 || true
+            ionice -c 2 -n 7 -p $$ >/dev/null 2>&1 || true
+            _log_extract_dir_by_range "$logdir" "$work_root/$dest_name" "$from_epoch" "$to_epoch" \
+                && echo "OK" > "$rf"
+        ) &
+        COLLECTOR_JOB_PIDS+=($!)
+    done
+    _collector_wait_all_jobs
+
+    idx=0
+    for dest_name in "${labels[@]}"; do
+        idx=$((idx + 1))
+        [[ -f "$result_dir/$idx" ]] || info "${dest_name}: $(_log_absent_reason "$ctx")"
+    done
+    rm -rf -- "$result_dir" 2>/dev/null
+}
+
 # Встроенный юнит-тест seek (используется расширенным selftest / --dev)
 _selftest_seek_extract() {
     local dir log dest from_epoch to_epoch base n lines got sz
@@ -4796,7 +4956,7 @@ report_collected_log_stats() {
 
 start_tail_for_dir() {
     local src_dir="$1" dest_dir="$2"
-    local find_fn="find_log_files_in_dir"
+    local find_fn="_log_candidate_files_for_dir"
     local display_label="${4:-$(basename "$src_dir")}"
     [[ "${3:-}" == "pg" ]] && find_fn="find_pg_log_files_in_dir"
     local files=() f started=0
@@ -5191,31 +5351,6 @@ copy_existing_logs() {
     fi
 }
 
-# Развернуть все директории логов в один общий пул задач (избегаем вложенных пулов воркеров)
-copy_all_log_dirs_parallel() {
-    local work_root="$1"
-    local from_time="${2:-}"
-    local to_time="${3:-}"
-    local logdir dest_name f file_count
-    local -a cp_files=() cp_src=() cp_dest=() cp_label=() empty_labels=()
-
-    for logdir in "${ALL_LOG_DIRS[@]}"; do
-        _collector_should_stop && return 130
-        dest_name=$(_archive_subdir_name "$logdir")
-        file_count=0
-        while IFS= read -r -d '' f; do
-            cp_files+=("$f")
-            cp_src+=("$logdir")
-            cp_dest+=("$work_root/$dest_name")
-            cp_label+=("$dest_name")
-            file_count=$((file_count + 1))
-        done < <(find_log_files_in_dir "$logdir")
-        [[ "$file_count" -eq 0 ]] && empty_labels+=("$dest_name")
-    done
-
-    _copy_log_files_parallel "$from_time" "$to_time" cp_files cp_src cp_dest cp_label "${empty_labels[@]}"
-}
-
 copy_system_log_by_range() {
     local sysfile="$1" sysdest="$2"
     local from_time="${3:-}" to_time="${4:-}"
@@ -5498,7 +5633,10 @@ run_log_collection() {
             info "$(_l log_all)"
         fi
         info "Parallel copy workers: $(_collector_max_jobs) (host-wide CPU/MEM gate ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}%)"
-        copy_all_log_dirs_parallel "$WORK_DIR" "$from_time" "$to_time"
+        local range_from_epoch="" range_to_epoch=""
+        [[ -n "$from_time" ]] && range_from_epoch=$(time_to_epoch "$from_time")
+        [[ -n "$to_time" ]] && range_to_epoch=$(time_to_epoch "$to_time")
+        _log_extract_all_dirs_by_range "$WORK_DIR" "$range_from_epoch" "$range_to_epoch"
         if [[ "$collect_infra" -eq 1 ]]; then
             for sysfile in /var/log/messages /var/log/syslog; do
                 _collector_should_stop && break
