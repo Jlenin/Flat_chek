@@ -65,7 +65,6 @@ SELFTEST_MODE=""
 LOG_SUBMODE="online"
 START_TCPDUMP=1
 TIMEOUT_RAW=""
-TIMEOUT_SEC=0
 FROM_TIME=""
 TO_TIME=""
 OUTPUT_DIR=""
@@ -737,39 +736,9 @@ _l() {
     case "$CURRENT_LANG" in
         ru)
             case "$key" in
-                help_usage)        echo "Usage: flat_check_2.sh [РЕЖИМ] [ОПЦИИ]" ;;
                 err_online_need_t) echo "Online без TTY требует -t/--timeout" ;;
-                help_check)        echo "  (без аргументов)        Проверка установленных служб" ;;
-                help_dev)          echo "  --dev                   Расширенный самотест (варианты + health + seek)" ;;
-                help_selftest)     echo "  --selftest simple|extended  Самотест (simple=дымовой; extended=как --dev)" ;;
-                help_v)            echo "  -v, --version           Показать версию скрипта и выйти" ;;
-                help_log)          echo "  -log                    Режим сборщика логов" ;;
-                help_log_on)       echo "    -on, --online         Сбор в реальном времени (tail -F + опц. tcpdump)" ;;
-                help_log_off)      echo "    -off, --offline       Копирование готовых логов" ;;
-                help_log_t)        echo "    -t, --timeout ДЛИТ    Online: автостоп через N (например 5h, 30m)" ;;
-                help_log_t2)       echo "                          Offline: извлечь строки за последние N (по метке в файле). Без -t: все логи" ;;
-                help_log_n)        echo "    -n, --no-tcpdump      Не записывать сетевой трафик (только online)" ;;
-                help_log_j)        echo "    -j, --jobs N          Offline: параллельных копий (по умолч. nproc*80%, макс. 32; не стартуют при CPU/RAM системы ≥80%)" ;;
-                help_scope)        echo "    --scope brief|extended  Краткий (только службы) / расширенный (+ system/nginx/pg/configs)" ;;
-                help_product)      echo "    -p, --product NAME    Продукт (повторяемый; см. --list-targets)" ;;
-                help_service)      echo "    -s, --service PKG     Служба/пакет (повторяемый)" ;;
-                help_list_targets) echo "    --list-targets        Показать доступные продукты/службы и выйти" ;;
-                help_mgcp)         echo "    --mgcpclient          SoftSwitch: включить mgcpclient (без вопроса)" ;;
-                help_no_mgcp)      echo "    --no-mgcpclient       SoftSwitch: не собирать mgcpclient" ;;
-                help_from)         echo "    -f, --from TIME       Начало диапазона (например -2h, 25.06.2026 10:00)" ;;
-                help_to)           echo "    -e, --to TIME         Конец диапазона (например -1h, 25.06.2026 12:00)" ;;
-                help_range_note)   echo "    Варианты: -f -2h -e -1h | -f '25.06.2026 10:00' -e '25.06.2026 12:00' | -f '25.06.2026 10:00' -e +2h" ;;
-                help_repo)         echo "  -r, --repo              Показать репозитории (APT/YUM sources)" ;;
-                help_out)          echo "  -o, --output ДИР        Записать архив в директорию (только -log)" ;;
-                help_h)            echo "  -h, --help              Показать справку" ;;
-                help_dur)          echo "Суффиксы: s=секунды, m=минуты, h=часы, d=дни. Чистое число = секунды" ;;
-                ask_lang)          echo "Выберите язык / Select language:" ;;
-                ask_lang_ru)       echo "  1 — Русский" ;;
-                ask_lang_en)       echo "  2 — English" ;;
                 ask_lang_prompt)   echo "Ваш выбор / Your choice [1-2]: " ;;
-                ask_log)           echo "Нажмите [Enter] для сбора online-логов, или Ctrl+C для выхода" ;;
                 mode_log)          echo "Режим логов" ;;
-                mode_check)        echo "Режим проверки" ;;
                 workdir)           echo "Рабочая директория" ;;
                 found_svcs)        echo "Найдено служб" ;;
                 found_logdirs)     echo "Найдено лог-директорий" ;;
@@ -783,11 +752,9 @@ _l() {
                 log_online_no_new) echo "За время сбора новых записей в логах не было (online пишет только новые строки)" ;;
                 log_autostop)      echo "Автоостановка через" ;;
                 log_stopping)      echo "Остановка сбора..." ;;
-                log_copied)        echo "Скопировано" ;;
                 log_files_from)    echo "файлов из" ;;
                 log_copydone)      echo "Копирование завершено" ;;
                 log_all)           echo "Копирование всех логов" ;;
-                log_depth)         echo "Копирование логов за последние" ;;
                 archive_pigz)      echo "Архив создан (pigz)" ;;
                 archive_gzip)      echo "Архив создан (gzip)" ;;
                 archive_at)        echo "Архив" ;;
@@ -863,39 +830,9 @@ _l() {
             ;;
         *)
             case "$key" in
-                help_usage)        echo "Usage: flat_check_2.sh [MODE] [OPTIONS]" ;;
                 err_online_need_t) echo "Online without TTY requires -t/--timeout" ;;
-                help_check)        echo "  (no args)               Health check (installed services only)" ;;
-                help_dev)          echo "  --dev                   Extended self-test (variants + health + seek)" ;;
-                help_selftest)     echo "  --selftest simple|extended  Self-test (simple=smoke; extended=same as --dev)" ;;
-                help_v)            echo "  -v, --version           Print script version and exit" ;;
-                help_log)          echo "  -log                    Log collector mode" ;;
-                help_log_on)       echo "    -on, --online         Real-time capture (tail -F + optional tcpdump)" ;;
-                help_log_off)      echo "    -off, --offline       Copy existing logs" ;;
-                help_log_t)        echo "    -t, --timeout DUR     Online: auto-stop after N (e.g. 5h, 30m)" ;;
-                help_log_t2)       echo "                          Offline: extract lines from last N (by content timestamp). Without -t: all" ;;
-                help_log_n)        echo "    -n, --no-tcpdump      Skip network capture (online only)" ;;
-                help_log_j)        echo "    -j, --jobs N          Offline: parallel copy workers (default nproc*80%, max 32; no spawn if host CPU/RAM ≥80%)" ;;
-                help_scope)        echo "    --scope brief|extended  Brief (services only) / extended (+ system/nginx/pg/configs)" ;;
-                help_product)      echo "    -p, --product NAME    Product (repeatable; see --list-targets)" ;;
-                help_service)      echo "    -s, --service PKG     Service/package (repeatable)" ;;
-                help_list_targets) echo "    --list-targets        List available products/services and exit" ;;
-                help_mgcp)         echo "    --mgcpclient          SoftSwitch: include mgcpclient (no prompt)" ;;
-                help_no_mgcp)      echo "    --no-mgcpclient       SoftSwitch: skip mgcpclient" ;;
-                help_from)         echo "    -f, --from TIME       Range start (e.g. -2h, 25.06.2026 10:00)" ;;
-                help_to)           echo "    -e, --to TIME         Range end (e.g. -1h, 25.06.2026 12:00)" ;;
-                help_range_note)   echo "    Range: -f -2h -e -1h | -f '25.06.2026 10:00' -e '25.06.2026 12:00' | -f '25.06.2026 10:00' -e +2h" ;;
-                help_repo)         echo "  -r, --repo              Show repositories (APT/YUM sources)" ;;
-                help_out)          echo "  -o, --output DIR        Write archive to DIR (log mode only)" ;;
-                help_h)            echo "  -h, --help              Show this help" ;;
-                help_dur)          echo "Duration suffixes: s=sec, m=min, h=hour, d=day. Bare number = seconds" ;;
-                ask_lang)          echo "Select language / Выберите язык:" ;;
-                ask_lang_ru)       echo "  1 — Русский" ;;
-                ask_lang_en)       echo "  2 — English" ;;
                 ask_lang_prompt)   echo "Your choice / Ваш выбор [1-2]: " ;;
-                ask_log)           echo "Press [Enter] to collect online logs, or Ctrl+C to exit" ;;
                 mode_log)          echo "Log mode" ;;
-                mode_check)        echo "Check mode" ;;
                 workdir)           echo "Work directory" ;;
                 found_svcs)        echo "Found services" ;;
                 found_logdirs)     echo "Found log directories" ;;
@@ -909,11 +846,9 @@ _l() {
                 log_online_no_new) echo "No new log lines during collection (online captures only new lines)" ;;
                 log_autostop)      echo "Auto-stop in" ;;
                 log_stopping)      echo "Stopping collection..." ;;
-                log_copied)        echo "Copied" ;;
                 log_files_from)    echo "files from" ;;
                 log_copydone)      echo "Copy done" ;;
                 log_all)           echo "Copying all logs" ;;
-                log_depth)         echo "Copying logs for last" ;;
                 archive_pigz)      echo "Archive created (pigz)" ;;
                 archive_gzip)      echo "Archive created (gzip)" ;;
                 archive_at)        echo "Archive" ;;
@@ -1503,22 +1438,6 @@ get_pkg_depends() {
     echo "$deps" | tr ',' '\n' | sed 's/|.*$//' | sed 's/([^)]*)//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | grep -v '^[0-9]' | grep -v '^(' | grep -v '^)' | grep -v '^<' | grep -v '^>' | grep -v '^=' | sort -u | tr '\n' ',' | sed 's/^,//;s/,$//'
 }
 
-# Получить версию пакета из PM
-get_pkg_version() {
-    local pkg="$1"
-    local ver=""
-
-    if [[ "$PM" == "dpkg" ]]; then
-        ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
-    elif [[ "$PM" == "rpm" ]]; then
-        ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null)
-    elif [[ "$PM" == "pacman" ]]; then
-        ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
-    fi
-
-    echo "$ver"
-}
-
 # Проверить, установлена ли зависимость
 is_dep_installed() {
     local dep="$1"
@@ -1700,11 +1619,6 @@ has_any_trace() {
     local pkg="$1"
     local unit="${pkg}.service"
     [[ -f "/usr/lib/systemd/system/${unit}" ]] || [[ -f "/etc/systemd/system/${unit}" ]] || [[ -f "/lib/systemd/system/${unit}" ]] || [[ -d "/opt/flat/${pkg}" ]]
-}
-
-# Тихая быстрая проверка установки пакета (возвращает 0/1, без вывода)
-is_pkg_installed() {
-    is_pkg_installed_tiny "$@"
 }
 
 is_pkg_installed_tiny() {
@@ -2533,33 +2447,6 @@ _log_path_to_dir() {
     fi
 }
 
-_parse_log_path_from_config_file() {
-    local conf="$1"
-    local path=""
-    [[ -f "$conf" ]] || return 1
-
-    case "$conf" in
-        *switchserver*|*fss-server*)
-            path=$(grep -s '^LogPath=' "$conf" | head -1 | cut -d '=' -f 2- | tr -d '[:space:]')
-            ;;
-        *srclient*|*fss-srclient*)
-            path=$(grep -s '^logger_fileName' "$conf" | head -1 | sed -E 's/.*=\s*"([^"]*)".*/\1/')
-            [[ -z "$path" ]] && path=$(grep -s '^logger_fileName' "$conf" | head -1 | cut -d '"' -f 2)
-            ;;
-        *mediasrv*|*fss-mediasrv*)
-            path=$(grep -s '<LogParams>' "$conf" | head -1 | sed -E 's/.*>([^<]*)<.*/\1/')
-            ;;
-        *flat-file*)
-            path=$(grep -s '^\s*dir\s*:' "$conf" | head -1 | cut -d ':' -f 2- | xargs)
-            ;;
-        *)
-            path=$(grep -siE '^(LogPath|log_path|logPath|logger_fileName|log_dir)\s*=' "$conf" 2>/dev/null | head -1 | sed -E 's/^[^=]+=\s*"?([^"]*)"?/\1/' | tr -d '[:space:]')
-            [[ -z "$path" ]] && path=$(grep -s '<LogParams>' "$conf" 2>/dev/null | head -1 | sed -E 's/.*>([^<]*)<.*/\1/')
-            ;;
-    esac
-    _log_path_to_dir "$path"
-}
-
 # Нормализовать имя продукта/службы для нечёткого сравнения: в нижний регистр, убрать пробелы/_/-
 _norm_target_name() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]_-'
@@ -2883,30 +2770,6 @@ discover_log_dirs_for_selected() {
     printf '%s\n' "${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}"
 }
 
-# Разрешить выбор (фильтры CLI/мастера либо все присутствующие пакеты) → директории
-discover_all_log_dirs() {
-    resolve_selected_packages
-    discover_log_dirs_for_selected
-}
-
-is_log_like_file() {
-    local f="$1"
-    [[ -f "$f" ]] || return 1
-    case "$f" in
-        *.log|*.txt|*.log.*|*.out) return 0 ;;
-        *.gz)
-            case "$f" in
-                *.log.gz|*.txt.gz) return 0 ;;
-            esac
-            return 1
-            ;;
-        *)
-            [[ "$(basename "$f")" == "messages" || "$(basename "$f")" == "syslog" ]] && return 0
-            return 1
-            ;;
-    esac
-}
-
 # Истина, если базовое имя похоже на дамп SoftSwitch mgcpclient (mgcpclient_2.txt, …)
 _is_mgcpclient_log_file() {
     local base
@@ -2945,13 +2808,6 @@ _dir_has_any_log_files() {
         -name '*.log' -o -name '*.txt' -o -name '*.log.*' -o -name '*.log.gz' -o -name '*.txt.gz' \
     \) -print0 2>/dev/null)
     return 1
-}
-
-# Истина, если в директории есть файлы, собираемые в текущем режиме (online: без .gz)
-has_log_files() {
-    local d="$1"
-    [[ -d "$d" ]] || return 1
-    [[ -n "$(find_log_files_in_dir "$d" | head -c 1)" ]]
 }
 
 # --- 7. Поиск логов PostgreSQL ---------------------------------------------------
@@ -4659,11 +4515,6 @@ parse_duration() {
         return 0
     fi
     return 1
-}
-
-duration_to_minutes() {
-    local num="$1" unit="$2"
-    case "$unit" in s) echo "$(( (num + 59) / 60 ))" ;; m) echo "$num" ;; h) echo "$(( num * 60 ))" ;; d) echo "$(( num * 1440 ))" ;; *) echo "$num" ;; esac
 }
 
 duration_to_seconds() {
