@@ -17,30 +17,51 @@
 # .gz и неотсортированные файлы: линейное / параллельное сканирование всего файла по чанкам.
 #
 # Внутренняя структура (искать "# --- N."):
-#   0  глобальные переменные / флаги
+#   0  глобальные переменные / флаги (включая SCRIPT_DIR/LOG_FILE)
 #   1  метаданные продуктов PKG_*
-#   2  хелперы вывода + локализация
+#   2  хелперы вывода + логирование в файл (_log_line/log_debug/init_logging) + локализация
 #   3  ОС / пакетный менеджер
 #   3b системные метрики (CPU/MEM/диск/БД/сеть/сертификаты/аптайм)
 #   4  проверки состояния по пакетам
 #   5  инфраструктура + репозитории
-#   6  поиск директорий логов
+#   6  поиск директорий логов (по выбранным пакетам/продуктам)
 #   7  поиск логов PostgreSQL
-#   8  фильтры строк по времени
-#   8b автономное извлечение диапазона из лога службы (parce_service_log)
+#   8b автономное извлечение диапазона из ОДНОГО лог-файла (parce_service_log)
+#   8c извлечение диапазона из логов СЛУЖБЫ по имени, целиком (parce_service_logs)
+#   8d те же примитивы (8b/8c), применённые к каталогам, которые уже нашёл блок 6 —
+#      общий движок поиска+копирования логов для online и offline (run_log_collection)
+#   8  парсеры длительности/момента времени + построчные фильтры по timestamp
 #   9  процессы сборщика / сигналы / безопасное удаление
-#  10  online / offline сбор
+#  10  online / offline сбор (run_log_collection)
 #  11  мастер, справка, argv, main
+#
+# Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log (LOG_FILE, см. блок 2) —
+#   аргументы/выбор мастера, что найдено/отклонено при поиске логов, снимки
+#   CPU/MEM. При -log он переносится внутрь рабочей директории и попадает в
+#   архив; иначе — лежит рядом со скриптом (или в -o/--output) и
+#   перезаписывается на каждом запуске.
 #
 # Безопасность при работе от root: временные директории удаляются только если совпадают
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.5.1"
+SCRIPT_VERSION="3.6.0"
 
 set -uo pipefail
 
 # --- 0. Глобальные переменные ---------------------------------------------------
+
+# Путь и имя скрипта — нужны и до parse_args (лог-файл сессии), и внутри
+# run_log_collection() (рабочая директория по умолчанию); вычисляем один раз.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+[[ -z "$SCRIPT_DIR" ]] && SCRIPT_DIR="$(pwd)"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_NAME="${SCRIPT_NAME%.sh}"
+
+# Путь текущего сессионного лог-файла (<SCRIPT_NAME>.log); "" = логирование в
+# файл отключено (нет прав на запись). Заполняется init_logging(), уровни
+# пишутся через _log_line() из ok()/warn()/fail()/info()/print_*()/log_debug().
+LOG_FILE=""
 
 # Цвета
 C_R='\033[0;31m'
@@ -89,6 +110,9 @@ COLLECTOR_JOB_PIDS=()
 TCPDUMP_PID=""
 TIMEOUT_KILL_PID=""
 DISK_WATCH_PID=""
+RESOURCE_WATCH_PID=""
+# Как часто фоновый монитор ресурсов (start_resource_monitor) пишет снимок CPU/MEM в лог сессии
+RESOURCE_LOG_INTERVAL_SEC=30
 DISCOVERED_LOG_DIRS=()
 PG_LOG_SOURCES=()
 COLLECTOR_ABORTED=0
@@ -697,36 +721,83 @@ PKG_PORTS["flat-file"]="8083"
 PKG_API["flat-file"]="/api/health"
 PKG_DEPS["flat-file"]="nginx"
 
-# --- 2. Хелперы вывода ----------------------------------------------------------
+# --- 2. Хелперы вывода + логирование в файл --------------------------------------
 # (print_ok / print_warn / print_fail / print_info — используются при проверке состояния)
+
+# Пишет строку сессионного лога (без ANSI-кодов, с таймстампом и уровнем).
+# Тихо ничего не делает, если LOG_FILE не задан/недоступен для записи —
+# логирование в файл никогда не должно ронять сам скрипт или его вывод.
+_log_line() {
+    [[ -n "${LOG_FILE:-}" ]] || return 0
+    printf '%s [%-5s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG_FILE" 2>/dev/null
+}
+
+# Технические подробности только в файл лога (что найдено/отклонено при
+# поиске логов, снимки CPU/MEM и т.п.) — не выводятся на экран, чтобы не
+# перегружать интерактивный вывод и терминал пользователя.
+log_debug() {
+    _log_line "DEBUG" "$1"
+}
+
+# Инициализирует LOG_FILE в $dir/${SCRIPT_NAME}.log (перезаписывается на
+# каждом запуске — без ротации, чтобы файл не разрастался при частых
+# вызовах из cron/Zabbix). При отсутствии прав на запись — тихо отключает
+# логирование в файл (на экран это не влияет).
+init_logging() {
+    local dir="${1:-$SCRIPT_DIR}"
+    LOG_FILE="${dir%/}/${SCRIPT_NAME}.log"
+    if ! : > "$LOG_FILE" 2>/dev/null; then
+        LOG_FILE=""
+        return 1
+    fi
+    _log_line "INFO" "=== ${SCRIPT_NAME}.sh v${SCRIPT_VERSION} — сессия начата ==="
+    return 0
+}
+
+# Переносит уже накопленный лог сессии (аргументы, выбор мастера — всё, что
+# случилось до создания WORK_DIR) внутрь рабочей директории сборщика, чтобы
+# он попал в архив вместе с собранными логами, и продолжает писать туда же.
+relocate_log_to_workdir() {
+    local new_log="${WORK_DIR%/}/${SCRIPT_NAME}.log"
+    if [[ -n "${LOG_FILE:-}" && -f "$LOG_FILE" && "$LOG_FILE" != "$new_log" ]]; then
+        mv -- "$LOG_FILE" "$new_log" 2>/dev/null || cp -- "$LOG_FILE" "$new_log" 2>/dev/null
+    fi
+    LOG_FILE="$new_log"
+    : >> "$LOG_FILE" 2>/dev/null || LOG_FILE=""
+}
 
 print_ok() {
     echo -e "${C_G}[OK]${C_N}    $1"
+    _log_line "OK" "$1"
 }
 
 print_warn() {
     echo -e "${C_Y}[WARN]${C_N}  $1"
+    _log_line "WARN" "$1"
     ((WARNINGS++))
 }
 
 print_fail() {
     echo -e "${C_R}[FAIL]${C_N}  $1"
+    _log_line "FAIL" "$1"
     ((ERRORS++))
 }
 
 print_info() {
     echo -e "${C_B}[INFO]${C_N}  $1"
+    _log_line "INFO" "$1"
 }
 
 print_not_installed() {
     echo -e "${C_B}[INFO]${C_N}  $1 — not installed"
+    _log_line "INFO" "$1 — not installed"
 }
 
 # Короткие псевдонимы для сборщика логов
-ok()  { echo -e "${C_G}[OK]${C_N}  $1"; }
-warn() { echo -e "${C_Y}[WARN]${C_N} $1"; }
-fail() { echo -e "${C_R}[FAIL]${C_N} $1"; }
-info() { echo -e "${C_B}[INFO]${C_N} $1"; }
+ok()  { echo -e "${C_G}[OK]${C_N}  $1"; _log_line "OK" "$1"; }
+warn() { echo -e "${C_Y}[WARN]${C_N} $1"; _log_line "WARN" "$1"; }
+fail() { echo -e "${C_R}[FAIL]${C_N} $1"; _log_line "FAIL" "$1"; }
+info() { echo -e "${C_B}[INFO]${C_N} $1"; _log_line "INFO" "$1"; }
 
 die() { fail "$1"; cleanup 2>/dev/null; exit 1; }
 
@@ -2754,17 +2825,24 @@ discover_log_dirs_for_selected() {
 
     for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
         while IFS= read -r d; do
-            [[ -n "$d" ]] && _log_dir_add_unique "$d"
+            [[ -n "$d" ]] && { _log_dir_add_unique "$d"; log_debug "found dir for package '$pkg': $d"; }
         done < <(find_log_dirs_for_pkg "$pkg")
     done
 
     for d in "${EXTRA_LOG_DIRS[@]+"${EXTRA_LOG_DIRS[@]}"}"; do
-        [[ -n "$d" && -d "$d" ]] && _log_dir_add_unique "$d"
+        if [[ -n "$d" && -d "$d" ]]; then
+            _log_dir_add_unique "$d"
+            log_debug "found extra dir: $d"
+        fi
     done
 
     for d in "${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}"; do
         # Включаем директории, где есть похожие на логи файлы (включая .gz). Online пропускает .gz при tail.
-        _dir_has_any_log_files "$d" && result+=("$d")
+        if _dir_has_any_log_files "$d"; then
+            result+=("$d")
+        else
+            log_debug "discarded (no log-like files inside): $d"
+        fi
     done
     DISCOVERED_LOG_DIRS=("${result[@]+"${result[@]}"}")
     printf '%s\n' "${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}"
@@ -4146,12 +4224,18 @@ parce_service_logs() {
 # newline-based _psl_dedupe_archive_copies() from the parce_service_log(s)
 # module without giving up NUL-safety at the edges.
 _log_dedupe_files_stream() {
-    local -a files=()
+    local -a files=() kept=()
     while IFS= read -r -d '' f; do files+=("$f"); done
     [[ ${#files[@]} -eq 0 ]] && return 0
-    printf '%s\n' "${files[@]}" | _psl_dedupe_archive_copies | while IFS= read -r f; do
-        printf '%s\0' "$f"
-    done
+    mapfile -t kept < <(printf '%s\n' "${files[@]}" | _psl_dedupe_archive_copies)
+    if [[ "${#kept[@]}" -ne "${#files[@]}" ]]; then
+        local -A kept_set=() f
+        for f in "${kept[@]}"; do kept_set["$f"]=1; done
+        for f in "${files[@]}"; do
+            [[ -z "${kept_set[$f]:-}" ]] && log_debug "discarded (archived twin of a live plain file): $f"
+        done
+    fi
+    printf '%s\0' "${kept[@]+"${kept[@]}"}"
 }
 
 # The exact candidate file list both start_tail_for_dir() (online) and
@@ -4212,20 +4296,29 @@ _log_extract_one_file() {
 # when a directory's files simply have nothing in range, not an error.
 _log_extract_dir_by_range() {
     local src_dir="$1" dest_dir="$2" from_epoch="$3" to_epoch="$4"
-    local work_dir f processed=0 chunk_count
+    local work_dir f processed=0 seen=0 chunk_count
 
     work_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_logdir.XXXXXX") || return 1
 
     while IFS= read -r -d '' f; do
         _collector_should_stop && { rm -rf -- "$work_dir"; return 130; }
+        seen=$((seen + 1))
         if [[ -n "$from_epoch" || -n "$to_epoch" ]]; then
-            _log_file_in_range "$f" "${from_epoch:-0}" "${to_epoch:-9999999999}" || continue
+            if ! _log_file_in_range "$f" "${from_epoch:-0}" "${to_epoch:-9999999999}"; then
+                log_debug "discarded (mtime/ctime span outside requested range): $f"
+                continue
+            fi
         fi
-        _log_extract_one_file "$f" "$from_epoch" "$to_epoch" "$work_dir" \
-            && processed=$((processed + 1))
+        if _log_extract_one_file "$f" "$from_epoch" "$to_epoch" "$work_dir"; then
+            processed=$((processed + 1))
+            log_debug "kept: $f"
+        else
+            log_debug "discarded (no lines in requested range or read error): $f"
+        fi
     done < <(_log_candidate_files_for_dir "$src_dir")
 
     if [[ "$processed" -eq 0 ]]; then
+        log_debug "$src_dir: candidates=$seen kept=0 -> nothing to write to $dest_dir"
         rm -rf -- "$work_dir" 2>/dev/null
         return 1
     fi
@@ -4233,6 +4326,7 @@ _log_extract_dir_by_range() {
     mkdir -p "$dest_dir" || { rm -rf -- "$work_dir"; return 1; }
     chunk_count=$(_psl_finalize_groups "$work_dir" "$dest_dir")
     rm -rf -- "$work_dir" 2>/dev/null
+    log_debug "$src_dir: candidates=$seen kept=$processed -> $dest_dir (chunks=$chunk_count)"
     [[ "$chunk_count" -gt 0 ]]
 }
 
@@ -4626,11 +4720,13 @@ cleanup_background_jobs() {
     [[ -n "${TCPDUMP_PID:-}" ]] && kill -TERM "$TCPDUMP_PID" 2>/dev/null
     [[ -n "${TIMEOUT_KILL_PID:-}" ]] && kill "$TIMEOUT_KILL_PID" 2>/dev/null
     [[ -n "${DISK_WATCH_PID:-}" ]] && kill "$DISK_WATCH_PID" 2>/dev/null
+    [[ -n "${RESOURCE_WATCH_PID:-}" ]] && kill "$RESOURCE_WATCH_PID" 2>/dev/null
     sleep 1
     for pid in "${TAIL_PIDS[@]+"${TAIL_PIDS[@]}"}" \
                ${TCPDUMP_PID:+"$TCPDUMP_PID"} \
                ${TIMEOUT_KILL_PID:+"$TIMEOUT_KILL_PID"} \
-               ${DISK_WATCH_PID:+"$DISK_WATCH_PID"}; do
+               ${DISK_WATCH_PID:+"$DISK_WATCH_PID"} \
+               ${RESOURCE_WATCH_PID:+"$RESOURCE_WATCH_PID"}; do
         [[ -n "$pid" ]] || continue
         if kill -0 "$pid" 2>/dev/null; then
             kill -KILL "$pid" 2>/dev/null
@@ -4642,6 +4738,7 @@ cleanup_background_jobs() {
     TCPDUMP_PID=""
     TIMEOUT_KILL_PID=""
     DISK_WATCH_PID=""
+    RESOURCE_WATCH_PID=""
 }
 
 cleanup_on_abort() {
@@ -4725,6 +4822,23 @@ start_disk_watch() {
         done
     ) &
     DISK_WATCH_PID=$!
+}
+
+# Фоновый монитор ресурсов хоста: раз в RESOURCE_LOG_INTERVAL_SEC пишет снимок
+# CPU/MEM только в файл лога сессии (log_debug — не на экран), чтобы после
+# долгого online/offline сбора можно было посмотреть, была ли машина
+# нагружена. Останавливается вместе с остальными фоновыми задачами в
+# cleanup_background_jobs().
+start_resource_monitor() {
+    (
+        # Первый вызов _get_cpu_usage_percent только инициализирует дельту (вернёт 0)
+        _get_cpu_usage_percent >/dev/null
+        while true; do
+            sleep "${RESOURCE_LOG_INTERVAL_SEC:-30}"
+            log_debug "resources: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
+        done
+    ) &
+    RESOURCE_WATCH_PID=$!
 }
 
 # Уникальный путь назначения: разворачиваем относительный путь в одну строку, чтобы параллельные файлы с одинаковым basename не конфликтовали
@@ -4822,8 +4936,12 @@ start_tail_for_dir() {
     for f in "${files[@]}"; do
         if _start_tail_one_file "$f" "$dest_dir" "$display_label" "$src_dir"; then
             started=$((started + 1))
+            log_debug "tailing: $f"
+        else
+            log_debug "discarded (failed to start tail): $f"
         fi
     done
+    log_debug "$src_dir: candidates=${#files[@]} tailing=$started"
     [[ "$started" -eq 0 ]] && warn "Failed to start tail for ${display_label} ($src_dir)"
 }
 
@@ -5322,7 +5440,6 @@ run_log_collection() {
         fi
     fi
 
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     COLLECTOR_DIR="${OUTPUT_DIR:-$SCRIPT_DIR}"
     if [[ ! -d "$COLLECTOR_DIR" ]]; then
         mkdir -p "$COLLECTOR_DIR" 2>/dev/null || die "$(_l err_perm): $COLLECTOR_DIR"
@@ -5334,9 +5451,13 @@ run_log_collection() {
     cleanup_old_work_dirs "$COLLECTOR_DIR" "$ARCHIVE_NAME"
     WORK_DIR="$COLLECTOR_DIR/$ARCHIVE_NAME"
     mkdir -p "$WORK_DIR" || die "Cannot create work dir: $WORK_DIR"
+    # Переносим сюда всё, что уже успело залогироваться (argv, выбор мастера) —
+    # ${SCRIPT_NAME}.log должен целиком оказаться в архиве вместе с логами
+    relocate_log_to_workdir
 
     info "$(_l mode_log): $mode / scope=$LOG_SCOPE (flat_check_2 v${SCRIPT_VERSION})"
     info "$(_l workdir): $WORK_DIR"
+    log_debug "Аргументы run_log_collection: mode=$mode timeout_raw='$timeout_raw' LOG_SCOPE=$LOG_SCOPE FROM_TIME='$FROM_TIME' TO_TIME='$TO_TIME' OUTPUT_DIR='$OUTPUT_DIR' INCLUDE_MGCPCLIENT='$INCLUDE_MGCPCLIENT' SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]+"${SELECTED_PRODUCTS[*]}"}) SELECTED_SERVICES=(${SELECTED_SERVICES[*]+"${SELECTED_SERVICES[*]}"})"
 
     detect_os
     command -v tail &>/dev/null || die "$(_l err_cmd_notfound): tail"
@@ -5387,6 +5508,9 @@ run_log_collection() {
 
         # Диск-guard перед запуском tail'ов (проверка сразу внутри start_disk_watch)
         start_disk_watch "$WORK_DIR"
+        start_resource_monitor
+        _get_cpu_usage_percent >/dev/null   # первый вызов лишь инициализирует дельту /proc/stat
+        log_debug "resources at start: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
 
         local logdir dest_name
         for logdir in "${ALL_LOG_DIRS[@]}"; do
@@ -5443,11 +5567,15 @@ run_log_collection() {
             info "$(_l log_autostop) ${timeout_raw} (${timeout_sec}s)"
             COLLECTOR_TIMEOUT_STOP=0
         fi
+        log_debug "resources at stop: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
         info "$(_l log_stopping)"
         cleanup
     else
         # Offline: диск-guard (аккуратная остановка + архивация, как и в online)
         start_disk_watch "$WORK_DIR"
+        start_resource_monitor
+        _get_cpu_usage_percent >/dev/null   # первый вызов лишь инициализирует дельту /proc/stat
+        log_debug "resources at start: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
 
         # Разбор from/to для offline-сбора по диапазону
         local from_time="" to_time=""
@@ -5521,6 +5649,9 @@ run_log_collection() {
             info "$(_l log_autostop) disk/timeout"
             COLLECTOR_TIMEOUT_STOP=0
         fi
+        log_debug "resources at stop: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
+        [[ -n "${RESOURCE_WATCH_PID:-}" ]] && kill "$RESOURCE_WATCH_PID" 2>/dev/null
+        RESOURCE_WATCH_PID=""
         ok "$(_l log_copydone)"
     fi
 
@@ -5550,9 +5681,13 @@ run_log_collection() {
         tar -zcf "$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME" --remove-files
         ok "$(_l archive_gzip)"
     fi
+    # ${SCRIPT_NAME}.log уже упакован в архив и удалён вместе с WORK_DIR
+    # (--remove-files) — дальше писать в него уже нельзя
+    LOG_FILE=""
     echo ""
     ok "$(_l archive_at): $COLLECTOR_DIR/$ARCHIVE_NAME.tar.gz"
     info "$(_l done_msg)"
+    return 0
 }
 
 # --- 11. Мастер / справка / argv / main ------------------------------------------
@@ -5583,6 +5718,7 @@ _wizard_select_log_targets() {
         warn "$(_l wiz_no_targets)"
         return 0
     fi
+    log_debug "wizard: available products on host: ${prods[*]}"
 
     echo ""
     echo "$(_l wiz_title_products)"
@@ -5613,6 +5749,7 @@ _wizard_select_log_targets() {
         done
         [[ ${#SELECTED_PRODUCTS[@]} -eq 0 ]] && SELECTED_PRODUCTS=("${prods[@]}")
     fi
+    log_debug "wizard: products choice='$choice' -> SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]})"
 
     # Опциональное уточнение по службам: предлагаем всегда, если выбран хоть один продукт
     echo ""
@@ -5691,6 +5828,7 @@ run_interactive_wizard() {
     echo -n "$(_l ask_lang_prompt)"
     read -r lang_choice 2>/dev/null || true
     if [[ "$lang_choice" == "1" ]]; then CURRENT_LANG="ru"; else CURRENT_LANG="en"; fi
+    log_debug "wizard: lang_choice='$lang_choice' -> CURRENT_LANG=$CURRENT_LANG"
 
     # Шаг 2: Режим
     echo ""
@@ -5700,6 +5838,7 @@ run_interactive_wizard() {
     echo "$(_l wiz_mode_3)"
     echo -n "$(_l wiz_mode_prompt)"
     read -r mode_choice 2>/dev/null || true
+    log_debug "wizard: mode_choice='$mode_choice'"
 
     case "$mode_choice" in
         2)
@@ -5714,6 +5853,7 @@ run_interactive_wizard() {
             echo -n "$(_l wiz_type_prompt)"
             read -r submode_choice 2>/dev/null || true
             [[ "$submode_choice" == "2" ]] && LOG_SUBMODE="offline" || LOG_SUBMODE="online"
+            log_debug "wizard: submode_choice='$submode_choice' -> LOG_SUBMODE=$LOG_SUBMODE"
 
             # Область: brief / extended
             echo ""
@@ -5723,6 +5863,7 @@ run_interactive_wizard() {
             echo -n "$(_l wiz_scope_prompt)"
             read -r scope_choice 2>/dev/null || true
             [[ "$scope_choice" == "2" ]] && LOG_SCOPE="extended" || LOG_SCOPE="brief"
+            log_debug "wizard: scope_choice='$scope_choice' -> LOG_SCOPE=$LOG_SCOPE"
 
             # Настройки времени
             if [[ "$LOG_SUBMODE" == "online" ]]; then
@@ -5770,16 +5911,19 @@ run_interactive_wizard() {
                         TO_TIME="${TO_TIME:-}"
                         ;;
                 esac
+                log_debug "wizard: range_choice='$range_choice' -> TIMEOUT_RAW='$TIMEOUT_RAW' FROM_TIME='$FROM_TIME' TO_TIME='$TO_TIME'"
             fi
 
             # Выбор продукта / службы
             detect_os
             _wizard_select_log_targets
+            log_debug "wizard: SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]+"${SELECTED_PRODUCTS[*]}"}) SELECTED_SERVICES=(${SELECTED_SERVICES[*]+"${SELECTED_SERVICES[*]}"})"
 
             # Директория вывода
             echo -n "$(_l wiz_output_dir)"
             read -r out_dir 2>/dev/null || true
             [[ -n "$out_dir" ]] && OUTPUT_DIR="$out_dir"
+            _log_line "INFO" "wizard: режим=сбор логов $LOG_SUBMODE, scope=$LOG_SCOPE, output_dir='${OUTPUT_DIR:-(по умолчанию)}'"
             ;;
         3)
             MODE_LOG=0
@@ -5794,6 +5938,7 @@ run_interactive_wizard() {
                 2) SELFTEST_MODE="extended"; MODE_DEV=1 ;;
                 *) SELFTEST_MODE="simple" ;;
             esac
+            _log_line "INFO" "wizard: режим=самотест ($SELFTEST_MODE)"
             ;;
         *)
             # По умолчанию: проверка состояния
@@ -5803,6 +5948,7 @@ run_interactive_wizard() {
             echo -n "$(_l wiz_show_repo)"
             read -r repo_choice 2>/dev/null || true
             [[ "$repo_choice" == "y" || "$repo_choice" == "Y" || "$repo_choice" == "д" || "$repo_choice" == "Д" ]] && SHOW_REPO=1
+            _log_line "INFO" "wizard: режим=проверка служб (health check), show_repo=$SHOW_REPO"
             ;;
     esac
 }
@@ -5876,6 +6022,18 @@ Log collection:
   Offline: parallel copy of log files (up to nproc workers, -j to override)
   Online: one tail -F process per source log file (same layout as offline archive)
   Empty files created during collection with no new lines are removed before archiving
+
+Session log (<script-name>.log):
+  Every run writes a full log of its own work: invocation args or wizard
+  choices, which log dirs/files were found and which were discarded (and
+  why), host CPU/MEM snapshots at start/stop and every 30s during collection.
+  -log: the log file is written inside the collection work dir and packed
+        into the same .tar.gz as the collected logs.
+  otherwise: written next to the script (or -o/--output) and overwritten on
+        each run (no rotation, safe for frequent cron/Zabbix invocations).
+  Terminal [OK]/[WARN]/[FAIL]/[INFO] lines are mirrored there with a
+  timestamp; fine-grained "found/discarded"/resource entries are DEBUG-level
+  and file-only, so the screen output is unaffected.
 
 Required dependencies:
   bash, coreutils (date, find, cp, tar, mkdir, wc, sort)
@@ -6102,6 +6260,9 @@ parse_args() {
 
 main() {
     parse_args "$@"
+
+    init_logging "${OUTPUT_DIR:-$SCRIPT_DIR}"
+    _log_line "INFO" "Запуск: $0 $* (аргументов: $#)"
 
     # -i: интерактивный мастер
     if [[ $MODE_INTERACTIVE -eq 1 ]]; then
