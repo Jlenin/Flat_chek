@@ -758,9 +758,12 @@ init_logging() {
 # случилось до создания WORK_DIR) внутрь рабочей директории сборщика, чтобы
 # он попал в архив вместе с собранными логами, и продолжает писать туда же.
 relocate_log_to_workdir() {
+    local old_log="${LOG_FILE:-}"
     local new_log="${WORK_DIR%/}/${SCRIPT_NAME}.log"
-    if [[ -n "${LOG_FILE:-}" && -f "$LOG_FILE" && "$LOG_FILE" != "$new_log" ]]; then
-        mv -- "$LOG_FILE" "$new_log" 2>/dev/null || cp -- "$LOG_FILE" "$new_log" 2>/dev/null
+    if [[ -n "$old_log" && -f "$old_log" && "$old_log" != "$new_log" ]]; then
+        if ! mv -- "$old_log" "$new_log" 2>/dev/null; then
+            cp -- "$old_log" "$new_log" 2>/dev/null && rm -f -- "$old_log" 2>/dev/null
+        fi
     fi
     LOG_FILE="$new_log"
     : >> "$LOG_FILE" 2>/dev/null || LOG_FILE=""
@@ -4224,12 +4227,13 @@ parce_service_logs() {
 # newline-based _psl_dedupe_archive_copies() from the parce_service_log(s)
 # module without giving up NUL-safety at the edges.
 _log_dedupe_files_stream() {
+    local f
     local -a files=() kept=()
     while IFS= read -r -d '' f; do files+=("$f"); done
     [[ ${#files[@]} -eq 0 ]] && return 0
     mapfile -t kept < <(printf '%s\n' "${files[@]}" | _psl_dedupe_archive_copies)
     if [[ "${#kept[@]}" -ne "${#files[@]}" ]]; then
-        local -A kept_set=() f
+        local -A kept_set=()
         for f in "${kept[@]}"; do kept_set["$f"]=1; done
         for f in "${files[@]}"; do
             [[ -z "${kept_set[$f]:-}" ]] && log_debug "discarded (archived twin of a live plain file): $f"
