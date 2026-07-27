@@ -4442,6 +4442,14 @@ _psl_dedupe_archive_copies() {
 _psl_log_group_key() {
     local key
     key=$(_psl_strip_archive_ext "$(basename -- "$1")")
+    # Ведущая дата в самом начале имени файла — ежедневная ротация вида
+    # YYYY_MM_DD_service_log.log / YYYY-MM-DD-service.log (например у
+    # fcs-swau/fcs-contact и других продуктов линейки FCS): без этого
+    # каждый день считался бы своим собственным "типом" лога и никогда не
+    # объединялся бы с остальными днями той же службы.
+    key=$(printf '%s' "$key" | sed -E \
+        -e 's/^[0-9]{4}[_-][0-9]{2}[_-][0-9]{2}[_-]//' \
+        -e 's/^[0-9]{2}[_.][0-9]{2}[_.][0-9]{4}[_-]//')
     key=$(printf '%s' "$key" | sed -E \
         -e 's/\.[0-9]+$//' \
         -e 's/[-.][0-9]{4}-?[0-9]{2}-?[0-9]{2}$//')
@@ -4670,6 +4678,15 @@ _log_dedupe_files_stream() {
     local -a files=() kept=()
     while IFS= read -r -d '' f; do files+=("$f"); done
     [[ ${#files[@]} -eq 0 ]] && return 0
+    # Хронологический порядок (старые сначала) по mtime — иначе порядок
+    # определялся бы обходом каталога (не гарантированно по датам), и
+    # объединённый файл группы (для нескольких ежедневно ротируемых файлов
+    # одной службы) читался бы вперемешку, а не по дням подряд.
+    mapfile -t files < <(
+        for f in "${files[@]}"; do
+            printf '%s\t%s\n' "$(stat -c '%Y' "$f" 2>/dev/null || echo 0)" "$f"
+        done | sort -t $'\t' -k1,1n | cut -f2-
+    )
     mapfile -t kept < <(printf '%s\n' "${files[@]}" | _psl_dedupe_archive_copies)
     if [[ "${#kept[@]}" -ne "${#files[@]}" ]]; then
         local -A kept_set=()
@@ -5005,6 +5022,38 @@ _run_selftest_simple() {
     rm -f -- "$ctmp" 2>/dev/null
     LOG_CHUNK_MODE="$saved_mode"
     LOG_CHUNK_LINES="$saved_lines"
+
+    # Ведущая дата в имени файла (YYYY_MM_DD_service_log.log — ежедневная
+    # ротация у fcs-swau/fcs-contact и т.п.) должна давать тот же ключ
+    # группы для разных дней одной службы, иначе каждый день считался бы
+    # своим отдельным "типом" лога и никогда не объединялся бы с
+    # остальными днями при офлайн-сборе за диапазон в несколько суток.
+    if [[ "$(_psl_log_group_key '2026_07_24_swau_log.log')" == "$(_psl_log_group_key '2026_07_25_swau_log.log')" ]]; then
+        _selftest_ok "_psl_log_group_key merges YYYY_MM_DD-prefixed daily files"
+    else
+        _selftest_bad "_psl_log_group_key merges YYYY_MM_DD-prefixed daily files"
+    fi
+
+    # Несколько ежедневных файлов одной службы должны объединяться в
+    # хронологическом порядке (по mtime), а не в порядке обхода каталога —
+    # иначе части офлайн-архива при многодневном диапазоне читались бы не
+    # по порядку дней.
+    local codir
+    codir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    printf '2026-07-27 00:00:00 day3\n' > "$codir/2026_07_27_x.log"
+    printf '2026-07-25 00:00:00 day1\n' > "$codir/2026_07_25_x.log"
+    printf '2026-07-26 00:00:00 day2\n' > "$codir/2026_07_26_x.log"
+    touch -d '2026-07-27 00:00:00' "$codir/2026_07_27_x.log"
+    touch -d '2026-07-25 00:00:00' "$codir/2026_07_25_x.log"
+    touch -d '2026-07-26 00:00:00' "$codir/2026_07_26_x.log"
+    local co_order
+    co_order=$(_log_candidate_files_for_dir "$codir" | tr '\0' '\n' | xargs -n1 basename 2>/dev/null | tr '\n' ',')
+    if [[ "$co_order" == "2026_07_25_x.log,2026_07_26_x.log,2026_07_27_x.log," ]]; then
+        _selftest_ok "_log_candidate_files_for_dir orders multi-day files chronologically"
+    else
+        _selftest_bad "_log_candidate_files_for_dir orders multi-day files chronologically (got: $co_order)"
+    fi
+    rm -rf -- "$codir" 2>/dev/null
 
     _get_mem_usage_percent >/dev/null && _selftest_ok "_get_mem_usage_percent" || _selftest_bad "_get_mem_usage_percent"
     _get_cpu_usage_percent >/dev/null && _selftest_ok "_get_cpu_usage_percent" || _selftest_bad "_get_cpu_usage_percent"
