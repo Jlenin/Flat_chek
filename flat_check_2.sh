@@ -45,7 +45,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.6.1"
+SCRIPT_VERSION="3.6.2"
 
 set -uo pipefail
 
@@ -5109,6 +5109,56 @@ _run_selftest_simple() {
     rm -rf -- "$mwork" 2>/dev/null
     rm -f -- "$midfile" 2>/dev/null
 
+    # Режим 2: from→to через полночь; режим 3: from+offset (+Nh и голый Nh).
+    local b_from b_to
+    b_from=$(_offline_resolve_time_bounds "26.07.2026 23:00" "27.07.2026 00:10:30" "" | sed -n '1p')
+    b_to=$(_offline_resolve_time_bounds "26.07.2026 23:00" "27.07.2026 00:10:30" "" | sed -n '2p')
+    if [[ "$b_from" == "2026-07-26 23:00:00" && "$b_to" == "2026-07-27 00:10:30" ]]; then
+        _selftest_ok "_offline_resolve_time_bounds mode2 from→to (DD.MM + seconds)"
+    else
+        _selftest_bad "_offline_resolve_time_bounds mode2 from→to (got '$b_from'|'$b_to')"
+    fi
+    b_to=$(_offline_resolve_time_bounds "26.07.2026 23:00" "+2h" "" | sed -n '2p')
+    if [[ "$b_to" == "2026-07-27 01:00:00" ]]; then
+        _selftest_ok "_offline_resolve_time_bounds mode3 +2h across midnight"
+    else
+        _selftest_bad "_offline_resolve_time_bounds mode3 +2h (got '$b_to')"
+    fi
+    # Голый "2h" без плюса раньше уходил в date -d "2h" → мусорная дата
+    b_to=$(_offline_resolve_time_bounds "26.07.2026 23:00" "2h" "" | sed -n '2p')
+    if [[ "$b_to" == "2026-07-27 01:00:00" ]]; then
+        _selftest_ok "_offline_resolve_time_bounds mode3 bare 2h == +2h"
+    else
+        _selftest_bad "_offline_resolve_time_bounds mode3 bare 2h (got '$b_to')"
+    fi
+
+    # Online: tail -n 0 — только новые строки (в т.ч. через полночь в тексте).
+    local on_src on_dest on_dir on_pid
+    on_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    on_src="$on_dir/sippbx.txt"
+    on_dest="$on_dir/out.txt"
+    printf 'OLD should not appear\n' > "$on_src"
+    tail -F -n 0 -- "$on_src" > "$on_dest" 2>/dev/null &
+    on_pid=$!
+    sleep 0.3
+    printf '26.07.2026 23:59:57.203 NEW1\n' >> "$on_src"
+    printf '27.07.2026 00:00:02.893 NEW2\n' >> "$on_src"
+    local on_i
+    for on_i in 1 2 3 4 5 6 7 8 9 10; do
+        grep -q NEW1 "$on_dest" 2>/dev/null && grep -q NEW2 "$on_dest" 2>/dev/null && break
+        sleep 0.2
+    done
+    kill "$on_pid" 2>/dev/null || true
+    wait "$on_pid" 2>/dev/null || true
+    if ! grep -q 'OLD' "$on_dest" 2>/dev/null \
+        && grep -q NEW1 "$on_dest" 2>/dev/null \
+        && grep -q NEW2 "$on_dest" 2>/dev/null; then
+        _selftest_ok "online tail -n 0 captures only new lines (across midnight text)"
+    else
+        _selftest_bad "online tail -n 0 captures only new lines (got: $(tr '\n' '|' < "$on_dest" 2>/dev/null))"
+    fi
+    rm -rf -- "$on_dir" 2>/dev/null
+
     _get_mem_usage_percent >/dev/null && _selftest_ok "_get_mem_usage_percent" || _selftest_bad "_get_mem_usage_percent"
     _get_cpu_usage_percent >/dev/null && _selftest_ok "_get_cpu_usage_percent" || _selftest_bad "_get_cpu_usage_percent"
 }
@@ -5272,22 +5322,63 @@ parse_time_point() {
     else
         # Абсолютная дата: пробуем несколько форматов
         result=$(date -d "$raw" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-        # Запасной вариант: DD.MM.YYYY HH:MM → преобразуем в YYYY-MM-DD HH:MM
-        if [[ -z "$result" && "$raw" =~ ^([0-9]{2})\.([0-9]{2})\.([0-9]{4})[[:space:]]([0-9]{2}):([0-9]{2}).*$ ]]; then
+        # Запасной вариант: DD.MM.YYYY HH:MM[:SS] → YYYY-MM-DD HH:MM:SS
+        if [[ -z "$result" && "$raw" =~ ^([0-9]{2})\.([0-9]{2})\.([0-9]{4})[[:space:]]([0-9]{2}):([0-9]{2})(:([0-9]{2}))? ]]; then
             local d="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}" y="${BASH_REMATCH[3]}"
             local hh="${BASH_REMATCH[4]}" mm="${BASH_REMATCH[5]}"
-            result=$(date -d "${y}-${m}-${d} ${hh}:${mm}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            local ss="${BASH_REMATCH[7]:-00}"
+            result=$(date -d "${y}-${m}-${d} ${hh}:${mm}:${ss}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
         fi
-        # Запасной вариант: DD.MM HH:MM (текущий год)
-        if [[ -z "$result" && "$raw" =~ ^([0-9]{2})\.([0-9]{2})[[:space:]]([0-9]{2}):([0-9]{2}).*$ ]]; then
+        # Запасной вариант: DD.MM HH:MM[:SS] (текущий год)
+        if [[ -z "$result" && "$raw" =~ ^([0-9]{2})\.([0-9]{2})[[:space:]]([0-9]{2}):([0-9]{2})(:([0-9]{2}))? ]]; then
             local d="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}"
             local hh="${BASH_REMATCH[3]}" mm="${BASH_REMATCH[4]}"
+            local ss="${BASH_REMATCH[6]:-00}"
             local y; y=$(date +%Y)
-            result=$(date -d "${y}-${m}-${d} ${hh}:${mm}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            result=$(date -d "${y}-${m}-${d} ${hh}:${mm}:${ss}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
         fi
     fi
     [[ -n "$result" ]] && echo "$result" && return 0
     return 1
+}
+
+# Разбирает FROM_TIME / TO_TIME / timeout_raw (режим «за последние Nd»)
+# в пару абсолютных строк "%Y-%m-%d %H:%M:%S". Печатает две строки:
+#   1) from_time  2) to_time
+# (обе пустые = собрать все логи без фильтра по времени).
+#
+# TO как смещение от FROM: принимаем и "+3h", и голый "3h"/"30m"/"1d"
+# (wizard просит "+3h", но без плюса GNU date -d "3h" даёт мусорную
+# абсолютную дату — часто раньше from — и диапазон оказывается пустым/перевёрнутым).
+_offline_resolve_time_bounds() {
+    local from_raw="${1:-}" to_raw="${2:-}" timeout_raw="${3:-}"
+    local from_time="" to_time="" offset_cand from_epoch add_sec
+
+    if [[ -n "$from_raw" ]]; then
+        from_time=$(parse_time_point "$from_raw") || return 1
+    fi
+    if [[ -n "$to_raw" ]]; then
+        offset_cand="$to_raw"
+        [[ "$offset_cand" =~ ^\+ ]] && offset_cand="${offset_cand:1}"
+        if [[ -n "$from_time" ]] && parse_duration "$offset_cand"; then
+            from_epoch=$(date -d "$from_time" "+%s" 2>/dev/null)
+            [[ -n "$from_epoch" ]] || return 1
+            add_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
+            to_time=$(date -d "@$(( from_epoch + add_sec ))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            [[ -n "$to_time" ]] || return 1
+        else
+            to_time=$(parse_time_point "$to_raw") || return 1
+        fi
+    fi
+    if [[ -z "$from_time" && -n "$timeout_raw" ]]; then
+        from_time=$(parse_time_point "-${timeout_raw}") || true
+    fi
+    # Только from («за последние Nd») → верхняя граница = сейчас.
+    # Иначе пустой to раньше доходил до date -d "" → полночь сегодня.
+    if [[ -n "$from_time" && -z "$to_time" ]]; then
+        to_time=$(date "+%Y-%m-%d %H:%M:%S")
+    fi
+    printf '%s\n%s\n' "$from_time" "$to_time"
 }
 
 # --- 9. Процессы сборщика / сигналы / безопасное удаление -----------------------
@@ -6215,38 +6306,13 @@ _run_offline_collection() {
     _get_cpu_usage_percent >/dev/null   # первый вызов лишь инициализирует дельту /proc/stat
     log_debug "resources at start: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
 
-    # Разбор from/to для offline-сбора по диапазону
-    if [[ -n "$FROM_TIME" ]]; then
-        from_time=$(parse_time_point "$FROM_TIME") || die "Invalid --from: '$FROM_TIME'"
+    # Разбор from/to для offline-сбора по диапазону (см. _offline_resolve_time_bounds)
+    local bounds_out
+    if ! bounds_out=$(_offline_resolve_time_bounds "$FROM_TIME" "$TO_TIME" "$timeout_raw"); then
+        die "Invalid --from/--to: from='${FROM_TIME:-}' to='${TO_TIME:-}'"
     fi
-    if [[ -n "$TO_TIME" ]]; then
-        # Смешанный режим: +3h вместе с --from = from_time + 3 часа
-        if [[ "$TO_TIME" =~ ^[+] && -n "$from_time" ]]; then
-            local offset="${TO_TIME:1}"
-            if ! parse_duration "$offset"; then
-                die "Invalid --to offset: '$TO_TIME'"
-            fi
-            local from_epoch add_sec
-            from_epoch=$(date -d "$from_time" "+%s" 2>/dev/null)
-            [[ -z "$from_epoch" ]] && die "Invalid --from for offset: '$FROM_TIME'"
-            add_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
-            to_time=$(date -d "@$(( from_epoch + add_sec ))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-            [[ -z "$to_time" ]] && die "Invalid --to offset: '$TO_TIME'"
-        else
-            to_time=$(parse_time_point "$TO_TIME") || die "Invalid --to: '$TO_TIME'"
-        fi
-    fi
-    # Legacy: -t в offline-режиме = --from -${value}
-    if [[ -z "$from_time" && -n "$timeout_raw" ]]; then
-        from_time=$(parse_time_point "-${timeout_raw}") || true
-    fi
-
-    # «За последние Nd/Nh»: задан только from — верхняя граница = сейчас.
-    # Без этого пустой to уходил в parce_service_log как "", а GNU date -d ""
-    # даёт 00:00:00 сегодня → хвост лога после полуночи (текущий день) терялся.
-    if [[ -n "$from_time" && -z "$to_time" ]]; then
-        to_time=$(date "+%Y-%m-%d %H:%M:%S")
-    fi
+    from_time=$(printf '%s\n' "$bounds_out" | sed -n '1p')
+    to_time=$(printf '%s\n' "$bounds_out" | sed -n '2p')
 
     if [[ -n "$from_time" && -n "$to_time" ]]; then
         info "Extracting log lines from $from_time to $to_time (by content timestamp)"
