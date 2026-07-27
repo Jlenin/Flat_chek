@@ -29,7 +29,7 @@ chmod +x flat_check_2.sh
 Версия при сборе логов:
 
 ```text
-[INFO] Режим логов: offline / scope=brief (flat_check_2 v3.6.0)
+[INFO] Режим логов: offline / scope=brief (flat_check_2 v3.6.1)
 ```
 
 Если версии нет или формат старый — на сервере лежит неактуальный файл. Переложите скрипт с репозитория.
