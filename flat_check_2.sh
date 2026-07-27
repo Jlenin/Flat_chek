@@ -143,6 +143,14 @@ MAX_LOG_CHUNK_SIZE=$((100 * 1024 * 1024))
 _CPU_PREV_IDLE=""
 _CPU_PREV_TOTAL=""
 
+# Epoch полуночи дня файла, который сейчас разбирает line_epoch() (awk, см.
+# _AWK_LINE_EPOCH) — нужен только логам без даты в самой строке (только
+# HH:MM:SS, дата — в имени файла). Выставляется _infer_file_midnight_epoch()
+# в начале обработки каждого файла (parce_service_log(),
+# filter_log_file_by_range()); "" — не относится к текущему файлу /
+# определить не удалось.
+_LOG_REF_MIDNIGHT_EPOCH=""
+
 # Пути к конфигам для извлечения логов
 CONFIG_PATHS=(
     "/opt/flat/switchserver/settings.ini"
@@ -3439,7 +3447,11 @@ time_to_epoch() {
     date -d "$1" "+%s" 2>/dev/null
 }
 
-# Общее тело awk: парсинг timestamp → epoch (YYYY-MM-DD / DD.MM.YYYY)
+# Общее тело awk: парсинг timestamp → epoch (YYYY-MM-DD / DD.MM.YYYY, плюс
+# запасной вариант для строк вообще без даты — только HH:MM:SS, см. ниже).
+# Ожидает опциональную awk-переменную ref_midnight (epoch полуночи дня,
+# к которому относится файл — задаётся через -v вызывающим кодом на основе
+# _LOG_REF_MIDNIGHT_EPOCH, см. _infer_file_midnight_epoch()).
 _AWK_LINE_EPOCH='
 function line_epoch(line, ts, n, p) {
     if (match(line, /[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
@@ -3466,6 +3478,16 @@ function line_epoch(line, ts, n, p) {
         n = split(ts, p, " ")
         if (n >= 5) return mktime(p[1] " " p[2] " " p[3] " " p[4] " " p[5] " 0")
     }
+    # Некоторые логгеры FLAT (например fcs-swau) пишут в каждой строке только
+    # время (HH:MM:SS[:мс]) без даты — дата целиком в имени файла
+    # (YYYY_MM_DD_*.log). ref_midnight (epoch 00:00:00 дня файла) передаётся
+    # вызывающим кодом через -v; без него строки такого формата неотличимы
+    # от "нет метки времени вообще", как и раньше.
+    if (ref_midnight > 0 && match(line, /^[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+        ts = substr(line, RSTART, RLENGTH)
+        n = split(ts, p, ":")
+        if (n >= 3) return ref_midnight + p[1] * 3600 + p[2] * 60 + p[3]
+    }
     return -1
 }
 '
@@ -3477,6 +3499,35 @@ _file_size_bytes() {
     echo "${s:-0}"
 }
 
+# Печатает epoch полуночи (00:00:00) календарного дня, к которому относится
+# файл — для логов, где каждая строка содержит только время (HH:MM:SS), без
+# даты, а дата зашита только в имени файла (обычная схема для ежедневно
+# ротируемых логов вида YYYY_MM_DD_*.log, например fcs-swau/*.log). Сначала
+# пробует распознать дату в имени файла (YYYY_MM_DD, YYYY-MM-DD,
+# DD.MM.YYYY, DD_MM_YYYY); если в имени файла даты нет — использует дату
+# mtime файла как разумное приближение. Пусто, если и это не удалось.
+_infer_file_midnight_epoch() {
+    local file="$1" base date_str="" epoch mtime
+    base=$(basename -- "$file")
+
+    if [[ "$base" =~ ([0-9]{4})[_-]([0-9]{2})[_-]([0-9]{2}) ]]; then
+        date_str="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
+    elif [[ "$base" =~ ([0-9]{2})[._]([0-9]{2})[._]([0-9]{4}) ]]; then
+        date_str="${BASH_REMATCH[3]}-${BASH_REMATCH[2]}-${BASH_REMATCH[1]}"
+    fi
+
+    if [[ -n "$date_str" ]]; then
+        epoch=$(date -d "$date_str 00:00:00" "+%s" 2>/dev/null)
+        [[ "$epoch" =~ ^[0-9]+$ ]] && { echo "$epoch"; return 0; }
+    fi
+
+    mtime=$(stat -c '%Y' "$file" 2>/dev/null) || return 1
+    date_str=$(date -d "@$mtime" '+%Y-%m-%d' 2>/dev/null)
+    [[ -n "$date_str" ]] || return 1
+    epoch=$(date -d "$date_str 00:00:00" "+%s" 2>/dev/null)
+    [[ "$epoch" =~ ^[0-9]+$ ]] && echo "$epoch"
+}
+
 # Epoch одной строки лога (-1, если нет)
 _epoch_of_line() {
     local line="$1" ep
@@ -3485,7 +3536,8 @@ _epoch_of_line() {
     line="${line//$'\0'/}"
     # Избегаем SIGPIPE+pipefail, когда awk завершается после одной строки
     ep=$(set +o pipefail
-        printf '%s\n' "$line" | LC_ALL=C awk "$_AWK_LINE_EPOCH"' { print line_epoch($0); exit }')
+        printf '%s\n' "$line" | LC_ALL=C awk -v ref_midnight="${_LOG_REF_MIDNIGHT_EPOCH:-0}" \
+            "$_AWK_LINE_EPOCH"' { print line_epoch($0); exit }')
     echo "${ep:--1}"
 }
 
@@ -3521,8 +3573,16 @@ _logs_appear_sorted() {
     e1=$(_epoch_of_line "$line1")
     line2=$(_probe_line_at_offset "$file" $((size / 2)))
     e2=$(_epoch_of_line "$line2")
-    near_end=$((size > SEEK_PROBE_BYTES ? size - SEEK_PROBE_BYTES : 0))
-    line3=$(_probe_line_at_offset "$file" "$near_end")
+    if [[ "$size" -gt "${SEEK_PROBE_BYTES:-131072}" ]]; then
+        near_end=$((size - SEEK_PROBE_BYTES))
+        line3=$(_probe_line_at_offset "$file" "$near_end")
+    else
+        # Файл меньше окна пробы: "около конца" совпало бы со смещением 0
+        # (тем же, что и "начало") — вместо этого берём реально последнюю
+        # непустую строку файла, иначе такие файлы почти всегда ошибочно
+        # определялись бы как неотсортированные только из-за своего размера.
+        line3=$(tail -n 1 -- "$file" 2>/dev/null | tr -d '\0')
+    fi
     e3=$(_epoch_of_line "$line3")
     [[ "$e1" =~ ^[0-9]+$ && "$e2" =~ ^[0-9]+$ && "$e3" =~ ^[0-9]+$ ]] || return 1
     [[ "$e1" -gt 0 && "$e2" -gt 0 && "$e3" -gt 0 ]] || return 1
@@ -3599,7 +3659,8 @@ _extract_chunk_worker() {
     [[ "$len" -le 0 ]] && { : > "$part"; return 0; }
     dd if="$file" bs=4M iflag=skip_bytes,count_bytes skip="$off" count="$len" 2>/dev/null \
         | tr -d '\0' \
-        | LC_ALL=C awk -v from="$from_epoch" -v to="$to_epoch" "$(_awk_filter_range_prog "$sorted")" \
+        | LC_ALL=C awk -v from="$from_epoch" -v to="$to_epoch" -v ref_midnight="${_LOG_REF_MIDNIGHT_EPOCH:-0}" \
+            "$(_awk_filter_range_prog "$sorted")" \
         > "$part" 2>/dev/null || true
 }
 
@@ -3759,6 +3820,7 @@ filter_log_file_by_range() {
     [[ "$src_file" == *.gz ]] && reader="zcat"
     _collector_should_stop && return 1
     mkdir -p "$(dirname "$dest_file")" 2>/dev/null
+    _LOG_REF_MIDNIGHT_EPOCH=$(_infer_file_midnight_epoch "$src_file")
 
     if [[ "$reader" == "cat" && -f "$src_file" ]]; then
         size=$(_file_size_bytes "$src_file")
@@ -3791,7 +3853,8 @@ filter_log_file_by_range() {
     # Маленькие файлы / gzip: единый поток
     $reader "$src_file" 2>/dev/null \
         | tr -d '\0' \
-        | LC_ALL=C awk -v from="$from_epoch" -v to="$to_epoch" "$(_awk_filter_range_prog 0)" \
+        | LC_ALL=C awk -v from="$from_epoch" -v to="$to_epoch" -v ref_midnight="${_LOG_REF_MIDNIGHT_EPOCH:-0}" \
+            "$(_awk_filter_range_prog 0)" \
         > "$dest_file" 2>/dev/null \
         || { rm -f "$dest_file" 2>/dev/null; return 1; }
 
@@ -4043,13 +4106,19 @@ _psl_plan_chunk_bounds() {
 }
 
 # Копирует каждый кусок [off, next) из _psl_plan_chunk_bounds (аргументы
-# 5..N) в свой part_NNNNN.log внутри out_dir, оставляя только строки внутри
+# 6..N) в свой part_NNNNN.log внутри out_dir, оставляя только строки внутри
 # [from_epoch, to_epoch] — защита от того, что интерполяционный поиск
-# приземлился на несколько строк раньше/позже точной границы. Отбрасывает
-# части, оказавшиеся пустыми. Печатает число фактически записанных чанк-файлов.
+# приземлился на несколько строк раньше/позже точной границы. $5=sorted:
+# 1 разрешает ранний выход из awk по каждому чанку, как только встретилась
+# строка позже to_epoch (безопасно только если файл действительно
+# хронологически отсортирован); 0 — сканировать чанк целиком (используется,
+# когда _logs_appear_sorted() уже сказал "нет", а границы [off,next) —
+# это просто весь файл, а не результат интерполяционного поиска).
+# Отбрасывает части, оказавшиеся пустыми. Печатает число фактически
+# записанных чанк-файлов.
 _psl_copy_chunks() {
-    local file="$1" out_dir="$2" from_epoch="$3" to_epoch="$4"
-    local -a bounds=("${@:5}")
+    local file="$1" out_dir="$2" from_epoch="$3" to_epoch="$4" sorted="$5"
+    local -a bounds=("${@:6}")
     local n=$((${#bounds[@]} - 1))
     local max_jobs i off next len part idx=0 count=0
 
@@ -4070,7 +4139,7 @@ _psl_copy_chunks() {
         (
             renice -n 10 $$ >/dev/null 2>&1 || true
             ionice -c 2 -n 7 -p $$ >/dev/null 2>&1 || true
-            _extract_chunk_worker "$file" "$off" "$len" "$from_epoch" "$to_epoch" 1 "$part"
+            _extract_chunk_worker "$file" "$off" "$len" "$from_epoch" "$to_epoch" "$sorted" "$part"
         ) &
         _SEEK_JOB_PIDS+=($!)
     done
@@ -4098,7 +4167,7 @@ _psl_copy_chunks() {
 # При неудаче: выводит warn с причиной, возвращает 1, оставляет обе глобальные переменные неустановленными.
 parce_service_log() {
     local log_path="$1" ts_from_raw="$2" ts_to_raw="$3"
-    local real_path from_epoch to_epoch size range_str start_off end_off
+    local real_path from_epoch to_epoch size range_str start_off end_off sorted=1
     local out_dir chunk_count
     local -a bounds=()
 
@@ -4117,18 +4186,31 @@ parce_service_log() {
         warn "parce_service_log: $real_path is empty or unreadable"
         return 1
     fi
+    # Некоторые логгеры (например fcs-swau) пишут в строке только время без
+    # даты — дата только в имени файла; без этого такие строки были бы
+    # неотличимы от "нет метки времени вообще" везде ниже по конвейеру
+    # (line_epoch() в awk читает эту переменную через -v ref_midnight=...).
+    _LOG_REF_MIDNIGHT_EPOCH=$(_infer_file_midnight_epoch "$real_path")
 
-    _logs_appear_sorted "$real_path" "$size" \
-        || warn "parce_service_log: $real_path does not look chronologically sorted — results may be incomplete"
-
-    range_str=$(_psl_locate_range "$real_path" "$size" "$from_epoch" "$to_epoch") || return 1
-    read -r start_off end_off <<< "$range_str"
+    if _logs_appear_sorted "$real_path" "$size"; then
+        range_str=$(_psl_locate_range "$real_path" "$size" "$from_epoch" "$to_epoch") || return 1
+        read -r start_off end_off <<< "$range_str"
+    else
+        # Неотсортированный: интерполяционный поиск не заслуживает доверия (он
+        # предполагает монотонные по offset timestamp'ы) — как и
+        # filter_log_file_by_range() в другом месте этого файла, сканируем
+        # файл целиком, каждый чанк — без раннего выхода по timestamp.
+        sorted=0
+        warn "parce_service_log: $real_path does not look chronologically sorted — scanning the whole file instead of seeking"
+        start_off=0
+        end_off="$size"
+    fi
 
     out_dir=$(_psl_make_output_dir "$real_path" "$from_epoch" "$to_epoch")
     [[ -n "$out_dir" && -d "$out_dir" ]] || { warn "parce_service_log: cannot create output dir under /tmp"; return 1; }
 
     mapfile -t bounds < <(_psl_plan_chunk_bounds "$real_path" "$start_off" "$end_off" "$size")
-    chunk_count=$(_psl_copy_chunks "$real_path" "$out_dir" "$from_epoch" "$to_epoch" "${bounds[@]}")
+    chunk_count=$(_psl_copy_chunks "$real_path" "$out_dir" "$from_epoch" "$to_epoch" "$sorted" "${bounds[@]}")
 
     if [[ ! "$chunk_count" =~ ^[0-9]+$ ]] || [[ "$chunk_count" -eq 0 ]]; then
         warn "parce_service_log: no lines matched inside the requested range"
@@ -4788,6 +4870,45 @@ _run_selftest_simple() {
     fi
     rm -rf -- "${PSL_OUTPUT_PATH:-}" 2>/dev/null
     rm -f -- "$tmp" 2>/dev/null
+
+    # Заведомо неотсортированный вход (убывающие timestamp) с искомыми строками
+    # в середине: регресс на баг, когда parce_service_log() лишь предупреждал
+    # "does not look chronologically sorted", но всё равно продолжал через
+    # интерполяционный поиск и терял совпадающие строки на реальных логах
+    # SoftSwitch (не append-only по времени).
+    tmp=$(mktemp "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    {
+        local si
+        for si in 20 19 18 17 16; do printf '2026-01-15 %02d:00:00 late-%d\n' "$si" "$si"; done
+        printf '2026-01-15 13:10:00 target-a\n2026-01-15 13:40:00 target-b\n'
+        for si in 10 9 8 7 6; do printf '2026-01-15 %02d:00:00 early-%d\n' "$si" "$si"; done
+    } > "$tmp"
+    if parce_service_log "$tmp" "2026-01-15 13:00:00" "2026-01-15 13:59:59" >/dev/null 2>&1 \
+        && [[ "$(cat "${PSL_OUTPUT_PATH:-/nonexistent}"/part_*.log 2>/dev/null | grep -c '^2026-01-15 13:')" -eq 2 ]]; then
+        _selftest_ok "parce_service_log on unsorted (descending) input"
+    else
+        _selftest_bad "parce_service_log on unsorted (descending) input"
+    fi
+    rm -rf -- "${PSL_OUTPUT_PATH:-}" 2>/dev/null
+    rm -f -- "$tmp" 2>/dev/null
+
+    # Строки вообще без даты (только HH:MM:SS) — дата зашита только в имени
+    # файла (YYYY_MM_DD_*, как у fcs-swau и т.п.). Регресс на баг, когда
+    # такие строки везде получали epoch=-1 (никогда не совпадали ни с одним
+    # из паттернов line_epoch()), из-за чего офлайн-сбор рапортовал "логи
+    # отсутствуют", хотя данные за нужный период в файле были.
+    local dldir dlfile
+    dldir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    dlfile="$dldir/2026_01_15_dateless_log.log"
+    printf '00:00:10:100 [DEBUG] before range\n13:10:00:200 [DEBUG] target-a\n13:40:00:300 [DEBUG] target-b\n23:59:00:400 [DEBUG] after range\n' > "$dlfile"
+    if parce_service_log "$dlfile" "2026-01-15 13:00:00" "2026-01-15 13:59:59" >/dev/null 2>&1 \
+        && [[ "$(cat "${PSL_OUTPUT_PATH:-/nonexistent}"/part_*.log 2>/dev/null | grep -c 'target-')" -eq 2 ]]; then
+        _selftest_ok "parce_service_log on date-less (HH:MM:SS only) input"
+    else
+        _selftest_bad "parce_service_log on date-less (HH:MM:SS only) input"
+    fi
+    rm -rf -- "${PSL_OUTPUT_PATH:-}" 2>/dev/null
+    rm -rf -- "$dldir" 2>/dev/null
 
     _get_mem_usage_percent >/dev/null && _selftest_ok "_get_mem_usage_percent" || _selftest_bad "_get_mem_usage_percent"
     _get_cpu_usage_percent >/dev/null && _selftest_ok "_get_cpu_usage_percent" || _selftest_bad "_get_cpu_usage_percent"
