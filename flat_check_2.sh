@@ -729,7 +729,11 @@ PKG_DEPS["flat-file"]="nginx"
 # логирование в файл никогда не должно ронять сам скрипт или его вывод.
 _log_line() {
     [[ -n "${LOG_FILE:-}" ]] || return 0
-    printf '%s [%-5s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG_FILE" 2>/dev/null
+    # Группа скобок обязательна: если каталог LOG_FILE уже исчез (сборщик
+    # только что заархивировал и удалил WORK_DIR), сам bash печатает "No such
+    # file or directory" в свой stderr при настройке редиректа >> — до того,
+    # как успевает сработать 2>/dev/null самой команды printf.
+    { printf '%s [%-5s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG_FILE"; } 2>/dev/null
 }
 
 # Технические подробности только в файл лога (что найдено/отклонено при
@@ -746,7 +750,7 @@ log_debug() {
 init_logging() {
     local dir="${1:-$SCRIPT_DIR}"
     LOG_FILE="${dir%/}/${SCRIPT_NAME}.log"
-    if ! : > "$LOG_FILE" 2>/dev/null; then
+    if ! { : > "$LOG_FILE"; } 2>/dev/null; then
         LOG_FILE=""
         return 1
     fi
@@ -766,7 +770,7 @@ relocate_log_to_workdir() {
         fi
     fi
     LOG_FILE="$new_log"
-    : >> "$LOG_FILE" 2>/dev/null || LOG_FILE=""
+    { : >> "$LOG_FILE"; } 2>/dev/null || LOG_FILE=""
 }
 
 print_ok() {
@@ -1067,6 +1071,45 @@ detect_os() {
     echo ""
 }
 
+# Канонический id дистрибутива для OS-специфичной диспетчеризации (get_sys_cpu_<id> и т.п.).
+# Тот же порядок определения, что и в detect_os(): сначала /etc/os-release, затем legacy
+# файлы релиза для систем без os-release. Чистая функция — без глобальных переменных,
+# без вывода, просто печатает одно из:
+#   debian ubuntu astra centos rhel oracle rocky almalinux arch alpine unknown
+get_os_release() {
+    local id=""
+
+    if [[ -f /etc/os-release ]]; then
+        id=$(. /etc/os-release 2>/dev/null; echo "${ID:-}")
+        id="${id,,}"
+    fi
+
+    if [[ -z "$id" ]]; then
+        if   [[ -f /etc/astra_version ]];     then id="astra"
+        elif [[ -f /etc/centos-release ]];    then id="centos"
+        elif [[ -f /etc/rocky-release ]];      then id="rocky"
+        elif [[ -f /etc/almalinux-release ]];  then id="almalinux"
+        elif [[ -f /etc/oracle-release ]];     then id="oracle"
+        elif [[ -f /etc/redhat-release ]];     then id="rhel"
+        elif [[ -f /etc/alpine-release ]];     then id="alpine"
+        elif [[ -f /etc/arch-release ]];       then id="arch"
+        elif [[ -f /etc/debian_version ]];     then id="debian"
+        fi
+    fi
+
+    # Нормализуем пару алиасов, которые os-release использует, но которые не совпадают с
+    # именами файлов релиза выше (у Oracle Linux ID "ol"; у RHEL — "redhat"
+    # в очень старых релизах). Всё остальное передаётся как есть и
+    # попадает в общую ветку диспетчеризации у вызывающего кода.
+    case "$id" in
+        ol)     id="oracle" ;;
+        redhat) id="rhel" ;;
+        "")     id="unknown" ;;
+    esac
+
+    echo "$id"
+}
+
 # --- 3b. Системные метрики (обзор хоста для дашборда / health JSON) ------------
 # Всегда печатает блок === System ===; отсутствующие данные → n/a (секция никогда не пропускается).
 
@@ -1138,34 +1181,105 @@ _sys_pkg_pids() {
     fi
 }
 
-_sys_cpu() {
-    local usage="" idle us top_parts=() pkg pct
-    local -a pids=()
+# --- 3b-1. Пробы загрузки CPU по ОС -------------------------------------------
+# Каждая проба печатает целочисленный/десятичный процент загрузки на stdout и
+# возвращает 0, либо возвращает 1 без вывода, если снять показание не удалось.
+# _sys_cpu() ниже вызывает их только через диспетчеризацию get_os_release().
 
-    # Предпочитать дельту /proc/stat (определяется ниже; разрешается в момент вызова)
-    if declare -F _get_cpu_usage_percent >/dev/null 2>&1; then
-        _get_cpu_usage_percent >/dev/null
-        sleep 0.25
-        usage=$(_get_cpu_usage_percent)
-        [[ "$usage" =~ ^[0-9]+$ ]] || usage=""
+# /proc/stat — это интерфейс ядра, одинаковый на любом поддерживаемом нами
+# дистрибутиве Linux — это единственный не-OS-специфичный строительный блок,
+# который всем пробам ниже разрешено использовать совместно, точно как они
+_sys_cpu_via_procstat() {
+    declare -F _get_cpu_usage_percent >/dev/null 2>&1 || return 1
+    _get_cpu_usage_percent >/dev/null   # инициализируем окно дельты
+    sleep 0.25
+    local pct
+    pct=$(_get_cpu_usage_percent)
+    [[ "$pct" =~ ^[0-9]+$ ]] || return 1
+    echo "$pct"
+}
+
+# Debian-семья (Debian/Ubuntu/Astra поставляют procps-ng >= 3.3.10):
+# `top -bn1` печатает "%Cpu(s):  3.2 us,  1.1 sy, ..., 95.3 id, ...".
+get_sys_cpu_debian() {
+    _sys_cpu_via_procstat && return 0
+
+    command -v top &>/dev/null || return 1
+    local line idle
+    line=$(top -bn1 2>/dev/null | grep -m1 '^%Cpu(s):')
+    [[ -n "$line" ]] || return 1
+    idle=$(grep -oE '[0-9]+([.,][0-9]+)?[[:space:]]*id' <<<"$line" | grep -oE '^[0-9]+([.,][0-9]+)?' | tr ',' '.')
+    [[ -n "$idle" ]] || return 1
+    awk -v i="$idle" 'BEGIN{printf "%.1f", 100-i}'
+}
+
+get_sys_cpu_ubuntu() { get_sys_cpu_debian; }   # та же семья procps-ng, что и у Debian
+get_sys_cpu_astra()  { get_sys_cpu_debian; }   # Astra Linux основана на Debian
+
+# RHEL-семья (RHEL/CentOS/Oracle/Rocky/AlmaLinux — один и тот же userland):
+# старый procps печатает "Cpu(s):  10.0%us,  2.0%sy, ..., 87.0%id, ..." — без
+# ведущего '%' в строке и без пробела перед '%' каждого поля.
+get_sys_cpu_rhel() {
+    _sys_cpu_via_procstat && return 0
+
+    command -v top &>/dev/null || return 1
+    local line idle us
+    line=$(top -bn1 2>/dev/null | grep -m1 -E '^Cpu\(s\):')
+    [[ -n "$line" ]] || return 1
+    idle=$(grep -oE '[0-9]+([.,][0-9]+)?%id' <<<"$line" | grep -oE '^[0-9]+([.,][0-9]+)?' | tr ',' '.')
+    if [[ -n "$idle" ]]; then
+        awk -v i="$idle" 'BEGIN{printf "%.1f", 100-i}'
+        return 0
     fi
-    if [[ -z "$usage" ]]; then
-        usage=$(top -bn1 2>/dev/null | grep -E 'Cpu\(s\)|%Cpu' | head -1)
-        if [[ -n "$usage" ]]; then
-            idle=$(echo "$usage" | grep -oE '[0-9]+([.,][0-9]+)?[[:space:]]*%?id' | head -1 | grep -oE '[0-9]+([.,][0-9]+)?' | tr ',' '.')
-            us=$(echo "$usage" | grep -oE '[0-9]+([.,][0-9]+)?[[:space:]]*%?us' | head -1 | grep -oE '[0-9]+([.,][0-9]+)?' | tr ',' '.')
-            if [[ -n "$idle" ]]; then
-                usage=$(awk -v i="$idle" 'BEGIN{printf "%.1f", 100-i}')
-            elif [[ -n "$us" ]]; then
-                usage=$(echo "$us" | tr ',' '.')
-            else
-                usage=""
-            fi
-        else
-            usage=""
-        fi
-    fi
-    if [[ -n "$usage" ]]; then
+    us=$(grep -oE '[0-9]+([.,][0-9]+)?%us' <<<"$line" | grep -oE '^[0-9]+([.,][0-9]+)?' | tr ',' '.')
+    [[ -n "$us" ]] || return 1
+    echo "$us"
+}
+
+get_sys_cpu_centos()    { get_sys_cpu_rhel; }   # CentOS — пересборка RHEL
+get_sys_cpu_oracle()    { get_sys_cpu_rhel; }   # Oracle Linux — пересборка RHEL
+get_sys_cpu_rocky()     { get_sys_cpu_rhel; }   # Rocky Linux — пересборка RHEL
+get_sys_cpu_almalinux() { get_sys_cpu_rhel; }   # AlmaLinux — пересборка RHEL
+
+# Arch всегда следует последней procps-ng — та же форма вывода, что и у Debian-семьи.
+get_sys_cpu_arch() { get_sys_cpu_debian; }
+
+# Alpine — это musl/busybox: вывод `top -bn1` недостаточно стабилен для парсинга
+# между версиями busybox, а sysstat/mpstat не входят в базовый образ.
+# /proc/stat всё равно остаётся интерфейсом ядра, так что он один и составляет всю пробу —
+# запасного варианта с угадыванием формата здесь намеренно нет.
+get_sys_cpu_alpine() {
+    _sys_cpu_via_procstat
+}
+
+# Неизвестный/неподдерживаемый дистрибутив: пробуем всё, что знаем, в порядке надёжности.
+get_sys_cpu_generic() {
+    _sys_cpu_via_procstat && return 0
+    get_sys_cpu_debian && return 0
+    get_sys_cpu_rhel
+}
+
+# --- 3b-2. Секция CPU (обзор хоста) ------------------------------------------
+_sys_cpu() {
+    local os usage pkg pct
+    local -a top_parts=() pids=()
+
+    os=$(get_os_release)
+    case "$os" in
+        debian)    usage=$(get_sys_cpu_debian) ;;
+        ubuntu)    usage=$(get_sys_cpu_ubuntu) ;;
+        astra)     usage=$(get_sys_cpu_astra) ;;
+        centos)    usage=$(get_sys_cpu_centos) ;;
+        rhel)      usage=$(get_sys_cpu_rhel) ;;
+        oracle)    usage=$(get_sys_cpu_oracle) ;;
+        rocky)     usage=$(get_sys_cpu_rocky) ;;
+        almalinux) usage=$(get_sys_cpu_almalinux) ;;
+        arch)      usage=$(get_sys_cpu_arch) ;;
+        alpine)    usage=$(get_sys_cpu_alpine) ;;
+        *)         usage=$(get_sys_cpu_generic) ;;
+    esac
+
+    if [[ "$usage" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         print_info "cpu: usage=${usage}%"
     else
         print_info "cpu: usage=n/a"
@@ -1261,52 +1375,81 @@ _sys_psql() {
     echo "$out" | tr -d '[:space:]'
 }
 
-_sys_database() {
-    local db="n/a" cluster="n/a" role="" lag="" n=""
-    local euid
-    euid="${EUID:-$(id -u)}"
+# --- Хелперы кластера PostgreSQL (используются _sys_database ниже) ---------
+# Каждая фаза старого монолитного определения получила своё имя: активен ли
+# движок, в какой роли он находится и как выглядит его состояние репликации.
+# _sys_database() ниже просто связывает результаты вместе.
 
-    if command -v systemctl &>/dev/null; then
-        if systemctl is-active --quiet postgresql 2>/dev/null \
-            || systemctl is-active --quiet postgresql.service 2>/dev/null \
-            || systemctl list-units --type=service --state=running 2>/dev/null | grep -qE 'postgresql(@|-)'; then
-            db="postgresql active"
-            if command -v psql &>/dev/null && [[ "$euid" -eq 0 || -n "${PGUSER:-}" || -n "${PGDATABASE:-}" ]]; then
-                role=$(_sys_psql "SELECT CASE WHEN pg_is_in_recovery() THEN 'standby' ELSE 'primary' END")
-                if [[ "$role" == "primary" || "$role" == "standby" ]]; then
-                    db="postgresql active ($role)"
-                    if [[ "$role" == "primary" ]]; then
-                        n=$(_sys_psql "SELECT count(*) FROM pg_stat_replication")
-                        if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then
-                            lag=$(_sys_psql "SELECT COALESCE((EXTRACT(EPOCH FROM MAX(COALESCE(replay_lag, write_lag, flush_lag))))::int, 0) FROM pg_stat_replication")
-                            if [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]]; then
-                                lag=$(_sys_psql "SELECT COALESCE(EXTRACT(EPOCH FROM (now()-min(reply_time)))::int,0) FROM pg_stat_replication")
-                            fi
-                            [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]] && lag="0"
-                            cluster="replication=ok lag=${lag}s replicas=$n"
-                        else
-                            cluster="replication=none replicas=0"
-                        fi
-                    else
-                        # Standby: лаг относительно primary по локальному replay timestamp
-                        lag=$(_sys_psql "SELECT COALESCE(EXTRACT(EPOCH FROM (now()-pg_last_xact_replay_timestamp()))::int, 0)")
-                        [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]] && lag="n/a"
-                        if [[ "$lag" == "n/a" ]]; then
-                            cluster="replication=standby lag=n/a"
-                        else
-                            cluster="replication=standby lag=${lag}s"
-                        fi
-                    fi
-                else
-                    cluster="n/a"
-                fi
+# Истина, если юнит postgresql активен (обычный, .service, или @-инстанс).
+_sys_pg_is_active() {
+    command -v systemctl &>/dev/null || return 1
+    systemctl is-active --quiet postgresql 2>/dev/null \
+        || systemctl is-active --quiet postgresql.service 2>/dev/null \
+        || systemctl list-units --type=service --state=running 2>/dev/null | grep -qE 'postgresql(@|-)'
+}
+
+# Истина, если активным движком БД является mariadb или mysql (проверяется только
+# после того, как postgresql исключён — тот же порядок, что и в оригинале).
+_sys_mariadb_is_active() {
+    command -v systemctl &>/dev/null || return 1
+    systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null
+}
+
+# Печатает "primary" или "standby" через pg_is_in_recovery(); ничего (rc=1), если
+# доступ к psql недоступен либо запрос не вернул одно из этих двух значений.
+_sys_pg_role() {
+    local euid role
+    euid="${EUID:-$(id -u)}"
+    command -v psql &>/dev/null && [[ "$euid" -eq 0 || -n "${PGUSER:-}" || -n "${PGDATABASE:-}" ]] || return 1
+    role=$(_sys_psql "SELECT CASE WHEN pg_is_in_recovery() THEN 'standby' ELSE 'primary' END")
+    [[ "$role" == "primary" || "$role" == "standby" ]] || return 1
+    echo "$role"
+}
+
+# Сводка по репликации для узла primary.
+_sys_pg_primary_cluster_info() {
+    local n lag
+    n=$(_sys_psql "SELECT count(*) FROM pg_stat_replication")
+    if [[ ! "$n" =~ ^[0-9]+$ || "$n" -eq 0 ]]; then
+        echo "replication=none replicas=0"
+        return
+    fi
+    lag=$(_sys_psql "SELECT COALESCE((EXTRACT(EPOCH FROM MAX(COALESCE(replay_lag, write_lag, flush_lag))))::int, 0) FROM pg_stat_replication")
+    if [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]]; then
+        lag=$(_sys_psql "SELECT COALESCE(EXTRACT(EPOCH FROM (now()-min(reply_time)))::int,0) FROM pg_stat_replication")
+    fi
+    [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]] && lag="0"
+    echo "replication=ok lag=${lag}s replicas=$n"
+}
+
+# Сводка по lag для узла standby, относительно последней воспроизведённой транзакции primary.
+_sys_pg_standby_cluster_info() {
+    local lag
+    lag=$(_sys_psql "SELECT COALESCE(EXTRACT(EPOCH FROM (now()-pg_last_xact_replay_timestamp()))::int, 0)")
+    [[ -z "$lag" || ! "$lag" =~ ^[0-9]+$ ]] && lag="n/a"
+    if [[ "$lag" == "n/a" ]]; then
+        echo "replication=standby lag=n/a"
+    else
+        echo "replication=standby lag=${lag}s"
+    fi
+}
+
+_sys_database() {
+    local db="n/a" cluster="n/a" role=""
+
+    if _sys_pg_is_active; then
+        db="postgresql active"
+        role=$(_sys_pg_role)
+        if [[ -n "$role" ]]; then
+            db="postgresql active ($role)"
+            if [[ "$role" == "primary" ]]; then
+                cluster=$(_sys_pg_primary_cluster_info)
             else
-                cluster="n/a"
+                cluster=$(_sys_pg_standby_cluster_info)
             fi
-        elif systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null; then
-            db="mariadb/mysql active"
-            cluster="n/a"
         fi
+    elif _sys_mariadb_is_active; then
+        db="mariadb/mysql active"
     fi
 
     # Запасной вариант: пакет присутствует, но systemd не определён
@@ -1488,58 +1631,114 @@ check_system() {
     rm -rf -- "$tmpdir" 2>/dev/null
 }
 
-# Получить реальные зависимости пакета из PM
+# --- Список сырых зависимостей по PM -----------------------------------------
+# По одной самодостаточной функции на каждый пакетный менеджер: печатает сырую,
+# нефильтрованную строку зависимостей для установленного пакета, используя только
+# инструмент(ы) этого PM; печатает ничего, если пакет не установлен.
+# get_pkg_depends() ниже диспетчеризует по $PM, затем выполняет общую для обоих
+# PM-агностичную очистку (убрать версионные ограничения/альтернативы, дедуп).
+
+# Debian-семья: строка Depends: из dpkg -s, запасной вариант — apt-cache depends.
+get_pkg_depends_dpkg() {
+    local pkg="$1" deps=""
+
+    dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed' || return
+    deps=$(dpkg -s "$pkg" 2>/dev/null | grep "^Depends:" | sed 's/^Depends: //')
+    if [[ -z "$deps" ]]; then
+        deps=$(apt-cache depends "$pkg" 2>/dev/null | grep -E "^\s+Depends:" | sed 's/.*Depends: //' | tr '\n' ', ' | sed 's/, $//')
+    fi
+    echo "$deps"
+}
+
+# RHEL-семья: сырой список requires из rpm -qR, отфильтрованный до реальных имён пакетов.
+get_pkg_depends_rpm() {
+    local pkg="$1" deps=""
+
+    rpm -q "$pkg" &>/dev/null || return
+    deps=$(rpm -qR "$pkg" 2>/dev/null | grep -v "^rpmlib(" | grep -v "^/" | grep -v "^config" | grep -v "^config(" | grep -vi "^package" | grep -vi "^пакет" | sed 's/ .*$//' | sort -u | tr '\n' ', ' | sed 's/, $//')
+    echo "$deps"
+}
+
+# Получить реальные зависимости пакета из PM (только dpkg/rpm — у пакетов FLAT
+# для pacman/apk реальные зависимости здесь и раньше не декларировались, до этого разделения тоже)
 get_pkg_depends() {
     local pkg="$1"
     local deps=""
 
-    if [[ "$PM" == "dpkg" ]]; then
-        if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
-            return
-        fi
-        deps=$(dpkg -s "$pkg" 2>/dev/null | grep "^Depends:" | sed 's/^Depends: //')
-        if [[ -z "$deps" ]]; then
-            deps=$(apt-cache depends "$pkg" 2>/dev/null | grep -E "^\s+Depends:" | sed 's/.*Depends: //' | tr '\n' ', ' | sed 's/, $//')
-        fi
-    elif [[ "$PM" == "rpm" ]]; then
-        if ! rpm -q "$pkg" &>/dev/null; then
-            return
-        fi
-        deps=$(rpm -qR "$pkg" 2>/dev/null | grep -v "^rpmlib(" | grep -v "^/" | grep -v "^config" | grep -v "^config(" | grep -vi "^package" | grep -vi "^пакет" | sed 's/ .*$//' | sort -u | tr '\n' ', ' | sed 's/, $//')
-    fi
+    case "$PM" in
+        dpkg) deps=$(get_pkg_depends_dpkg "$pkg") ;;
+        rpm)  deps=$(get_pkg_depends_rpm "$pkg") ;;
+    esac
 
     # Очистка: убрать версионные ограничения, альтернативы, оставить только имена пакетов
     echo "$deps" | tr ',' '\n' | sed 's/|.*$//' | sed 's/([^)]*)//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | grep -v '^[0-9]' | grep -v '^(' | grep -v '^)' | grep -v '^<' | grep -v '^>' | grep -v '^=' | sort -u | tr '\n' ',' | sed 's/^,//;s/,$//'
 }
 
-# Проверить, установлена ли зависимость
-is_dep_installed() {
-    local dep="$1"
-    if [[ "$PM" == "dpkg" ]]; then
-        dpkg-query -W -f='${Status}\n' "$dep" 2>/dev/null | grep -q 'install ok installed'
-    elif [[ "$PM" == "rpm" ]]; then
-        rpm -q "$dep" &>/dev/null
-    elif [[ "$PM" == "pacman" ]]; then
-        pacman -Q "$dep" &>/dev/null
-    else
-        return 1
-    fi
+# --- Запрос версии по PM -------------------------------------------------------
+# По одной самодостаточной функции на каждый пакетный менеджер: печатает установленную
+# строку версии для имени (пакет или зависимость — поиск один и тот же
+# в обоих случаях), либо ничего, если не найдено/не применимо.
+# get_pkg_version()/get_dep_version() — это два имени для одной и той же диспетчеризации;
+# раньше это были две копии друг друга, по одной на каждого вызывающего.
+
+# Debian-семья: dpkg-query печатает поле Version напрямую.
+_pkg_version_dpkg() {
+    dpkg-query -W -f='${Version}' "$1" 2>/dev/null
 }
 
-# Получить версию зависимости
-get_dep_version() {
-    local dep="$1"
-    local ver=""
+# RHEL-семья: у rpm нет однопольного запроса версии, поэтому объединяем VERSION+RELEASE.
+_pkg_version_rpm() {
+    rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null
+}
 
-    if [[ "$PM" == "dpkg" ]]; then
-        ver=$(dpkg-query -W -f='${Version}' "$dep" 2>/dev/null)
-    elif [[ "$PM" == "rpm" ]]; then
-        ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$dep" 2>/dev/null)
-    elif [[ "$PM" == "pacman" ]]; then
-        ver=$(pacman -Q "$dep" 2>/dev/null | awk '{print $2}')
-    fi
+# Arch: pacman -Q печатает "имя версия" в одной строке; версия — второе поле.
+_pkg_version_pacman() {
+    pacman -Q "$1" 2>/dev/null | awk '{print $2}'
+}
+
+_pkg_version() {
+    local name="$1" ver=""
+
+    case "$PM" in
+        dpkg)   ver=$(_pkg_version_dpkg "$name") ;;
+        rpm)    ver=$(_pkg_version_rpm "$name") ;;
+        pacman) ver=$(_pkg_version_pacman "$name") ;;
+    esac
 
     echo "$ver"
+}
+
+# Получить версию пакета из PM
+get_pkg_version() { _pkg_version "$1"; }
+
+# Получить версию зависимости из PM (тот же поиск, что и у get_pkg_version)
+get_dep_version() { _pkg_version "$1"; }
+
+# --- Проверка наличия зависимости по PM --------------------------------------
+# Debian-семья: достаточно одного поля Status из dpkg-query.
+_dep_installed_dpkg() {
+    dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+# RHEL-семья: достаточно одного кода возврата rpm -q.
+_dep_installed_rpm() {
+    rpm -q "$1" &>/dev/null
+}
+
+# Arch: достаточно одного кода возврата pacman -Q.
+_dep_installed_pacman() {
+    pacman -Q "$1" &>/dev/null
+}
+
+# Проверить, установлена ли зависимость (только dpkg/rpm/pacman, как и раньше)
+is_dep_installed() {
+    local dep="$1"
+    case "$PM" in
+        dpkg)   _dep_installed_dpkg "$dep" ;;
+        rpm)    _dep_installed_rpm "$dep" ;;
+        pacman) _dep_installed_pacman "$dep" ;;
+        *)      return 1 ;;
+    esac
 }
 
 # Проверить статус службы для зависимости (возвращает строку-описание)
@@ -1601,92 +1800,129 @@ register_dep() {
     fi
 }
 
+# --- Пробы наличия пакета по PM -----------------------------------------------
+# По одной самодостаточной функции на каждый пакетный менеджер: основное имя, затем
+# каждое legacy-имя через запятую, используя только инструмент запроса этого PM — никаких
+# команд других PM внутри. Каждая устанавливает FOUND_PKG_VER/FOUND_PKG_STATUS,
+# печатает соответствующую строку ok/warn/fail и возвращает:
+#   0 = установлен  1 = установлен, но не полностью настроен (только dpkg)
+#   2 = вместо него найдено legacy-имя  3 = не найден совсем
+# check_pkg_installed() ниже вызывает их только через диспетчеризацию по $PM.
+
+# Debian-семья: dpkg-query даёт версию + полный статус установки за один вызов.
+check_pkg_installed_dpkg() {
+    local pkg="$1" legacy="$2" old found ver status
+
+    found=$(dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$pkg" 2>/dev/null)
+    if [[ -n "$found" ]]; then
+        ver=$(echo "$found" | awk '{print $2}')
+        status=$(echo "$found" | awk '{$1=""; $2=""; print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        FOUND_PKG_VER="$ver"
+        FOUND_PKG_STATUS="$status"
+        if [[ "$status" == "install ok installed" ]]; then
+            print_ok "pkg: $pkg installed"
+            return 0
+        else
+            print_warn "pkg: $pkg installed but status='$status'"
+            return 1
+        fi
+    fi
+
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        found=$(dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$old" 2>/dev/null)
+        [[ -n "$found" ]] || continue
+        ver=$(echo "$found" | awk '{print $2}')
+        status=$(echo "$found" | awk '{$1=""; $2=""; print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        FOUND_PKG_VER="$ver"
+        FOUND_PKG_STATUS="$status"
+        print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
+        return 2
+    done
+
+    print_fail "pkg: $pkg not installed"
+    return 3
+}
+
+# RHEL-семья: rpm -q только подтверждает наличие, версия — из второго запроса.
+check_pkg_installed_rpm() {
+    local pkg="$1" legacy="$2" old ver
+
+    if rpm -q "$pkg" &>/dev/null; then
+        ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null)
+        FOUND_PKG_VER="$ver"
+        print_ok "pkg: $pkg installed"
+        return 0
+    fi
+
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        rpm -q "$old" &>/dev/null || continue
+        ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$old" 2>/dev/null)
+        FOUND_PKG_VER="$ver"
+        print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
+        return 2
+    done
+
+    print_fail "pkg: $pkg not installed"
+    return 3
+}
+
+# Arch: pacman -Q печатает "имя версия" в одной строке для установленного пакета.
+check_pkg_installed_pacman() {
+    local pkg="$1" legacy="$2" old ver
+
+    if pacman -Q "$pkg" &>/dev/null; then
+        ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
+        FOUND_PKG_VER="$ver"
+        print_ok "pkg: $pkg installed"
+        return 0
+    fi
+
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        pacman -Q "$old" &>/dev/null || continue
+        ver=$(pacman -Q "$old" 2>/dev/null | awk '{print $2}')
+        FOUND_PKG_VER="$ver"
+        print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
+        return 2
+    done
+
+    print_fail "pkg: $pkg not installed"
+    return 3
+}
+
+# Alpine: apk info -e только подтверждает наличие, отдельный запрос версии здесь не используется.
+check_pkg_installed_apk() {
+    local pkg="$1" legacy="$2" old
+
+    if apk info -e "$pkg" &>/dev/null; then
+        print_ok "pkg: $pkg installed"
+        return 0
+    fi
+
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        apk info -e "$old" &>/dev/null || continue
+        print_warn "pkg: $pkg not found, but legacy '$old' exists"
+        return 2
+    done
+
+    print_fail "pkg: $pkg not installed"
+    return 3
+}
+
 # Проверить, установлен ли пакет через PM (подробно, печатает статус)
 check_pkg_installed() {
     local pkg="$1"
     local legacy="$2"
-    local found=""
-    local ver=""
-    local status=""
 
     FOUND_PKG_VER=""
     FOUND_PKG_STATUS=""
 
-    if [[ "$PM" == "dpkg" ]]; then
-        found=$(dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$pkg" 2>/dev/null)
-        if [[ -n "$found" ]]; then
-            ver=$(echo "$found" | awk '{print $2}')
-            status=$(echo "$found" | awk '{$1=""; $2=""; print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            FOUND_PKG_VER="$ver"
-            FOUND_PKG_STATUS="$status"
-            if [[ "$status" == "install ok installed" ]]; then
-                print_ok "pkg: $pkg installed"
-                return 0
-            else
-                print_warn "pkg: $pkg installed but status='$status'"
-                return 1
-            fi
-        fi
-    elif [[ "$PM" == "rpm" ]]; then
-        if rpm -q "$pkg" &>/dev/null; then
-            ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null)
-            FOUND_PKG_VER="$ver"
-            print_ok "pkg: $pkg installed"
-            return 0
-        fi
-    elif [[ "$PM" == "pacman" ]]; then
-        if pacman -Q "$pkg" &>/dev/null; then
-            ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
-            FOUND_PKG_VER="$ver"
-            print_ok "pkg: $pkg installed"
-            return 0
-        fi
-    elif [[ "$PM" == "apk" ]]; then
-        if apk info -e "$pkg" &>/dev/null; then
-            print_ok "pkg: $pkg installed"
-            return 0
-        fi
-    fi
-
-    # Проверить legacy-имена
-    if [[ -n "$legacy" ]]; then
-        local old
-        for old in $(echo "$legacy" | tr ',' ' '); do
-            if [[ "$PM" == "dpkg" ]]; then
-                found=$(dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' "$old" 2>/dev/null)
-                if [[ -n "$found" ]]; then
-                    ver=$(echo "$found" | awk '{print $2}')
-                    status=$(echo "$found" | awk '{$1=""; $2=""; print $0}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                    FOUND_PKG_VER="$ver"
-                    FOUND_PKG_STATUS="$status"
-                    print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
-                    return 2
-                fi
-            elif [[ "$PM" == "rpm" ]]; then
-                if rpm -q "$old" &>/dev/null; then
-                    ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$old" 2>/dev/null)
-                    FOUND_PKG_VER="$ver"
-                    print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
-                    return 2
-                fi
-            elif [[ "$PM" == "pacman" ]]; then
-                if pacman -Q "$old" &>/dev/null; then
-                    ver=$(pacman -Q "$old" 2>/dev/null | awk '{print $2}')
-                    FOUND_PKG_VER="$ver"
-                    print_warn "pkg: $pkg not found, but legacy '$old' exists ($ver)"
-                    return 2
-                fi
-            elif [[ "$PM" == "apk" ]]; then
-                if apk info -e "$old" &>/dev/null; then
-                    print_warn "pkg: $pkg not found, but legacy '$old' exists"
-                    return 2
-                fi
-            fi
-        done
-    fi
-
-    print_fail "pkg: $pkg not installed"
-    return 3
+    case "$PM" in
+        dpkg)   check_pkg_installed_dpkg "$pkg" "$legacy" ;;
+        rpm)    check_pkg_installed_rpm "$pkg" "$legacy" ;;
+        pacman) check_pkg_installed_pacman "$pkg" "$legacy" ;;
+        apk)    check_pkg_installed_apk "$pkg" "$legacy" ;;
+        *)      print_fail "pkg: $pkg not installed"; return 3 ;;
+    esac
 }
 
 has_any_trace() {
@@ -1695,34 +1931,69 @@ has_any_trace() {
     [[ -f "/usr/lib/systemd/system/${unit}" ]] || [[ -f "/etc/systemd/system/${unit}" ]] || [[ -f "/lib/systemd/system/${unit}" ]] || [[ -d "/opt/flat/${pkg}" ]]
 }
 
+# --- Тихие проверки наличия по PM --------------------------------------------
+# По одной самодостаточной функции на каждый пакетный менеджер для тихого (без вывода)
+# быстрого пути: основное имя, затем каждое legacy-имя через запятую, используя только
+# инструмент запроса этого PM. Возвращает 0, если найдено, иначе 1.
+# is_pkg_installed_tiny() ниже пробует подходящую через $PM, затем всегда
+# откатывается на has_any_trace() независимо от PM/результата.
+
+# Debian-семья: достаточно одного поля Status из dpkg-query, версия не нужна.
+is_pkg_installed_tiny_dpkg() {
+    local pkg="$1" legacy="$2" old
+
+    dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed' && return 0
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        dpkg-query -W -f='${Status}\n' "$old" 2>/dev/null | grep -q 'install ok installed' && return 0
+    done
+    return 1
+}
+
+# RHEL-семья: для проверки наличия достаточно одного кода возврата rpm -q.
+is_pkg_installed_tiny_rpm() {
+    local pkg="$1" legacy="$2" old
+
+    rpm -q "$pkg" &>/dev/null && return 0
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        rpm -q "$old" &>/dev/null && return 0
+    done
+    return 1
+}
+
+# Arch: для проверки наличия достаточно одного кода возврата pacman -Q.
+is_pkg_installed_tiny_pacman() {
+    local pkg="$1" legacy="$2" old
+
+    pacman -Q "$pkg" &>/dev/null && return 0
+    for old in $(echo "$legacy" | tr ',' ' '); do
+        pacman -Q "$old" &>/dev/null && return 0
+    done
+    return 1
+}
+
+# Alpine: достаточно одного кода возврата apk info -e; legacy-цикла здесь
+# не было и в исходном монолите — у пакетов FLAT для apk-семьи их просто нет.
+is_pkg_installed_tiny_apk() {
+    local pkg="$1"
+    apk info -e "$pkg" &>/dev/null && return 0
+    return 1
+}
+
+# Тихая быстрая проверка установки пакета (возвращает 0/1, без вывода)
+is_pkg_installed() {
+    is_pkg_installed_tiny "$@"
+}
+
 is_pkg_installed_tiny() {
     local pkg="$1"
     local legacy="$2"
 
-    if [[ "$PM" == "dpkg" ]]; then
-        dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed' && return 0
-        if [[ -n "$legacy" ]]; then
-            for old in $(echo "$legacy" | tr ',' ' '); do
-                dpkg-query -W -f='${Status}\n' "$old" 2>/dev/null | grep -q 'install ok installed' && return 0
-            done
-        fi
-    elif [[ "$PM" == "rpm" ]]; then
-        rpm -q "$pkg" &>/dev/null && return 0
-        if [[ -n "$legacy" ]]; then
-            for old in $(echo "$legacy" | tr ',' ' '); do
-                rpm -q "$old" &>/dev/null && return 0
-            done
-        fi
-    elif [[ "$PM" == "pacman" ]]; then
-        pacman -Q "$pkg" &>/dev/null && return 0
-        if [[ -n "$legacy" ]]; then
-            for old in $(echo "$legacy" | tr ',' ' '); do
-                pacman -Q "$old" &>/dev/null && return 0
-            done
-        fi
-    elif [[ "$PM" == "apk" ]]; then
-        apk info -e "$pkg" &>/dev/null && return 0
-    fi
+    case "$PM" in
+        dpkg)   is_pkg_installed_tiny_dpkg "$pkg" "$legacy" && return 0 ;;
+        rpm)    is_pkg_installed_tiny_rpm "$pkg" "$legacy" && return 0 ;;
+        pacman) is_pkg_installed_tiny_pacman "$pkg" "$legacy" && return 0 ;;
+        apk)    is_pkg_installed_tiny_apk "$pkg" && return 0 ;;
+    esac
 
     # Проверить следы (unit-файл или директория /opt/flat)
     has_any_trace "$pkg" && return 0
@@ -2138,7 +2409,7 @@ run_product_checks() {
     local installed_count=0
     local total_count=0
     local product_pkgs=()
-    local pkg legacy max_jobs tmpdir job_idx=0 w e
+    local pkg legacy max_jobs tmpdir job_idx=0 dw de di dn
 
     for pkg in "${!PKG_PRODUCT[@]}"; do
         if [[ "${PKG_PRODUCT[$pkg]:-}" == "$product" ]]; then
@@ -2184,27 +2455,36 @@ run_product_checks() {
         job_idx=$((job_idx + 1))
         (
             renice -n 5 $$ >/dev/null 2>&1 || true
+            # Снимаем снэпшот счётчиков до проверки — НЕ "local" (это простой
+            # subshell, а не тело функции); дельта записывается ниже в
+            # файл, отдельный от человекочитаемого вывода самого check_single_pkg,
+            # чтобы родительский процесс мог восстановить именно то, что было
+            # увеличено здесь, без необходимости заново вычислять это через grep по
+            # напечатанному тексту [WARN]/[FAIL] (хрупко: зависит от того, что текст сообщения никогда не изменится).
+            _pj_w0=$WARNINGS; _pj_e0=$ERRORS; _pj_i0=$INSTALLED; _pj_n0=$NOT_INSTALLED
             check_single_pkg "$pkg"
+            printf '%d %d %d %d\n' \
+                "$((WARNINGS - _pj_w0))" "$((ERRORS - _pj_e0))" \
+                "$((INSTALLED - _pj_i0))" "$((NOT_INSTALLED - _pj_n0))" \
+                > "$tmpdir/$job_idx.stat" 2>/dev/null
         ) > "$tmpdir/$job_idx" 2>&1 &
         COLLECTOR_JOB_PIDS+=($!)
     done
     _collector_wait_all_jobs
 
-    # Печатаем в порядке пакетов; восстанавливаем счётчики, потерянные в subshell'ах (Summary / Zabbix)
+    # Печатаем в порядке пакетов; восстанавливаем счётчики, потерянные в subshell'ах (Summary /
+    # Zabbix), из собственного дельта-файла каждой задачи, а не разбором напечатанного текста.
     job_idx=0
     for pkg in "${product_pkgs[@]}"; do
         job_idx=$((job_idx + 1))
         [[ -f "$tmpdir/$job_idx" ]] || continue
         cat "$tmpdir/$job_idx"
-        w=$(grep -c '\[WARN\]' "$tmpdir/$job_idx" 2>/dev/null || true)
-        e=$(grep -c '\[FAIL\]' "$tmpdir/$job_idx" 2>/dev/null || true)
-        [[ "$w" =~ ^[0-9]+$ ]] && WARNINGS=$((WARNINGS + w))
-        [[ "$e" =~ ^[0-9]+$ ]] && ERRORS=$((ERRORS + e))
-        if grep -qE '\[OK\].*pkg:.*installed' "$tmpdir/$job_idx" 2>/dev/null \
-            || grep -qE '\[WARN\].*pkg:.*legacy' "$tmpdir/$job_idx" 2>/dev/null; then
-            ((INSTALLED++))
-        elif grep -q '— not installed' "$tmpdir/$job_idx" 2>/dev/null; then
-            ((NOT_INSTALLED++))
+        if [[ -f "$tmpdir/$job_idx.stat" ]]; then
+            read -r dw de di dn < "$tmpdir/$job_idx.stat"
+            [[ "$dw" =~ ^-?[0-9]+$ ]] && WARNINGS=$((WARNINGS + dw))
+            [[ "$de" =~ ^-?[0-9]+$ ]] && ERRORS=$((ERRORS + de))
+            [[ "$di" =~ ^-?[0-9]+$ ]] && INSTALLED=$((INSTALLED + di))
+            [[ "$dn" =~ ^-?[0-9]+$ ]] && NOT_INSTALLED=$((NOT_INSTALLED + dn))
         fi
     done
     rm -rf -- "$tmpdir" 2>/dev/null
@@ -2221,6 +2501,30 @@ is_lib_available() {
 
 # --- 5. Инфраструктура + репозитории --------------------------------------------
 # Проверить все собранные зависимости (Infrastructure)
+# Найти первую службу-кандидата systemd, чей unit-*файл* существует, и
+# сообщить, активна ли она. Это ровно тот паттерн, который раньше был
+# скопипащен для mariadb/postgresql/redis ниже: пробуем кандидатов в заданном
+# порядке, останавливаемся на первом совпадении unit-файла (независимо от активности) —
+# никогда не сообщаем о кандидате, чей unit вообще не был установлен.
+# Возвращает 0, если найден подходящий unit-файл, иначе 1 (вызывающий код решает,
+# что значит "нет ни одного подходящего unit" для этой зависимости).
+_infra_report_first_unit() {
+    local label="$1"; shift
+    local svc active
+    for svc in "$@"; do
+        if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
+            active=$(systemctl is-active "${svc}.service" 2>/dev/null)
+            if [[ "$active" == "active" ]]; then
+                print_ok "$label: $svc active"
+            else
+                print_warn "$label: $svc $active"
+            fi
+            return 0
+        fi
+    done
+    return 1
+}
+
 check_infrastructure() {
     echo ""
     echo "=== Infrastructure ==="
@@ -2295,19 +2599,7 @@ check_infrastructure() {
                     ver=$(mysql --version 2>/dev/null | head -1 | cut -d' ' -f1-4)
                     print_ok "mariadb/mysql: $ver"
                     if command -v systemctl &>/dev/null; then
-                        local svc
-                        for svc in mariadb mysql; do
-                            if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
-                                local active
-                                active=$(systemctl is-active "${svc}.service" 2>/dev/null)
-                                if [[ "$active" == "active" ]]; then
-                                    print_ok "mariadb: $svc active"
-                                else
-                                    print_warn "mariadb: $svc $active"
-                                fi
-                                break
-                            fi
-                        done
+                        _infra_report_first_unit mariadb mariadb mysql
                     fi
                     if command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -q ':3306 '; then
                         print_ok "mariadb: port 3306 open"
@@ -2324,19 +2616,7 @@ check_infrastructure() {
                     ver=$(psql --version 2>/dev/null | head -1)
                     print_ok "postgresql: $ver"
                     if command -v systemctl &>/dev/null; then
-                        local svc
-                        for svc in postgresql postgresql-12 postgresql-13 postgresql-14 postgresql-15 postgresql-16; do
-                            if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
-                                local active
-                                active=$(systemctl is-active "${svc}.service" 2>/dev/null)
-                                if [[ "$active" == "active" ]]; then
-                                    print_ok "postgresql: $svc active"
-                                else
-                                    print_warn "postgresql: $svc $active"
-                                fi
-                                break
-                            fi
-                        done
+                        _infra_report_first_unit postgresql postgresql postgresql-12 postgresql-13 postgresql-14 postgresql-15 postgresql-16
                     fi
                     if command -v ss &>/dev/null && ss -tlnp 2>/dev/null | grep -q ':5432 '; then
                         print_ok "postgresql: port 5432 open"
@@ -2353,18 +2633,7 @@ check_infrastructure() {
                 if [[ $dep_found -eq 1 ]]; then
                     print_ok "redis: $dep_ver installed"
                     if command -v systemctl &>/dev/null; then
-                        local active
-                        for svc in redis-server redis; do
-                            if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
-                                active=$(systemctl is-active "${svc}.service" 2>/dev/null)
-                                if [[ "$active" == "active" ]]; then
-                                    print_ok "redis: $svc active"
-                                else
-                                    print_warn "redis: $svc $active"
-                                fi
-                                break
-                            fi
-                        done
+                        _infra_report_first_unit redis redis-server redis
                     fi
                 else
                     print_fail "redis: not installed (required by: $req_by)"
@@ -2426,63 +2695,77 @@ check_infrastructure() {
 
 # Проверить репозитории
 
+# --- Список репозиториев по PM ------------------------------------------------
+# По одной самодостаточной функции на каждый пакетный менеджер — каждая читает только
+# свои конфиг-файлы/инструменты репозиториев этого PM. check_repositories() ниже просто
+# печатает заголовок секции и диспетчеризует по $PM.
+
+# Debian-семья: записи sources.list(.d), затем приоритеты apt-cache policy.
+check_repositories_dpkg() {
+    local f line policy
+
+    if [[ -f /etc/apt/sources.list ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* ]] && continue
+            print_info "[apt] $line"
+        done < /etc/apt/sources.list
+    fi
+
+    for f in /etc/apt/sources.list.d/*.list; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* ]] && continue
+            print_info "[apt] $line"
+        done < "$f"
+    done
+
+    if command -v apt-cache &>/dev/null; then
+        policy=$(apt-cache policy 2>/dev/null | grep -E '^\s+[0-9]+' | head -20)
+        if [[ -n "$policy" ]]; then
+            echo ""
+            print_info "APT priorities:"
+            echo "$policy" | while IFS= read -r line; do
+                print_info "  $line"
+            done
+        fi
+    fi
+}
+
+# RHEL-семья: вывод `yum repolist`, затем сырые файлы *.repo внутри yum.repos.d.
+check_repositories_rpm() {
+    local f line repolist
+
+    if command -v yum &>/dev/null; then
+        repolist=$(yum repolist 2>/dev/null | tail -n +2 | grep -v "^repolist" | head -30)
+        if [[ -n "$repolist" ]]; then
+            echo "$repolist" | while IFS= read -r line; do
+                print_info "[yum] $line"
+            done
+        fi
+    fi
+
+    for f in /etc/yum.repos.d/*.repo; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* ]] && continue
+            print_info "[yum] $line"
+        done < "$f"
+    done
+}
+
+# Печатает настроенные репозитории пакетов для определённого PM (только dpkg/rpm —
+# для pacman/apk список репозиториев никогда не был реализован, как и до этого разделения).
 check_repositories() {
     echo ""
     echo "=== Repositories ==="
 
-    if [[ "$PM" == "dpkg" ]]; then
-        # Источники APT
-        if [[ -f /etc/apt/sources.list ]]; then
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                [[ "$line" == \#* ]] && continue
-                print_info "[apt] $line"
-            done < /etc/apt/sources.list
-        fi
-
-        for f in /etc/apt/sources.list.d/*.list; do
-            [[ -f "$f" ]] || continue
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                [[ "$line" == \#* ]] && continue
-                print_info "[apt] $line"
-            done < "$f"
-        done
-
-        # Приоритеты APT через apt-cache policy (если доступно)
-        if command -v apt-cache &>/dev/null; then
-            local policy
-            policy=$(apt-cache policy 2>/dev/null | grep -E '^\s+[0-9]+' | head -20)
-            if [[ -n "$policy" ]]; then
-                echo ""
-                print_info "APT priorities:"
-                echo "$policy" | while IFS= read -r line; do
-                    print_info "  $line"
-                done
-            fi
-        fi
-
-    elif [[ "$PM" == "rpm" ]]; then
-        # Репозитории YUM/DNF
-        if command -v yum &>/dev/null; then
-            local repolist
-            repolist=$(yum repolist 2>/dev/null | tail -n +2 | grep -v "^repolist" | head -30)
-            if [[ -n "$repolist" ]]; then
-                echo "$repolist" | while IFS= read -r line; do
-                    print_info "[yum] $line"
-                done
-            fi
-        fi
-
-        for f in /etc/yum.repos.d/*.repo; do
-            [[ -f "$f" ]] || continue
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                [[ "$line" == \#* ]] && continue
-                print_info "[yum] $line"
-            done < "$f"
-        done
-    fi
+    case "$PM" in
+        dpkg) check_repositories_dpkg ;;
+        rpm)  check_repositories_rpm ;;
+    esac
 }
 
 # Итоги
@@ -5430,19 +5713,12 @@ collect_configs() {
 }
 
 # --- 10. Online / offline сбор --------------------------------------------------
-run_log_collection() {
+# Разрешить OUTPUT_DIR в COLLECTOR_DIR/WORK_DIR/ARCHIVE_NAME. Они осознанно
+# остаются простыми глобальными переменными — start_disk_watch/cleanup/обработчики
+# сигналов читают $WORK_DIR напрямую, как и до этого разделения. Сначала удаляет
+# устаревшие рабочие директории (никогда не трогает ту, которую мы собираемся создать).
+_prepare_collection_workdir() {
     local mode="$1"
-    local timeout_raw="${2:-}"
-    local timeout_sec=0
-
-    if [[ -n "$timeout_raw" ]]; then
-        if ! parse_duration "$timeout_raw"; then
-            die "Invalid timeout: '$timeout_raw'. Use: 5h, 30m, 1d, 300s or 300"
-        fi
-        if [[ "$mode" == "online" ]]; then
-            timeout_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
-        fi
-    fi
 
     COLLECTOR_DIR="${OUTPUT_DIR:-$SCRIPT_DIR}"
     if [[ ! -d "$COLLECTOR_DIR" ]]; then
@@ -5461,7 +5737,12 @@ run_log_collection() {
 
     info "$(_l mode_log): $mode / scope=$LOG_SCOPE (flat_check_2 v${SCRIPT_VERSION})"
     info "$(_l workdir): $WORK_DIR"
-    log_debug "Аргументы run_log_collection: mode=$mode timeout_raw='$timeout_raw' LOG_SCOPE=$LOG_SCOPE FROM_TIME='$FROM_TIME' TO_TIME='$TO_TIME' OUTPUT_DIR='$OUTPUT_DIR' INCLUDE_MGCPCLIENT='$INCLUDE_MGCPCLIENT' SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]+"${SELECTED_PRODUCTS[*]}"}) SELECTED_SERVICES=(${SELECTED_SERVICES[*]+"${SELECTED_SERVICES[*]}"})"
+}
+
+# Разрешить SELECTED_PKGS и глобальный массив ALL_LOG_DIRS. Возвращает 1 (предварительно
+# удалив только что созданный WORK_DIR), если собирать нечего.
+_resolve_collection_targets() {
+    local mode="$1" logdir
 
     detect_os
     command -v tail &>/dev/null || die "$(_l err_cmd_notfound): tail"
@@ -5499,171 +5780,181 @@ run_log_collection() {
     for logdir in "${ALL_LOG_DIRS[@]}"; do
         info "  → $logdir"
     done
+}
 
-    local collect_infra=0
-    [[ "$LOG_SCOPE" == "extended" ]] && collect_infra=1
+# Online: запустить tail -F на каждой директории из глобального ALL_LOG_DIRS (+ инфра-
+# логи при collect_infra=1), опционально tcpdump, затем блокироваться до
+# остановки/timeout. Возвращает 1 (предварительно удалив WORK_DIR), если tail
+# так ни на чём и не запустился.
+_run_online_collection() {
+    local timeout_raw="$1" timeout_sec="$2" collect_infra="$3"
+    local logdir dest_name sysfile
 
-    if [[ "$mode" == "online" ]]; then
-        # Неинтерактивный online без -t завершился бы сразу после запуска tail'ов
-        if [[ ! -t 0 && "$timeout_sec" -le 0 ]]; then
-            safe_rm_work_dir "$WORK_DIR"
-            die "$(_l err_online_need_t)"
-        fi
-
-        # Диск-guard перед запуском tail'ов (проверка сразу внутри start_disk_watch)
-        start_disk_watch "$WORK_DIR"
-        start_resource_monitor
-        _get_cpu_usage_percent >/dev/null   # первый вызов лишь инициализирует дельту /proc/stat
-        log_debug "resources at start: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
-
-        local logdir dest_name
-        for logdir in "${ALL_LOG_DIRS[@]}"; do
-            dest_name=$(_archive_subdir_name "$logdir")
-            start_tail_for_dir "$logdir" "$WORK_DIR/$dest_name" "" "$dest_name"
-        done
-        if [[ "$collect_infra" -eq 1 ]]; then
-            for sysfile in /var/log/messages /var/log/syslog; do
-                [[ -f "$sysfile" ]] && start_tail_for_file "$sysfile" "$WORK_DIR/system" "system"
-            done
-
-            # Логи Nginx для FLAT — собираем, если nginx присутствует (online только обычные логи)
-            if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
-                local ngx_dir="/var/log/nginx"
-                if [[ -d "$ngx_dir" ]]; then
-                    while IFS= read -r -d '' ngx_file; do
-                        start_tail_for_file "$ngx_file" "$WORK_DIR/nginx" "nginx"
-                    done < <(find -L "$ngx_dir" -maxdepth 1 -type f \( -name '*flat*.log' -o -name '*access*.log' -o -name '*error*.log' \) ! -name '*.gz' -print0 2>/dev/null)
-                fi
-            fi
-
-            collect_postgresql_logs "$WORK_DIR" "online"
-        fi
-
-        if [[ ${#TAIL_PIDS[@]} -eq 0 ]]; then
-            warn "$(_l err_no_logfiles)"
-            safe_rm_work_dir "$WORK_DIR"
-            return 1
-        fi
-        ok "$(_l tail_running): ${#TAIL_PIDS[@]}"
-
-        if [[ "$collect_infra" -eq 1 && "$START_TCPDUMP" -eq 1 ]]; then
-            if command -v tcpdump &>/dev/null; then
-                nohup tcpdump -i any -s 0 -w "$WORK_DIR/tcpdump_$(hostname).pcap" >/dev/null 2>&1 &
-                TCPDUMP_PID=$!; sleep 1
-                if kill -0 "$TCPDUMP_PID" 2>/dev/null; then ok "$(_l tcpdump_started) $TCPDUMP_PID)"
-                else warn "$(_l tcpdump_fail)"; TCPDUMP_PID=""; fi
-            else warn "$(_l tcpdump_notfound)"; fi
-        fi
-
-        echo ""
-        info "$(_l log_running)"
-        info "$(_l log_running_online_note)"
-        [[ "$timeout_sec" -gt 0 ]] && info "$(_l log_autostop) ${timeout_raw} (${timeout_sec}s)"
-        if [[ "$timeout_sec" -gt 0 ]]; then
-            ( sleep "$timeout_sec"; kill -TERM $$ 2>/dev/null ) &
-            TIMEOUT_KILL_PID=$!
-        fi
-        _online_wait_for_stop
-        [[ -n "${TIMEOUT_KILL_PID:-}" ]] && kill "$TIMEOUT_KILL_PID" 2>/dev/null && wait "$TIMEOUT_KILL_PID" 2>/dev/null
-        TIMEOUT_KILL_PID=""
-        echo ""
-        if [[ "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]; then
-            info "$(_l log_autostop) ${timeout_raw} (${timeout_sec}s)"
-            COLLECTOR_TIMEOUT_STOP=0
-        fi
-        log_debug "resources at stop: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
-        info "$(_l log_stopping)"
-        cleanup
-    else
-        # Offline: диск-guard (аккуратная остановка + архивация, как и в online)
-        start_disk_watch "$WORK_DIR"
-        start_resource_monitor
-        _get_cpu_usage_percent >/dev/null   # первый вызов лишь инициализирует дельту /proc/stat
-        log_debug "resources at start: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
-
-        # Разбор from/to для offline-сбора по диапазону
-        local from_time="" to_time=""
-        if [[ -n "$FROM_TIME" ]]; then
-            from_time=$(parse_time_point "$FROM_TIME") || die "Invalid --from: '$FROM_TIME'"
-        fi
-        if [[ -n "$TO_TIME" ]]; then
-            # Смешанный режим: +3h вместе с --from = from_time + 3 часа
-            if [[ "$TO_TIME" =~ ^[+] && -n "$from_time" ]]; then
-                local offset="${TO_TIME:1}"
-                if ! parse_duration "$offset"; then
-                    die "Invalid --to offset: '$TO_TIME'"
-                fi
-                local from_epoch add_sec
-                from_epoch=$(date -d "$from_time" "+%s" 2>/dev/null)
-                [[ -z "$from_epoch" ]] && die "Invalid --from for offset: '$FROM_TIME'"
-                add_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
-                to_time=$(date -d "@$(( from_epoch + add_sec ))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-                [[ -z "$to_time" ]] && die "Invalid --to offset: '$TO_TIME'"
-            else
-                to_time=$(parse_time_point "$TO_TIME") || die "Invalid --to: '$TO_TIME'"
-            fi
-        fi
-        # Legacy: -t в offline-режиме = --from -${value}
-        if [[ -z "$from_time" && -n "$timeout_raw" ]]; then
-            from_time=$(parse_time_point "-${timeout_raw}") || true
-        fi
-
-        if [[ -n "$from_time" && -n "$to_time" ]]; then
-            info "Extracting log lines from $from_time to $to_time (by content timestamp)"
-        elif [[ -n "$from_time" ]]; then
-            info "Extracting log lines from $from_time to now (by content timestamp)"
-        else
-            info "$(_l log_all)"
-        fi
-        info "Parallel copy workers: $(_collector_max_jobs) (host-wide CPU/MEM gate ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}%)"
-        local range_from_epoch="" range_to_epoch=""
-        [[ -n "$from_time" ]] && range_from_epoch=$(time_to_epoch "$from_time")
-        [[ -n "$to_time" ]] && range_to_epoch=$(time_to_epoch "$to_time")
-        _log_extract_all_dirs_by_range "$WORK_DIR" "$range_from_epoch" "$range_to_epoch"
-        if [[ "$collect_infra" -eq 1 ]]; then
-            for sysfile in /var/log/messages /var/log/syslog; do
-                _collector_should_stop && break
-                copy_system_log_by_range "$sysfile" "$WORK_DIR/system" "$from_time" "$to_time" "system"
-            done
-
-            # Логи Nginx для FLAT — собираем, если nginx присутствует
-            if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
-                local ngx_dir="/var/log/nginx"
-                if [[ -d "$ngx_dir" ]]; then
-                    local ngx_dest="$WORK_DIR/nginx"
-                    while IFS= read -r -d '' ngx_file; do
-                        _collector_should_stop && break
-                        if [[ -n "$from_time" || -n "$to_time" ]]; then
-                            copy_system_log_by_range "$ngx_file" "$ngx_dest" "$from_time" "$to_time" "nginx"
-                        else
-                            mkdir -p "$ngx_dest"
-                            cp -p "$ngx_file" "$ngx_dest/$(basename "$ngx_file")" 2>/dev/null && ok "nginx: $(_l sys_copied) $(basename "$ngx_file")"
-                        fi
-                    done < <(find -L "$ngx_dir" -maxdepth 1 -type f \( -name '*flat*.log' -o -name '*access*.log' -o -name '*error*.log' \) -print0 2>/dev/null)
-                    rmdir "$ngx_dest" 2>/dev/null
-                fi
-            fi
-
-            if ! _collector_should_stop; then
-                collect_postgresql_logs "$WORK_DIR" "offline" "$from_time" "$to_time"
-            fi
-        fi
-
-        if [[ "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]; then
-            info "$(_l log_autostop) disk/timeout"
-            COLLECTOR_TIMEOUT_STOP=0
-        fi
-        log_debug "resources at stop: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
-        [[ -n "${RESOURCE_WATCH_PID:-}" ]] && kill "$RESOURCE_WATCH_PID" 2>/dev/null
-        RESOURCE_WATCH_PID=""
-        ok "$(_l log_copydone)"
+    # Неинтерактивный online без -t завершился бы сразу после запуска tail'ов
+    if [[ ! -t 0 && "$timeout_sec" -le 0 ]]; then
+        safe_rm_work_dir "$WORK_DIR"
+        die "$(_l err_online_need_t)"
     fi
 
+    # Диск-guard перед запуском tail'ов (проверка сразу внутри start_disk_watch)
+    start_disk_watch "$WORK_DIR"
+    start_resource_monitor
+    _get_cpu_usage_percent >/dev/null   # первый вызов лишь инициализирует дельту /proc/stat
+    log_debug "resources at start: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
+
+    for logdir in "${ALL_LOG_DIRS[@]}"; do
+        dest_name=$(_archive_subdir_name "$logdir")
+        start_tail_for_dir "$logdir" "$WORK_DIR/$dest_name" "" "$dest_name"
+    done
     if [[ "$collect_infra" -eq 1 ]]; then
-        collect_configs "$WORK_DIR"
+        for sysfile in /var/log/messages /var/log/syslog; do
+            [[ -f "$sysfile" ]] && start_tail_for_file "$sysfile" "$WORK_DIR/system" "system"
+        done
+
+        # Логи Nginx для FLAT — собираем, если nginx присутствует (online только обычные логи)
+        if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
+            local ngx_dir="/var/log/nginx"
+            if [[ -d "$ngx_dir" ]]; then
+                while IFS= read -r -d '' ngx_file; do
+                    start_tail_for_file "$ngx_file" "$WORK_DIR/nginx" "nginx"
+                done < <(find -L "$ngx_dir" -maxdepth 1 -type f \( -name '*flat*.log' -o -name '*access*.log' -o -name '*error*.log' \) ! -name '*.gz' -print0 2>/dev/null)
+            fi
+        fi
+
+        collect_postgresql_logs "$WORK_DIR" "online"
     fi
-    prune_empty_collected_files "$WORK_DIR"
-    report_collected_log_stats "$WORK_DIR" "$mode"
+
+    if [[ ${#TAIL_PIDS[@]} -eq 0 ]]; then
+        warn "$(_l err_no_logfiles)"
+        safe_rm_work_dir "$WORK_DIR"
+        return 1
+    fi
+    ok "$(_l tail_running): ${#TAIL_PIDS[@]}"
+
+    if [[ "$collect_infra" -eq 1 && "$START_TCPDUMP" -eq 1 ]]; then
+        if command -v tcpdump &>/dev/null; then
+            nohup tcpdump -i any -s 0 -w "$WORK_DIR/tcpdump_$(hostname).pcap" >/dev/null 2>&1 &
+            TCPDUMP_PID=$!; sleep 1
+            if kill -0 "$TCPDUMP_PID" 2>/dev/null; then ok "$(_l tcpdump_started) $TCPDUMP_PID)"
+            else warn "$(_l tcpdump_fail)"; TCPDUMP_PID=""; fi
+        else warn "$(_l tcpdump_notfound)"; fi
+    fi
+
+    echo ""
+    info "$(_l log_running)"
+    info "$(_l log_running_online_note)"
+    [[ "$timeout_sec" -gt 0 ]] && info "$(_l log_autostop) ${timeout_raw} (${timeout_sec}s)"
+    if [[ "$timeout_sec" -gt 0 ]]; then
+        ( sleep "$timeout_sec"; kill -TERM $$ 2>/dev/null ) &
+        TIMEOUT_KILL_PID=$!
+    fi
+    _online_wait_for_stop
+    [[ -n "${TIMEOUT_KILL_PID:-}" ]] && kill "$TIMEOUT_KILL_PID" 2>/dev/null && wait "$TIMEOUT_KILL_PID" 2>/dev/null
+    TIMEOUT_KILL_PID=""
+    echo ""
+    if [[ "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]; then
+        info "$(_l log_autostop) ${timeout_raw} (${timeout_sec}s)"
+        COLLECTOR_TIMEOUT_STOP=0
+    fi
+    log_debug "resources at stop: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
+    info "$(_l log_stopping)"
+    cleanup
+}
+
+# Offline: по каждой директории из глобального ALL_LOG_DIRS через parce_service_log(s)
+# извлечь в опциональном диапазоне времени from/to (+ инфра-логи при collect_infra=1).
+_run_offline_collection() {
+    local timeout_raw="$1" collect_infra="$2"
+    local from_time="" to_time="" sysfile
+
+    # Offline: диск-guard (аккуратная остановка + архивация, как и в online)
+    start_disk_watch "$WORK_DIR"
+    start_resource_monitor
+    _get_cpu_usage_percent >/dev/null   # первый вызов лишь инициализирует дельту /proc/stat
+    log_debug "resources at start: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
+
+    # Разбор from/to для offline-сбора по диапазону
+    if [[ -n "$FROM_TIME" ]]; then
+        from_time=$(parse_time_point "$FROM_TIME") || die "Invalid --from: '$FROM_TIME'"
+    fi
+    if [[ -n "$TO_TIME" ]]; then
+        # Смешанный режим: +3h вместе с --from = from_time + 3 часа
+        if [[ "$TO_TIME" =~ ^[+] && -n "$from_time" ]]; then
+            local offset="${TO_TIME:1}"
+            if ! parse_duration "$offset"; then
+                die "Invalid --to offset: '$TO_TIME'"
+            fi
+            local from_epoch add_sec
+            from_epoch=$(date -d "$from_time" "+%s" 2>/dev/null)
+            [[ -z "$from_epoch" ]] && die "Invalid --from for offset: '$FROM_TIME'"
+            add_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
+            to_time=$(date -d "@$(( from_epoch + add_sec ))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            [[ -z "$to_time" ]] && die "Invalid --to offset: '$TO_TIME'"
+        else
+            to_time=$(parse_time_point "$TO_TIME") || die "Invalid --to: '$TO_TIME'"
+        fi
+    fi
+    # Legacy: -t в offline-режиме = --from -${value}
+    if [[ -z "$from_time" && -n "$timeout_raw" ]]; then
+        from_time=$(parse_time_point "-${timeout_raw}") || true
+    fi
+
+    if [[ -n "$from_time" && -n "$to_time" ]]; then
+        info "Extracting log lines from $from_time to $to_time (by content timestamp)"
+    elif [[ -n "$from_time" ]]; then
+        info "Extracting log lines from $from_time to now (by content timestamp)"
+    else
+        info "$(_l log_all)"
+    fi
+    info "Parallel copy workers: $(_collector_max_jobs) (host-wide CPU/MEM gate ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}%)"
+    local range_from_epoch="" range_to_epoch=""
+    [[ -n "$from_time" ]] && range_from_epoch=$(time_to_epoch "$from_time")
+    [[ -n "$to_time" ]] && range_to_epoch=$(time_to_epoch "$to_time")
+    _log_extract_all_dirs_by_range "$WORK_DIR" "$range_from_epoch" "$range_to_epoch"
+    if [[ "$collect_infra" -eq 1 ]]; then
+        for sysfile in /var/log/messages /var/log/syslog; do
+            _collector_should_stop && break
+            copy_system_log_by_range "$sysfile" "$WORK_DIR/system" "$from_time" "$to_time" "system"
+        done
+
+        # Логи Nginx для FLAT — собираем, если nginx присутствует
+        if command -v nginx &>/dev/null || [[ -d "/etc/nginx" ]] || [[ -d "/var/log/nginx" ]]; then
+            local ngx_dir="/var/log/nginx"
+            if [[ -d "$ngx_dir" ]]; then
+                local ngx_dest="$WORK_DIR/nginx"
+                while IFS= read -r -d '' ngx_file; do
+                    _collector_should_stop && break
+                    if [[ -n "$from_time" || -n "$to_time" ]]; then
+                        copy_system_log_by_range "$ngx_file" "$ngx_dest" "$from_time" "$to_time" "nginx"
+                    else
+                        mkdir -p "$ngx_dest"
+                        cp -p "$ngx_file" "$ngx_dest/$(basename "$ngx_file")" 2>/dev/null && ok "nginx: $(_l sys_copied) $(basename "$ngx_file")"
+                    fi
+                done < <(find -L "$ngx_dir" -maxdepth 1 -type f \( -name '*flat*.log' -o -name '*access*.log' -o -name '*error*.log' \) -print0 2>/dev/null)
+                rmdir "$ngx_dest" 2>/dev/null
+            fi
+        fi
+
+        if ! _collector_should_stop; then
+            collect_postgresql_logs "$WORK_DIR" "offline" "$from_time" "$to_time"
+        fi
+    fi
+
+    if [[ "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]; then
+        info "$(_l log_autostop) disk/timeout"
+        COLLECTOR_TIMEOUT_STOP=0
+    fi
+    log_debug "resources at stop: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
+    [[ -n "${RESOURCE_WATCH_PID:-}" ]] && kill "$RESOURCE_WATCH_PID" 2>/dev/null
+    RESOURCE_WATCH_PID=""
+    ok "$(_l log_copydone)"
+}
+
+# Сжать глобальный WORK_DIR в ARCHIVE_NAME.tar.gz внутри
+# COLLECTOR_DIR, используя pigz с учитывающим хост числом потоков/паузой,
+# когда доступно.
+_archive_collection_workdir() {
+    local cores _pigz_wait=0
 
     cd "$COLLECTOR_DIR" || die "Cannot enter $COLLECTOR_DIR"
     if command -v pigz &>/dev/null; then
@@ -5672,7 +5963,6 @@ run_log_collection() {
         cores=$(( cores * (${RESOURCE_CPU_LIMIT:-80} - 20) / 100 ))
         [[ "$cores" -lt 1 ]] && cores=1
         _get_cpu_usage_percent >/dev/null
-        local _pigz_wait=0
         # Только ограниченное ожидание — никогда не блокировать архивацию навечно на загруженном хосте
         while ! _collector_resources_ok && [[ "$_pigz_wait" -lt 30 ]]; do
             sleep 1
@@ -5690,18 +5980,93 @@ run_log_collection() {
     LOG_FILE=""
     echo ""
     ok "$(_l archive_at): $COLLECTOR_DIR/$ARCHIVE_NAME.tar.gz"
+}
+
+run_log_collection() {
+    local mode="$1"
+    local timeout_raw="${2:-}"
+    local timeout_sec=0
+
+    if [[ -n "$timeout_raw" ]]; then
+        if ! parse_duration "$timeout_raw"; then
+            die "Invalid timeout: '$timeout_raw'. Use: 5h, 30m, 1d, 300s or 300"
+        fi
+        if [[ "$mode" == "online" ]]; then
+            timeout_sec=$(duration_to_seconds "$PARSE_RESULT_NUM" "$PARSE_RESULT_UNIT")
+        fi
+    fi
+
+    _prepare_collection_workdir "$mode"
+    log_debug "Аргументы run_log_collection: mode=$mode timeout_raw='$timeout_raw' LOG_SCOPE=$LOG_SCOPE FROM_TIME='$FROM_TIME' TO_TIME='$TO_TIME' OUTPUT_DIR='$OUTPUT_DIR' INCLUDE_MGCPCLIENT='$INCLUDE_MGCPCLIENT' SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]+"${SELECTED_PRODUCTS[*]}"}) SELECTED_SERVICES=(${SELECTED_SERVICES[*]+"${SELECTED_SERVICES[*]}"})"
+    _resolve_collection_targets "$mode" || return 1
+
+    local collect_infra=0
+    [[ "$LOG_SCOPE" == "extended" ]] && collect_infra=1
+
+    if [[ "$mode" == "online" ]]; then
+        _run_online_collection "$timeout_raw" "$timeout_sec" "$collect_infra" || return 1
+    else
+        _run_offline_collection "$timeout_raw" "$collect_infra"
+    fi
+
+    if [[ "$collect_infra" -eq 1 ]]; then
+        collect_configs "$WORK_DIR"
+    fi
+    prune_empty_collected_files "$WORK_DIR"
+    report_collected_log_stats "$WORK_DIR" "$mode"
+
+    _archive_collection_workdir
     info "$(_l done_msg)"
     return 0
 }
 
+
 # --- 11. Мастер / справка / argv / main ------------------------------------------
 
 # Интерактивный выбор продукта/службы; устанавливает SELECTED_PRODUCTS / SELECTED_SERVICES
+# Печатает нумерованный список заранее, затем читает+разбирает выбор пользователя в
+# отбор из этого же списка: "a"/"A"/"а"/"А" (или пустой ввод) выбирает
+# всё; индексы через запятую выбирают конкретные элементы (невалидные токены
+# выдают warn и пропускаются); если ничего валидного не выбрано, откатывается на
+# "всё" — так же, как явное "all". Это шаг чтения+разбора,
+# который раньше был скопипащен для списка продуктов и списка служб
+# ниже; сама *печать* нумерованного списка отличается между ними (разная
+# аннотация на элемент) и остаётся в каждом вызывающем коде.
+# Аргументы: label (для предупреждения "Invalid <label> choice"), имя
+# исходного массива, имя массива назначения.
+_wizard_pick_from_list() {
+    local label="$1"
+    local -n _wpfl_src=$2
+    local -n _wpfl_dst=$3
+    local choice="" part
+    local -a _parts=()
+
+    read -r choice 2>/dev/null || true
+    choice="${choice:-a}"
+
+    _wpfl_dst=()
+    if [[ "$choice" == "a" || "$choice" == "A" || "$choice" == "а" || "$choice" == "А" ]]; then
+        _wpfl_dst=("${_wpfl_src[@]}")
+    else
+        IFS=',' read -ra _parts <<< "$choice"
+        for part in "${_parts[@]}"; do
+            part="${part// /}"
+            [[ -z "$part" ]] && continue
+            if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#_wpfl_src[@]} ]]; then
+                _wpfl_dst+=("${_wpfl_src[$((part - 1))]}")
+            else
+                warn "Invalid $label choice: $part"
+            fi
+        done
+        [[ ${#_wpfl_dst[@]} -eq 0 ]] && _wpfl_dst=("${_wpfl_src[@]}")
+    fi
+    log_debug "wizard: $label choice='$choice' -> selected: ${_wpfl_dst[*]+"${_wpfl_dst[*]}"}"
+}
+
 _wizard_select_log_targets() {
     local -a prods=()
     local -A prod_pkgs=()
-    local pkg prod i choice="" refine=""
-    local -a idx_map=()
+    local pkg prod i refine=""
     local -a svc_list=()
 
     SELECTED_PRODUCTS=()
@@ -5729,31 +6094,11 @@ _wizard_select_log_targets() {
     i=1
     for prod in "${prods[@]}"; do
         echo "  $i — $prod (${prod_pkgs[$prod]})"
-        idx_map+=("$prod")
         i=$((i + 1))
     done
     echo "$(_l wiz_products_all)"
     echo -n "$(_l wiz_products_prompt)"
-    read -r choice 2>/dev/null || true
-    choice="${choice:-a}"
-
-    if [[ "$choice" == "a" || "$choice" == "A" || "$choice" == "а" || "$choice" == "А" ]]; then
-        SELECTED_PRODUCTS=("${prods[@]}")
-    else
-        local part
-        IFS=',' read -ra _parts <<< "$choice"
-        for part in "${_parts[@]}"; do
-            part="${part// /}"
-            [[ -z "$part" ]] && continue
-            if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#idx_map[@]} ]]; then
-                SELECTED_PRODUCTS+=("${idx_map[$((part - 1))]}")
-            else
-                warn "Invalid product choice: $part"
-            fi
-        done
-        [[ ${#SELECTED_PRODUCTS[@]} -eq 0 ]] && SELECTED_PRODUCTS=("${prods[@]}")
-    fi
-    log_debug "wizard: products choice='$choice' -> SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]})"
+    _wizard_pick_from_list product prods SELECTED_PRODUCTS
 
     # Опциональное уточнение по службам: предлагаем всегда, если выбран хоть один продукт
     echo ""
@@ -5768,33 +6113,14 @@ _wizard_select_log_targets() {
         done
         echo "$(_l wiz_title_services)"
         i=1
-        idx_map=()
         for pkg in "${svc_list[@]}"; do
             echo "  $i — $pkg [${PKG_PRODUCT[$pkg]}]"
-            idx_map+=("$pkg")
             i=$((i + 1))
         done
         echo "$(_l wiz_services_all)"
         echo -n "$(_l wiz_services_prompt)"
-        read -r choice 2>/dev/null || true
-        choice="${choice:-a}"
+        _wizard_pick_from_list service svc_list SELECTED_SERVICES
         SELECTED_PRODUCTS=()
-        SELECTED_SERVICES=()
-        if [[ "$choice" == "a" || "$choice" == "A" || "$choice" == "а" || "$choice" == "А" ]]; then
-            SELECTED_SERVICES=("${svc_list[@]}")
-        else
-            IFS=',' read -ra _parts <<< "$choice"
-            for part in "${_parts[@]}"; do
-                part="${part// /}"
-                [[ -z "$part" ]] && continue
-                if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#idx_map[@]} ]]; then
-                    SELECTED_SERVICES+=("${idx_map[$((part - 1))]}")
-                else
-                    warn "Invalid service choice: $part"
-                fi
-            done
-            [[ ${#SELECTED_SERVICES[@]} -eq 0 ]] && SELECTED_SERVICES=("${svc_list[@]}")
-        fi
     fi
 
     resolve_selected_packages
@@ -5814,17 +6140,14 @@ _wizard_select_log_targets() {
     done
 }
 
-run_interactive_wizard() {
-    # Сбрасываем режимы, чтобы предыдущий -log/--dev из argv не протёк в выбор проверки состояния
-    MODE_LOG=0
-    MODE_DEV=0
-    SELFTEST_MODE=""
-    # Инициализация до read — set -u прервёт выполнение при EOF, если переменные не были назначены
-    local lang_choice="" mode_choice="" submode_choice="" scope_choice=""
-    local tcpdump_choice="" range_choice="" repo_choice="" out_dir=""
-    local selftest_choice=""
+# --- Шаги диалога мастера (каждый читает ровно один запрос) --------------------
+# Локальные переменные предварительно инициализируются в "" перед каждым read: при
+# `set -u` `read`, наткнувшийся на EOF (неинтерактивный stdin), может оставить целевую
+# переменную неустановленной, а не пустой, и любой последующий `[[ "$var" == ... ]]`
+# на никогда не назначенной локальной переменной прервёт выполнение скрипта.
 
-    # Шаг 1: Язык
+_wizard_step_language() {
+    local lang_choice=""
     echo ""
     echo "=== Language / Язык ==="
     echo "  1 — Русский"
@@ -5833,127 +6156,177 @@ run_interactive_wizard() {
     read -r lang_choice 2>/dev/null || true
     if [[ "$lang_choice" == "1" ]]; then CURRENT_LANG="ru"; else CURRENT_LANG="en"; fi
     log_debug "wizard: lang_choice='$lang_choice' -> CURRENT_LANG=$CURRENT_LANG"
+}
 
-    # Шаг 2: Режим
+# Устанавливает глобальную WIZARD_MODE_CHOICE для диспетчеризации у вызывающего кода — НЕ печатает:
+# эта функция уже печатает текст запроса в тот же stdout, так что
+# возврат выбора через $(...) захватил бы и этот текст тоже.
+_wizard_step_mode() {
+    WIZARD_MODE_CHOICE=""
     echo ""
     echo "$(_l wiz_title_mode)"
     echo "$(_l wiz_mode_1)"
     echo "$(_l wiz_mode_2)"
     echo "$(_l wiz_mode_3)"
     echo -n "$(_l wiz_mode_prompt)"
-    read -r mode_choice 2>/dev/null || true
-    log_debug "wizard: mode_choice='$mode_choice'"
+    read -r WIZARD_MODE_CHOICE 2>/dev/null || true
+    log_debug "wizard: mode_choice='$WIZARD_MODE_CHOICE'"
+}
 
-    case "$mode_choice" in
+_wizard_step_online_offline() {
+    local submode_choice=""
+    echo ""
+    echo "$(_l wiz_title_type)"
+    echo "$(_l wiz_type_1)"
+    echo "$(_l wiz_type_2)"
+    echo -n "$(_l wiz_type_prompt)"
+    read -r submode_choice 2>/dev/null || true
+    [[ "$submode_choice" == "2" ]] && LOG_SUBMODE="offline" || LOG_SUBMODE="online"
+    log_debug "wizard: submode_choice='$submode_choice' -> LOG_SUBMODE=$LOG_SUBMODE"
+}
+
+_wizard_step_scope() {
+    local scope_choice=""
+    echo ""
+    echo "$(_l wiz_title_scope)"
+    echo "$(_l wiz_scope_1)"
+    echo "$(_l wiz_scope_2)"
+    echo -n "$(_l wiz_scope_prompt)"
+    read -r scope_choice 2>/dev/null || true
+    [[ "$scope_choice" == "2" ]] && LOG_SCOPE="extended" || LOG_SCOPE="brief"
+    log_debug "wizard: scope_choice='$scope_choice' -> LOG_SCOPE=$LOG_SCOPE"
+}
+
+# Online: timeout, плюс (только для extended scope) отказ от tcpdump.
+_wizard_step_online_time_settings() {
+    local tcpdump_choice=""
+    echo ""
+    echo -n "$(_l wiz_timeout)"
+    read -r TIMEOUT_RAW 2>/dev/null || true
+    TIMEOUT_RAW="${TIMEOUT_RAW:-}"
+    if [[ "$LOG_SCOPE" == "extended" ]]; then
+        echo -n "$(_l wiz_tcpdump)"
+        read -r tcpdump_choice 2>/dev/null || true
+        [[ "$tcpdump_choice" == "n" || "$tcpdump_choice" == "N" || "$tcpdump_choice" == "н" || "$tcpdump_choice" == "Н" ]] && START_TCPDUMP=0
+    else
+        START_TCPDUMP=0
+    fi
+    log_debug "wizard: online timeout='$TIMEOUT_RAW' tcpdump_choice='$tcpdump_choice' -> START_TCPDUMP=$START_TCPDUMP"
+}
+
+# Offline: выбрать режим диапазона (отступ по длительности / явные from+to / from+offset).
+_wizard_step_offline_time_settings() {
+    local range_choice=""
+    echo ""
+    echo "$(_l wiz_title_range)"
+    echo "$(_l wiz_range_1)"
+    echo "$(_l wiz_range_2)"
+    echo "$(_l wiz_range_3)"
+    echo "$(_l wiz_range_all)"
+    echo -n "$(_l wiz_range_prompt)"
+    read -r range_choice 2>/dev/null || true
+    case "$range_choice" in
+        1)
+            echo -n "$(_l wiz_for_how_long)"
+            read -r TIMEOUT_RAW 2>/dev/null || true
+            TIMEOUT_RAW="${TIMEOUT_RAW:-}"
+            ;;
         2)
-            MODE_LOG=1
-            MODE_DEV=0
-            SELFTEST_MODE=""
-            # Шаг 3: Online / Offline
-            echo ""
-            echo "$(_l wiz_title_type)"
-            echo "$(_l wiz_type_1)"
-            echo "$(_l wiz_type_2)"
-            echo -n "$(_l wiz_type_prompt)"
-            read -r submode_choice 2>/dev/null || true
-            [[ "$submode_choice" == "2" ]] && LOG_SUBMODE="offline" || LOG_SUBMODE="online"
-            log_debug "wizard: submode_choice='$submode_choice' -> LOG_SUBMODE=$LOG_SUBMODE"
-
-            # Область: brief / extended
-            echo ""
-            echo "$(_l wiz_title_scope)"
-            echo "$(_l wiz_scope_1)"
-            echo "$(_l wiz_scope_2)"
-            echo -n "$(_l wiz_scope_prompt)"
-            read -r scope_choice 2>/dev/null || true
-            [[ "$scope_choice" == "2" ]] && LOG_SCOPE="extended" || LOG_SCOPE="brief"
-            log_debug "wizard: scope_choice='$scope_choice' -> LOG_SCOPE=$LOG_SCOPE"
-
-            # Настройки времени
-            if [[ "$LOG_SUBMODE" == "online" ]]; then
-                echo ""
-                echo -n "$(_l wiz_timeout)"
-                read -r TIMEOUT_RAW 2>/dev/null || true
-                TIMEOUT_RAW="${TIMEOUT_RAW:-}"
-                if [[ "$LOG_SCOPE" == "extended" ]]; then
-                    echo -n "$(_l wiz_tcpdump)"
-                    read -r tcpdump_choice 2>/dev/null || true
-                    [[ "$tcpdump_choice" == "n" || "$tcpdump_choice" == "N" || "$tcpdump_choice" == "н" || "$tcpdump_choice" == "Н" ]] && START_TCPDUMP=0
-                else
-                    START_TCPDUMP=0
-                fi
-            else
-                # Offline: выбор диапазона
-                echo ""
-                echo "$(_l wiz_title_range)"
-                echo "$(_l wiz_range_1)"
-                echo "$(_l wiz_range_2)"
-                echo "$(_l wiz_range_3)"
-                echo "$(_l wiz_range_all)"
-                echo -n "$(_l wiz_range_prompt)"
-                read -r range_choice 2>/dev/null || true
-                case "$range_choice" in
-                    1)
-                        echo -n "$(_l wiz_for_how_long)"
-                        read -r TIMEOUT_RAW 2>/dev/null || true
-                        TIMEOUT_RAW="${TIMEOUT_RAW:-}"
-                        ;;
-                    2)
-                        echo -n "$(_l wiz_from_dt)"
-                        read -r FROM_TIME 2>/dev/null || true
-                        FROM_TIME="${FROM_TIME:-}"
-                        echo -n "$(_l wiz_to_dt)"
-                        read -r TO_TIME 2>/dev/null || true
-                        TO_TIME="${TO_TIME:-}"
-                        ;;
-                    3)
-                        echo -n "$(_l wiz_from_dt2)"
-                        read -r FROM_TIME 2>/dev/null || true
-                        FROM_TIME="${FROM_TIME:-}"
-                        echo -n "$(_l wiz_for_offset)"
-                        read -r TO_TIME 2>/dev/null || true
-                        TO_TIME="${TO_TIME:-}"
-                        ;;
-                esac
-                log_debug "wizard: range_choice='$range_choice' -> TIMEOUT_RAW='$TIMEOUT_RAW' FROM_TIME='$FROM_TIME' TO_TIME='$TO_TIME'"
-            fi
-
-            # Выбор продукта / службы
-            detect_os
-            _wizard_select_log_targets
-            log_debug "wizard: SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]+"${SELECTED_PRODUCTS[*]}"}) SELECTED_SERVICES=(${SELECTED_SERVICES[*]+"${SELECTED_SERVICES[*]}"})"
-
-            # Директория вывода
-            echo -n "$(_l wiz_output_dir)"
-            read -r out_dir 2>/dev/null || true
-            [[ -n "$out_dir" ]] && OUTPUT_DIR="$out_dir"
-            _log_line "INFO" "wizard: режим=сбор логов $LOG_SUBMODE, scope=$LOG_SCOPE, output_dir='${OUTPUT_DIR:-(по умолчанию)}'"
+            echo -n "$(_l wiz_from_dt)"
+            read -r FROM_TIME 2>/dev/null || true
+            FROM_TIME="${FROM_TIME:-}"
+            echo -n "$(_l wiz_to_dt)"
+            read -r TO_TIME 2>/dev/null || true
+            TO_TIME="${TO_TIME:-}"
             ;;
         3)
-            MODE_LOG=0
-            MODE_DEV=0
-            echo ""
-            echo "$(_l wiz_title_selftest)"
-            echo "$(_l wiz_selftest_1)"
-            echo "$(_l wiz_selftest_2)"
-            echo -n "$(_l wiz_selftest_prompt)"
-            read -r selftest_choice 2>/dev/null || true
-            case "$selftest_choice" in
-                2) SELFTEST_MODE="extended"; MODE_DEV=1 ;;
-                *) SELFTEST_MODE="simple" ;;
-            esac
-            _log_line "INFO" "wizard: режим=самотест ($SELFTEST_MODE)"
+            echo -n "$(_l wiz_from_dt2)"
+            read -r FROM_TIME 2>/dev/null || true
+            FROM_TIME="${FROM_TIME:-}"
+            echo -n "$(_l wiz_for_offset)"
+            read -r TO_TIME 2>/dev/null || true
+            TO_TIME="${TO_TIME:-}"
             ;;
-        *)
-            # По умолчанию: проверка состояния
-            MODE_LOG=0
-            MODE_DEV=0
-            SELFTEST_MODE=""
-            echo -n "$(_l wiz_show_repo)"
-            read -r repo_choice 2>/dev/null || true
-            [[ "$repo_choice" == "y" || "$repo_choice" == "Y" || "$repo_choice" == "д" || "$repo_choice" == "Д" ]] && SHOW_REPO=1
-            _log_line "INFO" "wizard: режим=проверка служб (health check), show_repo=$SHOW_REPO"
-            ;;
+    esac
+    log_debug "wizard: range_choice='$range_choice' -> TIMEOUT_RAW='${TIMEOUT_RAW:-}' FROM_TIME='${FROM_TIME:-}' TO_TIME='${TO_TIME:-}'"
+}
+
+_wizard_step_output_dir() {
+    local out_dir=""
+    echo -n "$(_l wiz_output_dir)"
+    read -r out_dir 2>/dev/null || true
+    [[ -n "$out_dir" ]] && OUTPUT_DIR="$out_dir"
+}
+
+# Режим 2: настроить сбор логов от начала до конца — online/offline, область,
+# настройки времени, выбор продукта/службы, директория вывода.
+_wizard_configure_log_mode() {
+    MODE_LOG=1
+    MODE_DEV=0
+    SELFTEST_MODE=""
+
+    _wizard_step_online_offline
+    _wizard_step_scope
+
+    if [[ "$LOG_SUBMODE" == "online" ]]; then
+        _wizard_step_online_time_settings
+    else
+        _wizard_step_offline_time_settings
+    fi
+
+    # Выбор продукта / службы
+    detect_os
+    _wizard_select_log_targets
+    log_debug "wizard: SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]+"${SELECTED_PRODUCTS[*]}"}) SELECTED_SERVICES=(${SELECTED_SERVICES[*]+"${SELECTED_SERVICES[*]}"})"
+
+    _wizard_step_output_dir
+    _log_line "INFO" "wizard: режим=сбор логов $LOG_SUBMODE, scope=$LOG_SCOPE, output_dir='${OUTPUT_DIR:-(по умолчанию)}'"
+}
+
+# Режим 3: настроить режим самотеста (simple/extended).
+_wizard_configure_selftest() {
+    local selftest_choice=""
+    MODE_LOG=0
+    MODE_DEV=0
+    echo ""
+    echo "$(_l wiz_title_selftest)"
+    echo "$(_l wiz_selftest_1)"
+    echo "$(_l wiz_selftest_2)"
+    echo -n "$(_l wiz_selftest_prompt)"
+    read -r selftest_choice 2>/dev/null || true
+    case "$selftest_choice" in
+        2) SELFTEST_MODE="extended"; MODE_DEV=1 ;;
+        *) SELFTEST_MODE="simple" ;;
+    esac
+    _log_line "INFO" "wizard: режим=самотест ($SELFTEST_MODE)"
+}
+
+# Режим по умолчанию: проверка состояния, с опциональной секцией репозиториев.
+_wizard_configure_healthcheck() {
+    local repo_choice=""
+    MODE_LOG=0
+    MODE_DEV=0
+    SELFTEST_MODE=""
+    echo -n "$(_l wiz_show_repo)"
+    read -r repo_choice 2>/dev/null || true
+    [[ "$repo_choice" == "y" || "$repo_choice" == "Y" || "$repo_choice" == "д" || "$repo_choice" == "Д" ]] && SHOW_REPO=1
+    _log_line "INFO" "wizard: режим=проверка служб (health check), show_repo=$SHOW_REPO"
+}
+
+run_interactive_wizard() {
+    # Сбрасываем режимы, чтобы предыдущий -log/--dev из argv не протёк в выбор проверки состояния
+    MODE_LOG=0
+    MODE_DEV=0
+    SELFTEST_MODE=""
+
+    _wizard_step_language
+
+    _wizard_step_mode
+
+    case "$WIZARD_MODE_CHOICE" in
+        2) _wizard_configure_log_mode ;;
+        3) _wizard_configure_selftest ;;
+        *) _wizard_configure_healthcheck ;;
     esac
 }
 
