@@ -137,8 +137,21 @@ SEEK_CHUNK_BYTES=$((64 * 1024 * 1024))
 SEEK_PROBE_BYTES=131072
 # Отступ перед начальным смещением, чтобы не упустить первую подходящую строку
 SEEK_BACKOFF_BYTES=$((1024 * 1024))
-# Максимальный размер (байт) одного чанк-файла, создаваемого parce_service_log()
+# Внутренняя гранулярность параллельного извлечения ОДНОГО файла в
+# parce_service_log() (не путать с LOG_CHUNK_* ниже — это чисто про то, как
+# крупно резать работу между воркерами _psl_copy_chunks(), а не про итоговый
+# размер part_*.log в архиве; итоговая нарезка делается один раз в конце,
+# см. _psl_split_final_output()).
 MAX_LOG_CHUNK_SIZE=$((100 * 1024 * 1024))
+
+# Как резать ИТОГОВЫЕ part_*.log при offline-сборе (только offline —
+# online просто tail -F в один файл на источник, без нарезки): "size" —
+# по размеру (split -C, LOG_CHUNK_SIZE_BYTES байт на часть), "lines" — по
+# числу строк (split -l, LOG_CHUNK_LINES строк на часть). Настраивается
+# -log --chunk-mode/--chunk-size/--chunk-lines или мастером (-i).
+LOG_CHUNK_MODE="size"
+LOG_CHUNK_SIZE_BYTES=$((100 * 1024 * 1024))
+LOG_CHUNK_LINES=500000
 # Снимок /proc/stat для расчёта дельты CPU
 _CPU_PREV_IDLE=""
 _CPU_PREV_TOTAL=""
@@ -877,6 +890,13 @@ _l() {
                 wiz_to_dt)         echo -n "До (например 25.06.2026 12:00): " ;;
                 wiz_from_dt2)      echo -n "От (например 25.06.2026 10:00): " ;;
                 wiz_for_offset)    echo -n "На сколько? (например +3h, +30m): " ;;
+                wiz_title_chunk)   echo "=== Разбивка больших логов ===" ;;
+                wiz_chunk_1)       echo "  1 — По размеру (например 100MB) [по умолчанию]" ;;
+                wiz_chunk_2)       echo "  2 — По количеству строк (например 500000)" ;;
+                wiz_chunk_prompt)  echo "Ваш выбор [1-2, Enter=1]: " ;;
+                wiz_chunk_size_prompt)  echo -n "Максимальный размер одной части (например 50M, 200M; Enter = 100M): " ;;
+                wiz_chunk_lines_prompt) echo -n "Максимум строк в одной части (Enter = 500000): " ;;
+                wiz_chunk_size_invalid) echo "Не удалось разобрать размер, используется значение по умолчанию:" ;;
                 wiz_output_dir)    echo -n "Директория для архива (Enter = рядом со скриптом): " ;;
                 wiz_show_repo)     echo -n "Показать репозитории? (y/n): " ;;
                 wiz_title_scope)   echo "=== Объём сбора ===" ;;
@@ -971,6 +991,13 @@ _l() {
                 wiz_to_dt)         echo -n "To (e.g. 25.06.2026 12:00): " ;;
                 wiz_from_dt2)      echo -n "From (e.g. 25.06.2026 10:00): " ;;
                 wiz_for_offset)    echo -n "For how long? (e.g. +3h, +30m): " ;;
+                wiz_title_chunk)   echo "=== Splitting large logs ===" ;;
+                wiz_chunk_1)       echo "  1 — By size (e.g. 100MB) [default]" ;;
+                wiz_chunk_2)       echo "  2 — By line count (e.g. 500000)" ;;
+                wiz_chunk_prompt)  echo "Your choice [1-2, Enter=1]: " ;;
+                wiz_chunk_size_prompt)  echo -n "Max size per part (e.g. 50M, 200M; Enter = 100M): " ;;
+                wiz_chunk_lines_prompt) echo -n "Max lines per part (Enter = 500000): " ;;
+                wiz_chunk_size_invalid) echo "Could not parse size, using default:" ;;
                 wiz_output_dir)    echo -n "Output dir (Enter = script dir): " ;;
                 wiz_show_repo)     echo -n "Show repositories? (y/n): " ;;
                 wiz_title_scope)   echo "=== Collection scope ===" ;;
@@ -4106,18 +4133,21 @@ _psl_plan_chunk_bounds() {
 }
 
 # Копирует каждый кусок [off, next) из _psl_plan_chunk_bounds (аргументы
-# 6..N) в свой part_NNNNN.log внутри out_dir, оставляя только строки внутри
+# 6..N) в свой raw_NNNNN.log внутри raw_dir, оставляя только строки внутри
 # [from_epoch, to_epoch] — защита от того, что интерполяционный поиск
-# приземлился на несколько строк раньше/позже точной границы. $5=sorted:
-# 1 разрешает ранний выход из awk по каждому чанку, как только встретилась
-# строка позже to_epoch (безопасно только если файл действительно
-# хронологически отсортирован); 0 — сканировать чанк целиком (используется,
-# когда _logs_appear_sorted() уже сказал "нет", а границы [off,next) —
+# приземлился на несколько строк раньше/позже точной границы. Это ВНУТРЕННЯЯ
+# параллельная нарезка на воркеры (гранулярность — MAX_LOG_CHUNK_SIZE), а не
+# итоговые part_*.log в архиве — вызывающий код (parce_service_log())
+# склеивает эти raw_*.log обратно в один файл и режет его заново на
+# итоговые части через _psl_split_final_output() (LOG_CHUNK_MODE и т.п.).
+# $5=sorted: 1 разрешает ранний выход из awk по каждому куску, как только
+# встретилась строка позже to_epoch (безопасно только если файл
+# действительно хронологически отсортирован); 0 — сканировать кусок целиком
+# (когда _logs_appear_sorted() уже сказал "нет", а границы [off,next) —
 # это просто весь файл, а не результат интерполяционного поиска).
-# Отбрасывает части, оказавшиеся пустыми. Печатает число фактически
-# записанных чанк-файлов.
+# Отбрасывает куски, оказавшиеся пустыми. Печатает число непустых кусков.
 _psl_copy_chunks() {
-    local file="$1" out_dir="$2" from_epoch="$3" to_epoch="$4" sorted="$5"
+    local file="$1" raw_dir="$2" from_epoch="$3" to_epoch="$4" sorted="$5"
     local -a bounds=("${@:6}")
     local n=$((${#bounds[@]} - 1))
     local max_jobs i off next len part idx=0 count=0
@@ -4131,7 +4161,7 @@ _psl_copy_chunks() {
         len=$((next - off))
         [[ "$len" -le 0 ]] && continue
         idx=$((idx + 1))
-        part=$(printf '%s/part_%05d.log' "$out_dir" "$idx")
+        part=$(printf '%s/raw_%05d.log' "$raw_dir" "$idx")
         if ! _seek_wait_slot "$max_jobs"; then
             _seek_kill_jobs
             break
@@ -4145,7 +4175,7 @@ _psl_copy_chunks() {
     done
     _seek_wait_all_jobs
 
-    for part in "$out_dir"/part_*.log; do
+    for part in "$raw_dir"/raw_*.log; do
         [[ -e "$part" ]] || continue
         if [[ -s "$part" ]]; then
             count=$((count + 1))
@@ -4168,7 +4198,7 @@ _psl_copy_chunks() {
 parce_service_log() {
     local log_path="$1" ts_from_raw="$2" ts_to_raw="$3"
     local real_path from_epoch to_epoch size range_str start_off end_off sorted=1
-    local out_dir chunk_count
+    local out_dir raw_dir combined raw_count chunk_count
     local -a bounds=()
 
     unset PSL_OUTPUT_PATH PSL_OUTPUT_CHUNKS
@@ -4208,9 +4238,28 @@ parce_service_log() {
 
     out_dir=$(_psl_make_output_dir "$real_path" "$from_epoch" "$to_epoch")
     [[ -n "$out_dir" && -d "$out_dir" ]] || { warn "parce_service_log: cannot create output dir under /tmp"; return 1; }
+    raw_dir="$out_dir/.raw"
+    mkdir -p "$raw_dir" 2>/dev/null || { warn "parce_service_log: cannot create scratch dir under /tmp"; rm -rf -- "$out_dir" 2>/dev/null; return 1; }
 
     mapfile -t bounds < <(_psl_plan_chunk_bounds "$real_path" "$start_off" "$end_off" "$size")
-    chunk_count=$(_psl_copy_chunks "$real_path" "$out_dir" "$from_epoch" "$to_epoch" "$sorted" "${bounds[@]}")
+    raw_count=$(_psl_copy_chunks "$real_path" "$raw_dir" "$from_epoch" "$to_epoch" "$sorted" "${bounds[@]}")
+
+    if [[ ! "$raw_count" =~ ^[0-9]+$ ]] || [[ "$raw_count" -eq 0 ]]; then
+        warn "parce_service_log: no lines matched inside the requested range"
+        rm -rf -- "$out_dir" 2>/dev/null
+        return 1
+    fi
+
+    # Склеиваем внутренние параллельные куски обратно в один файл (порядок
+    # сохраняется благодаря нулям в raw_%05d) и режем его заново на итоговые
+    # part_*.log согласно LOG_CHUNK_MODE — так же, как это делает
+    # _psl_finalize_groups() для директорий/служб целиком.
+    combined="$out_dir/.combined.log"
+    cat "$raw_dir"/raw_*.log > "$combined" 2>/dev/null
+    rm -rf -- "$raw_dir" 2>/dev/null
+
+    chunk_count=$(_psl_split_final_output "$combined" "$out_dir" "part_")
+    rm -f -- "$combined" 2>/dev/null
 
     if [[ ! "$chunk_count" =~ ^[0-9]+$ ]] || [[ "$chunk_count" -eq 0 ]]; then
         warn "parce_service_log: no lines matched inside the requested range"
@@ -4474,22 +4523,47 @@ _psl_make_service_output_dir() {
     mktemp -d "${prefix}.XXXXXX" 2>/dev/null
 }
 
+# Разбивает один уже готовый (отфильтрованный/объединённый) файл на
+# part_*.log в out_dir — целиком по строкам, никогда их не разрывая.
+# Режим — LOG_CHUNK_MODE: "size" (умолчание) — split -C LOG_CHUNK_SIZE_BYTES;
+# "lines" — split -l LOG_CHUNK_LINES. Это единственное место, где
+# по-настоящему определяется размер/число строк итоговых файлов в архиве —
+# и parce_service_log(), и _psl_finalize_groups() вызывают именно её.
+# Печатает число получившихся частей (0, если src_file пуст/отсутствует).
+_psl_split_final_output() {
+    local src_file="$1" out_dir="$2" prefix="${3:-part_}"
+    local count
+
+    [[ -s "$src_file" ]] || { echo 0; return 0; }
+    mkdir -p "$out_dir" 2>/dev/null || { echo 0; return 1; }
+
+    if [[ "${LOG_CHUNK_MODE:-size}" == "lines" ]]; then
+        split -l "${LOG_CHUNK_LINES:-500000}" -d --numeric-suffixes=1 -a 5 \
+            --additional-suffix=.log -- "$src_file" "$out_dir/${prefix}" 2>/dev/null
+    else
+        split -C "${LOG_CHUNK_SIZE_BYTES:-104857600}" -d --numeric-suffixes=1 -a 5 \
+            --additional-suffix=.log -- "$src_file" "$out_dir/${prefix}" 2>/dev/null
+    fi
+
+    count=$(find "$out_dir" -maxdepth 1 -type f -name "${prefix}*.log" 2>/dev/null | wc -l)
+    echo "${count:-0}"
+}
+
 # Перенарезает каждый файл-аккумулятор группы в $work_dir/groups/ на
-# куски размером MAX_LOG_CHUNK_SIZE, целые по строкам, в $final_dir, с именами
-# "<group>.part_NN.log". Печатает общее число записанных чанк-файлов.
+# part_*.log в $final_dir (через _psl_split_final_output(), см. LOG_CHUNK_*),
+# с именами "<group>.part_NN.log". Печатает общее число записанных чанк-файлов.
 _psl_finalize_groups() {
     local work_dir="$1" final_dir="$2"
-    local gfile gkey count
+    local gfile gkey count total=0
 
     for gfile in "$work_dir"/groups/*.log; do
         [[ -s "$gfile" ]] || continue
         gkey=$(basename -- "$gfile"); gkey="${gkey%.log}"
-        split -C "${MAX_LOG_CHUNK_SIZE:-104857600}" -d --numeric-suffixes=1 \
-            --additional-suffix=.log -- "$gfile" "$final_dir/${gkey}.part_" 2>/dev/null
+        count=$(_psl_split_final_output "$gfile" "$final_dir" "${gkey}.part_")
+        [[ "$count" =~ ^[0-9]+$ ]] && total=$((total + count))
     done
 
-    count=$(find "$final_dir" -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l)
-    echo "${count:-0}"
+    echo "$total"
 }
 
 # Извлекает каждый лог-файл заданной службы, который попадает (хотя бы частично)
@@ -4910,6 +4984,28 @@ _run_selftest_simple() {
     rm -rf -- "${PSL_OUTPUT_PATH:-}" 2>/dev/null
     rm -rf -- "$dldir" 2>/dev/null
 
+    # Настраиваемая разбивка part_*.log — LOG_CHUNK_MODE=lines должна резать
+    # ровно по числу строк, независимо от глобального LOG_CHUNK_SIZE_BYTES.
+    local ctmp saved_mode="${LOG_CHUNK_MODE:-size}" saved_lines="${LOG_CHUNK_LINES:-500000}"
+    ctmp=$(mktemp "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    {
+        local ci
+        for ci in $(seq 1 30); do printf '2026-01-15 12:%02d:00 line-%d\n' "$((ci % 60))" "$ci"; done
+    } > "$ctmp"
+    LOG_CHUNK_MODE="lines"
+    LOG_CHUNK_LINES=10
+    if parce_service_log "$ctmp" "2026-01-15 00:00:00" "2026-01-15 23:59:59" >/dev/null 2>&1 \
+        && [[ "${PSL_OUTPUT_CHUNKS:-0}" -eq 3 ]] \
+        && [[ "$(cat "${PSL_OUTPUT_PATH:-/nonexistent}"/part_*.log 2>/dev/null | wc -l)" -eq 30 ]]; then
+        _selftest_ok "parce_service_log respects LOG_CHUNK_MODE=lines"
+    else
+        _selftest_bad "parce_service_log respects LOG_CHUNK_MODE=lines (chunks=${PSL_OUTPUT_CHUNKS:-?})"
+    fi
+    rm -rf -- "${PSL_OUTPUT_PATH:-}" 2>/dev/null
+    rm -f -- "$ctmp" 2>/dev/null
+    LOG_CHUNK_MODE="$saved_mode"
+    LOG_CHUNK_LINES="$saved_lines"
+
     _get_mem_usage_percent >/dev/null && _selftest_ok "_get_mem_usage_percent" || _selftest_bad "_get_mem_usage_percent"
     _get_cpu_usage_percent >/dev/null && _selftest_ok "_get_cpu_usage_percent" || _selftest_bad "_get_cpu_usage_percent"
 }
@@ -5022,6 +5118,28 @@ parse_duration() {
 duration_to_seconds() {
     local num="$1" unit="$2"
     case "$unit" in s) echo "$num" ;; m) echo "$(( num * 60 ))" ;; h) echo "$(( num * 3600 ))" ;; d) echo "$(( num * 86400 ))" ;; *) echo "$num" ;; esac
+}
+
+# Разбор человеко-читаемого размера (--chunk-size) в байты: "500000000",
+# "100M"/"100MB", "2G"/"2GB", "512K"/"512KB" (регистр не важен, суффикс "B"
+# необязателен). Печатает байты, возвращает 1 при нераспознанном формате.
+_parse_size_to_bytes() {
+    local raw="${1^^}" num unit
+    if [[ "$raw" =~ ^([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$raw" =~ ^([0-9]+)(K|M|G)B?$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            K) echo "$((num * 1024))" ;;
+            M) echo "$((num * 1024 * 1024))" ;;
+            G) echo "$((num * 1024 * 1024 * 1024))" ;;
+        esac
+        return 0
+    fi
+    return 1
 }
 
 # ============================================================
@@ -6372,6 +6490,37 @@ _wizard_step_offline_time_settings() {
     log_debug "wizard: range_choice='$range_choice' -> TIMEOUT_RAW='${TIMEOUT_RAW:-}' FROM_TIME='${FROM_TIME:-}' TO_TIME='${TO_TIME:-}'"
 }
 
+# Только offline: как резать итоговые part_*.log в архиве — по размеру
+# (LOG_CHUNK_SIZE_BYTES) или по числу строк (LOG_CHUNK_LINES). См.
+# LOG_CHUNK_MODE / _psl_split_final_output().
+_wizard_step_chunk_settings() {
+    local chunk_choice="" value="" bytes
+    echo ""
+    echo "$(_l wiz_title_chunk)"
+    echo "$(_l wiz_chunk_1)"
+    echo "$(_l wiz_chunk_2)"
+    echo -n "$(_l wiz_chunk_prompt)"
+    read -r chunk_choice 2>/dev/null || true
+    if [[ "$chunk_choice" == "2" ]]; then
+        LOG_CHUNK_MODE="lines"
+        echo -n "$(_l wiz_chunk_lines_prompt)"
+        read -r value 2>/dev/null || true
+        [[ "$value" =~ ^[1-9][0-9]*$ ]] && LOG_CHUNK_LINES="$value"
+    else
+        LOG_CHUNK_MODE="size"
+        echo -n "$(_l wiz_chunk_size_prompt)"
+        read -r value 2>/dev/null || true
+        if [[ -n "$value" ]]; then
+            if bytes=$(_parse_size_to_bytes "$value") && [[ "$bytes" -gt 0 ]]; then
+                LOG_CHUNK_SIZE_BYTES="$bytes"
+            else
+                warn "$(_l wiz_chunk_size_invalid) '$value'"
+            fi
+        fi
+    fi
+    log_debug "wizard: chunk_choice='$chunk_choice' value='$value' -> LOG_CHUNK_MODE=$LOG_CHUNK_MODE LOG_CHUNK_SIZE_BYTES=$LOG_CHUNK_SIZE_BYTES LOG_CHUNK_LINES=$LOG_CHUNK_LINES"
+}
+
 _wizard_step_output_dir() {
     local out_dir=""
     echo -n "$(_l wiz_output_dir)"
@@ -6393,6 +6542,9 @@ _wizard_configure_log_mode() {
         _wizard_step_online_time_settings
     else
         _wizard_step_offline_time_settings
+        # Разбивка на part_*.log касается только offline — online просто
+        # tail -F в один файл на источник, без нарезки.
+        _wizard_step_chunk_settings
     fi
 
     # Выбор продукта / службы
@@ -6473,6 +6625,9 @@ Modes:
                           Range: -f -2h -e -1h | -f '25.06.2026 10:00' -e '25.06.2026 12:00'
     -n, --no-tcpdump      Skip network capture (online only)
     -j, --jobs N          Offline: parallel file copy workers (default: nproc*80%, max 32)
+    --chunk-mode size|lines  Offline: how to split large output logs (default: size)
+    --chunk-size SIZE     Offline: max size per part when --chunk-mode size (e.g. 50M, 200M; default: 100M)
+    --chunk-lines N       Offline: max lines per part when --chunk-mode lines (default: 500000)
     --scope brief|extended  Brief = selected services only (default);
                           extended = + system/nginx/postgresql/configs (+ tcpdump online)
     -p, --product NAME    Product to collect (repeatable; see --list-targets)
@@ -6581,6 +6736,9 @@ flat_check_2.sh — проверка FLAT/FCS + сборщик логов
     -e, --to TIME         Конец диапазона (например -1h, 25.06.2026 12:00)
     -n, --no-tcpdump      Не записывать сетевой трафик (только online)
     -j, --jobs N          Offline: число параллельных копий файлов (по умолч. nproc*80%, макс. 32)
+    --chunk-mode size|lines  Offline: как резать крупные логи (по умолч. size)
+    --chunk-size РАЗМЕР   Offline: макс. размер одной части при --chunk-mode size (например 50M, 200M; по умолч. 100M)
+    --chunk-lines N       Offline: макс. строк в одной части при --chunk-mode lines (по умолч. 500000)
     --scope brief|extended  Краткий = только выбранные службы (по умолч.);
                           расширенный = + system/nginx/postgresql/configs (+ tcpdump online)
     -p, --product NAME    Продукт (повторяемый; см. --list-targets)
@@ -6713,6 +6871,26 @@ parse_args() {
                 if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
                 if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then die "Invalid -j/--jobs value: '$2' (positive integer)"; fi
                 COLLECTOR_JOBS="$2"; shift 2
+                ;;
+            --chunk-mode)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                case "$2" in
+                    size|lines) LOG_CHUNK_MODE="$2" ;;
+                    *) die "Invalid --chunk-mode: '$2' (use size|lines)" ;;
+                esac
+                shift 2
+                ;;
+            --chunk-size)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                if ! LOG_CHUNK_SIZE_BYTES=$(_parse_size_to_bytes "$2") || [[ "$LOG_CHUNK_SIZE_BYTES" -le 0 ]]; then
+                    die "Invalid --chunk-size: '$2' (e.g. 50M, 200000000)"
+                fi
+                LOG_CHUNK_MODE="size"; shift 2
+                ;;
+            --chunk-lines)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then die "Invalid --chunk-lines: '$2' (positive integer)"; fi
+                LOG_CHUNK_LINES="$2"; LOG_CHUNK_MODE="lines"; shift 2
                 ;;
             --scope)
                 if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
