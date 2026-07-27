@@ -5079,20 +5079,28 @@ _run_selftest_simple() {
     # Непрерывный SoftSwitch-лог через полночь (DD.MM.YYYY + tz): извлечение
     # с from до «сейчас» (только from_epoch, пустой to — как wizard «за Nd»)
     # должно включать обе стороны полуночи, а не обрываться на 23:59.
-    local midfile mwork last_line
+    local midfile mwork last_line keep_hh keep_mm keep_ss keep_stamp
     midfile=$(mktemp "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
     mwork=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || { rm -f -- "$midfile"; return 1; }
+    # Строка «после полуночи» с wall-clock чуть раньше сейчас — иначе при
+    # запуске selftest до условных 12:00 «фиксированный midday» оказывался
+    # позже to=now и ложно валил проверку.
+    keep_hh=$(date -d '2 minutes ago' '+%H')
+    keep_mm=$(date -d '2 minutes ago' '+%M')
+    keep_ss=$(date -d '2 minutes ago' '+%S')
+    keep_stamp=$(date -d '2 minutes ago' '+%d.%m.%Y')
     {
         printf '26.07.2026 23:59:50.100 (UTC+03:00) [DEBUG] before midnight a\n'
         printf '26.07.2026 23:59:57.203 (UTC+03:00) [NORMAL] End processpacket\n'
         printf '27.07.2026 00:00:02.893 (UTC+03:00) [DEBUG] start processpacket\n'
         printf '27.07.2026 00:00:02.893 (UTC+03:00) [NORMAL] End processpacket\n'
-        printf '27.07.2026 12:00:00.000 (UTC+03:00) [DEBUG] midday keep\n'
+        printf '%s %s:%s:%s.000 (UTC+03:00) [DEBUG] after-midnight keep\n' \
+            "$keep_stamp" "$keep_hh" "$keep_mm" "$keep_ss"
     } > "$midfile"
-    touch -d '2026-07-27 14:00:00' "$midfile"
+    touch -d "$(date '+%Y-%m-%d %H:%M:%S')" "$midfile"
     if _log_extract_one_file "$midfile" "$(time_to_epoch '2026-07-26 23:00:00')" "" "$mwork" \
         && last_line=$(tail -n 1 -- "$mwork"/groups/*.log 2>/dev/null) \
-        && [[ "$last_line" == *"midday keep"* ]] \
+        && [[ "$last_line" == *"after-midnight keep"* ]] \
         && [[ "$(grep -c '00:00:02' "$mwork"/groups/*.log 2>/dev/null || echo 0)" -ge 1 ]]; then
         _selftest_ok "_log_extract_one_file from-only keeps lines after midnight"
     else
