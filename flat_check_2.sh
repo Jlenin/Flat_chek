@@ -889,7 +889,7 @@ _l() {
                 wiz_from_dt)       echo -n "От (например 25.06.2026 10:00): " ;;
                 wiz_to_dt)         echo -n "До (например 25.06.2026 12:00): " ;;
                 wiz_from_dt2)      echo -n "От (например 25.06.2026 10:00): " ;;
-                wiz_for_offset)    echo -n "На сколько? (например +3h, +30m): " ;;
+                wiz_for_offset)    echo -n "На сколько? (например +3h, 3h, +30m): " ;;
                 wiz_title_chunk)   echo "=== Разбивка больших логов ===" ;;
                 wiz_chunk_1)       echo "  1 — По размеру (например 100MB) [по умолчанию]" ;;
                 wiz_chunk_2)       echo "  2 — По количеству строк (например 500000)" ;;
@@ -990,7 +990,7 @@ _l() {
                 wiz_from_dt)       echo -n "From (e.g. 25.06.2026 10:00): " ;;
                 wiz_to_dt)         echo -n "To (e.g. 25.06.2026 12:00): " ;;
                 wiz_from_dt2)      echo -n "From (e.g. 25.06.2026 10:00): " ;;
-                wiz_for_offset)    echo -n "For how long? (e.g. +3h, +30m): " ;;
+                wiz_for_offset)    echo -n "For how long? (e.g. +3h, 3h, +30m): " ;;
                 wiz_title_chunk)   echo "=== Splitting large logs ===" ;;
                 wiz_chunk_1)       echo "  1 — By size (e.g. 100MB) [default]" ;;
                 wiz_chunk_2)       echo "  2 — By line count (e.g. 500000)" ;;
