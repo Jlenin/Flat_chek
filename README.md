@@ -141,6 +141,9 @@ chmod +x flat_check_2.sh
 | `-s` / `--service` | пакет/служба (повторяемый) |
 | `--mgcpclient` / `--no-mgcpclient` | SoftSwitch: включать ли `mgcpclient*` |
 | `-j N` | offline / health: макс. параллельных воркеров (по умолч. nproc×80%, ≤32) |
+| `--chunk-mode size\|lines` | offline: как резать крупные логи на part_\*.log (по умолч. `size`) |
+| `--chunk-size РАЗМЕР` | offline: макс. размер одной части при `--chunk-mode size` (например `50M`, `200M`; по умолч. `100M`) |
+| `--chunk-lines N` | offline: макс. строк в одной части при `--chunk-mode lines` (по умолч. `500000`) |
 
 Без `-p`/`-s` — все пакеты, **присутствующие на хосте**. Каталоги вне allowlist (`logforflat` и т.п.) пропускаются: `[INFO] skip unknown`.
 
@@ -171,7 +174,11 @@ Health: продукты/пакеты проверяются параллель�
 ./flat_check_2.sh -log -off -f -2h -e -1h
 ./flat_check_2.sh -log -off -f '14.07.2026 10:00' -e '14.07.2026 14:00'
 ./flat_check_2.sh -log -off -o /root
+./flat_check_2.sh -log -off -t 1d --chunk-mode lines --chunk-lines 200000
+./flat_check_2.sh -log -off -t 1d --chunk-mode size --chunk-size 50M
 ```
+
+Мастер (`-i` → «Сбор логов» → «Offline») задаёт те же вопросы про разбивку отдельным шагом после выбора диапазона.
 
 ### Online
 
