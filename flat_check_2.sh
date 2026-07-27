@@ -45,7 +45,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.6.0"
+SCRIPT_VERSION="3.6.1"
 
 set -uo pipefail
 
@@ -3975,8 +3975,14 @@ _psl_resolve_log_path() {
 
 # Принимает либо уже числовой epoch, либо всё, что понимает `date -d`.
 # Та же оговорка про stdout-как-возвращаемое-значение, что и у _psl_resolve_log_path() выше.
+# Пустая строка — ошибка: GNU `date -d ""` молча даёт 00:00:00 сегодняшнего дня,
+# из‑за чего верхняя граница «за последние Nd» обрывала лог ровно на полуночи.
 _psl_parse_timestamp() {
     local raw="$1" ep
+    if [[ -z "${raw//[[:space:]]/}" ]]; then
+        warn "parce_service_log: cannot parse timestamp '$raw'" >&2
+        return 1
+    fi
     if [[ "$raw" =~ ^[0-9]+$ ]]; then
         echo "$raw"
         return 0
@@ -4727,6 +4733,9 @@ _log_file_in_range() {
 # everything" (offline with no --from/--to at all), which skips the
 # epoch filter entirely instead of forcing every line through it for
 # nothing.
+# Если задан только from (режим «за последние Nd»), to по умолчанию —
+# сейчас: иначе пустой to раньше доходил до date -d "" → полночь сегодня
+# и обрезал хвост текущего дня.
 _log_extract_one_file() {
     local file="$1" from_epoch="$2" to_epoch="$3" work_dir="$4"
     local plain is_scratch=0 group group_file rc=1
@@ -4740,9 +4749,13 @@ _log_extract_one_file() {
 
     if [[ -z "$from_epoch" && -z "$to_epoch" ]]; then
         cat "$plain" >> "$group_file" 2>/dev/null && rc=0
-    elif parce_service_log "$plain" "$from_epoch" "$to_epoch" >/dev/null 2>&1; then
-        cat "$PSL_OUTPUT_PATH"/part_*.log >> "$group_file" 2>/dev/null
-        rc=0
+    else
+        [[ -n "$from_epoch" && -z "$to_epoch" ]] && to_epoch=$(date +%s)
+        [[ -z "$from_epoch" && -n "$to_epoch" ]] && from_epoch=0
+        if parce_service_log "$plain" "$from_epoch" "$to_epoch" >/dev/null 2>&1; then
+            cat "$PSL_OUTPUT_PATH"/part_*.log >> "$group_file" 2>/dev/null
+            rc=0
+        fi
     fi
     rm -rf -- "${PSL_OUTPUT_PATH:-}" 2>/dev/null
     [[ "$is_scratch" -eq 1 ]] && rm -f -- "$plain" 2>/dev/null
@@ -5054,6 +5067,39 @@ _run_selftest_simple() {
         _selftest_bad "_log_candidate_files_for_dir orders multi-day files chronologically (got: $co_order)"
     fi
     rm -rf -- "$codir" 2>/dev/null
+
+    # Пустой timestamp нельзя принимать: GNU date -d "" → 00:00:00 сегодня,
+    # и «за последние Nd» без явного --to обрезало лог ровно на полуночи.
+    if _psl_parse_timestamp "" >/dev/null 2>&1; then
+        _selftest_bad "_psl_parse_timestamp rejects empty string"
+    else
+        _selftest_ok "_psl_parse_timestamp rejects empty string"
+    fi
+
+    # Непрерывный SoftSwitch-лог через полночь (DD.MM.YYYY + tz): извлечение
+    # с from до «сейчас» (только from_epoch, пустой to — как wizard «за Nd»)
+    # должно включать обе стороны полуночи, а не обрываться на 23:59.
+    local midfile mwork last_line
+    midfile=$(mktemp "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    mwork=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || { rm -f -- "$midfile"; return 1; }
+    {
+        printf '26.07.2026 23:59:50.100 (UTC+03:00) [DEBUG] before midnight a\n'
+        printf '26.07.2026 23:59:57.203 (UTC+03:00) [NORMAL] End processpacket\n'
+        printf '27.07.2026 00:00:02.893 (UTC+03:00) [DEBUG] start processpacket\n'
+        printf '27.07.2026 00:00:02.893 (UTC+03:00) [NORMAL] End processpacket\n'
+        printf '27.07.2026 12:00:00.000 (UTC+03:00) [DEBUG] midday keep\n'
+    } > "$midfile"
+    touch -d '2026-07-27 14:00:00' "$midfile"
+    if _log_extract_one_file "$midfile" "$(time_to_epoch '2026-07-26 23:00:00')" "" "$mwork" \
+        && last_line=$(tail -n 1 -- "$mwork"/groups/*.log 2>/dev/null) \
+        && [[ "$last_line" == *"midday keep"* ]] \
+        && [[ "$(grep -c '00:00:02' "$mwork"/groups/*.log 2>/dev/null || echo 0)" -ge 1 ]]; then
+        _selftest_ok "_log_extract_one_file from-only keeps lines after midnight"
+    else
+        _selftest_bad "_log_extract_one_file from-only keeps lines after midnight (last='${last_line:-}')"
+    fi
+    rm -rf -- "$mwork" 2>/dev/null
+    rm -f -- "$midfile" 2>/dev/null
 
     _get_mem_usage_percent >/dev/null && _selftest_ok "_get_mem_usage_percent" || _selftest_bad "_get_mem_usage_percent"
     _get_cpu_usage_percent >/dev/null && _selftest_ok "_get_cpu_usage_percent" || _selftest_bad "_get_cpu_usage_percent"
@@ -6187,10 +6233,15 @@ _run_offline_collection() {
         from_time=$(parse_time_point "-${timeout_raw}") || true
     fi
 
+    # «За последние Nd/Nh»: задан только from — верхняя граница = сейчас.
+    # Без этого пустой to уходил в parce_service_log как "", а GNU date -d ""
+    # даёт 00:00:00 сегодня → хвост лога после полуночи (текущий день) терялся.
+    if [[ -n "$from_time" && -z "$to_time" ]]; then
+        to_time=$(date "+%Y-%m-%d %H:%M:%S")
+    fi
+
     if [[ -n "$from_time" && -n "$to_time" ]]; then
         info "Extracting log lines from $from_time to $to_time (by content timestamp)"
-    elif [[ -n "$from_time" ]]; then
-        info "Extracting log lines from $from_time to now (by content timestamp)"
     else
         info "$(_l log_all)"
     fi
