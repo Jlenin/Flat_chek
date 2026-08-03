@@ -22,7 +22,7 @@
 
 _json_load_config() {
     # Conf заполняет только пустые переменные: CLI и env имеют приоритет.
-    local f="$1" line key val cur
+    local f="$1" line key val
     [[ -n "$f" && -f "$f" ]] || return 0
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -33,24 +33,22 @@ _json_load_config() {
             val="${val%\"}"; val="${val#\"}"
             val="${val%\'}"; val="${val#\'}"
             case "$key" in
-                HOST_ID|HOST_IP|SERVICE_NAME|PUSH_URLS|PUSH_URL|PUSH_TOKEN|PUSH_TOKENS|PUSH_AUTH_HEADER|PACKAGES|PRODUCT)
-                    cur="${!key-}"
-                    if [[ -z "$cur" ]]; then
-                        printf -v "$key" '%s' "$val"
-                    fi
-                    ;;
+                HOST_ID) [[ -z "${HOST_ID}" ]] && HOST_ID="$val" ;;
+                HOST_IP) [[ -z "${HOST_IP}" ]] && HOST_IP="$val" ;;
+                SERVICE_NAME) [[ -z "${SERVICE_NAME}" ]] && SERVICE_NAME="$val" ;;
+                PUSH_URLS) [[ -z "${PUSH_URLS}" ]] && PUSH_URLS="$val" ;;
+                PUSH_URL) [[ -z "${PUSH_URL:-}" ]] && PUSH_URL="$val" ;;
+                PUSH_TOKEN) [[ -z "${PUSH_TOKEN}" ]] && PUSH_TOKEN="$val" ;;
+                PUSH_TOKENS) [[ -z "${PUSH_TOKENS}" ]] && PUSH_TOKENS="$val" ;;
+                PUSH_AUTH_HEADER) [[ -z "${PUSH_AUTH_HEADER}" ]] && PUSH_AUTH_HEADER="$val" ;;
+                PACKAGES) [[ -z "${PACKAGES}" ]] && PACKAGES="$val" ;;
+                PRODUCT) [[ -z "${PRODUCT:-}" ]] && PRODUCT="$val" ;;
                 PUSH_CONNECT_TIMEOUT|PUSH_MAX_TIME|PUSH_RETRIES)
-                    if [[ "$val" =~ ^[0-9]+$ ]]; then
-                        printf -v "$key" '%s' "$val"
-                    fi
+                    [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
                     ;;
                 COLLECTOR_JOBS|JOBS)
-                    if [[ "$val" =~ ^[0-9]+$ ]]; then
-                        [[ "$key" == "JOBS" ]] && key="COLLECTOR_JOBS"
-                        # 0 = авто; не затираем явный -j/--jobs
-                        if [[ "${COLLECTOR_JOBS:-0}" -eq 0 ]]; then
-                            printf -v "$key" '%s' "$val"
-                        fi
+                    if [[ "$val" =~ ^[0-9]+$ && "${COLLECTOR_JOBS:-0}" -eq 0 ]]; then
+                        COLLECTOR_JOBS="$val"
                     fi
                     ;;
             esac
@@ -214,7 +212,8 @@ _json_collect_pkg() {
             [[ "${PKG_PORTS[$pkg]:-}" == *","* || "${PKG_PORTS[$pkg]:-}" == *"-"* || -z "${PKG_PORTS[$pkg]:-}" ]] && api_url="http://localhost$ep"
         fi
         if command -v curl >/dev/null 2>&1; then
-            api_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "$api_url" 2>/dev/null || echo 0)
+            api_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "$api_url" 2>/dev/null) || true
+            [[ "$api_code" =~ ^[0-9]{3}$ ]] || api_code=0
             api_code=$((10#${api_code:-0}))
             [[ "$api_code" -eq 200 || "$api_code" -eq 204 ]] && api_status="ok" || api_status="fail"
         else
@@ -376,7 +375,7 @@ _json_collect_system() {
 
 _json_collect_infra() {
     local out="[" first=1 dep status ver port req
-    for dep in "${!ALL_DEPENDS[@]}"; do
+    for dep in ${!ALL_DEPENDS[@]+"${!ALL_DEPENDS[@]}"}; do
         status="unknown"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
         if command -v systemctl >/dev/null 2>&1; then
             if systemctl is-active --quiet "$dep" 2>/dev/null; then
@@ -464,8 +463,15 @@ build_health_json() {
             fi
             product_pkgs+=("$pkg")
         done
-        IFS=$'\n' product_pkgs=($(printf '%s\n' "${product_pkgs[@]}" | sort)); unset IFS
-        for pkg in "${product_pkgs[@]}"; do
+        if ((${#product_pkgs[@]} > 0)); then
+            local sorted
+            sorted=$(printf '%s\n' "${product_pkgs[@]}" | sort)
+            product_pkgs=()
+            while IFS= read -r pkg; do
+                [[ -n "$pkg" ]] && product_pkgs+=("$pkg")
+            done <<< "$sorted"
+        fi
+        for pkg in ${product_pkgs[@]+"${product_pkgs[@]}"}; do
             local pj
             pj=$(_json_collect_pkg "$pkg") || continue
             # регистрация deps для infra
@@ -544,7 +550,8 @@ push_health_json() {
                 -H "X-Flat-Host-Id: ${HOST_ID}" \
                 -H "X-Flat-Service-Name: ${SERVICE_NAME}" \
                 ${token:+-H "$auth_hdr $token"} \
-                --data-binary "$body" 2>/dev/null || echo "000")
+                --data-binary "$body" 2>/dev/null) || true
+            [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code="000"
             if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
                 info "push: OK $http_code → $url"
                 ok=1

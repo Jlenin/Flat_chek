@@ -73,6 +73,8 @@ sudo ./agent/install_flat_check.sh \
 - conf не перетирает уже заданные CLI/env;
 - установщик пишет conf без хрупкого `sed` по URL/токену;
 - `--conf-dir` корректно задаёт путь conf.
+- push: код ответа curl не дублируется в `000000`.
+- install: без root можно ставить в свой префикс (`--bin/--conf-dir/--skip-cron`); system-wide — через `sudo`.
 
 ---
 

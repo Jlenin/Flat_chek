@@ -20,7 +20,7 @@ SRC_CONF="${SRC_CONF:-$SCRIPT_DIR/flat_check.conf.example}"
 INSTALL_BIN="${INSTALL_BIN:-/usr/local/bin/flat_check}"
 CONF_DIR="${CONF_DIR:-/etc/flat}"
 CONF_FILE="${CONF_FILE:-}"
-LOG_DIR="${LOG_DIR:-/var/log/flat}"
+LOG_DIR="${LOG_DIR:-}"          # default ниже: /var/log/flat или $CONF_DIR
 CRON_FILE="${CRON_FILE:-/etc/cron.d/flat-check}"
 
 PUSH_URLS="${PUSH_URLS:-}"
@@ -57,6 +57,7 @@ Usage:
   --bin PATH              куда ставить бинарь (default: /usr/local/bin/flat_check)
   --conf-dir DIR          каталог конфига (default: /etc/flat)
   --conf FILE             файл конфига (default: DIR/flat_check.conf)
+  --log-dir DIR           каталог логов push (default: /var/log/flat или CONF_DIR)
   --cron FILE             файл cron.d (default: /etc/cron.d/flat-check)
   --cron-spec SPEC        расписание (default: '*/5 * * * *')
   --skip-cron             не создавать cron
@@ -95,6 +96,7 @@ while [[ $# -gt 0 ]]; do
             CONF_FILE_EXPLICIT=1
             shift 2
             ;;
+        --log-dir) need_arg "$1" "${2:-}"; LOG_DIR="$2"; shift 2 ;;
         --cron) need_arg "$1" "${2:-}"; CRON_FILE="$2"; shift 2 ;;
         --cron-spec) need_arg "$1" "${2:-}"; CRON_SPEC="$2"; shift 2 ;;
         --skip-cron) SKIP_CRON=1; shift ;;
@@ -114,6 +116,13 @@ done
 
 [[ -n "$HOST_ID" ]] || HOST_ID="$(hostname -s 2>/dev/null || hostname)"
 [[ $CONF_FILE_EXPLICIT -eq 1 ]] || CONF_FILE="${CONF_FILE:-$CONF_DIR/flat_check.conf}"
+if [[ -z "$LOG_DIR" ]]; then
+    if [[ "$CONF_DIR" == "/etc/flat" ]]; then
+        LOG_DIR="/var/log/flat"
+    else
+        LOG_DIR="$CONF_DIR"
+    fi
+fi
 
 # Безопасная подстановка KEY="value" в conf (без sed по URL/токену).
 _conf_set() {
@@ -144,7 +153,31 @@ run() {
     "$@"
 }
 
-[[ $DRY_RUN -eq 1 || "$(id -u)" -eq 0 ]] || die "нужен root (или --dry-run)"
+_can_write() {
+    # достаточно, чтобы существовал записываемый родитель (каталоги создадим сами)
+    local path="$1" dir
+    [[ -w "$path" ]] && return 0
+    dir=$(dirname -- "$path")
+    while [[ ! -d "$dir" && "$dir" != "/" && "$dir" != "." && "$dir" != "" ]]; do
+        dir=$(dirname -- "$dir")
+    done
+    [[ -n "$dir" && -d "$dir" && -w "$dir" ]]
+}
+
+if [[ $DRY_RUN -eq 0 && "$(id -u)" -ne 0 ]]; then
+    # root не обязателен, если все целевые пути доступны на запись
+    # (типичный system-wide install в /usr/local + /etc — только через sudo)
+    need=0
+    _can_write "$INSTALL_BIN" || need=1
+    _can_write "$CONF_FILE" || need=1
+    _can_write "$LOG_DIR" || need=1
+    if [[ $SKIP_CRON -eq 0 ]]; then
+        _can_write "$CRON_FILE" || need=1
+    fi
+    if [[ $need -eq 1 ]]; then
+        die "нужен root: sudo $0 ...   (локально: --bin/--conf-dir/--skip-cron; проверка: --dry-run)"
+    fi
+fi
 [[ -f "$SRC_CHECK" ]] || die "не найден $SRC_CHECK"
 [[ -f "$SRC_CONF" ]] || die "не найден $SRC_CONF"
 
@@ -152,7 +185,10 @@ if [[ -z "$SERVICE_NAME" ]]; then
     warn "SERVICE_NAME не задан — в JSON будет unknown (лучше --service-name fss-backend)"
 fi
 
-info "1) бинарь → $INSTALL_BIN"
+info "1) каталоги"
+run install -d -m 0755 "$(dirname -- "$INSTALL_BIN")" "$CONF_DIR" "$LOG_DIR"
+
+info "2) бинарь → $INSTALL_BIN"
 if [[ $DRY_RUN -eq 1 ]]; then
     info "DRY: install -m 0755 $SRC_CHECK $INSTALL_BIN"
 else
@@ -161,17 +197,15 @@ fi
 
 if [[ $WITH_LOGS -eq 1 ]]; then
     src2="$REPO_ROOT/flat_check_2.sh"
+    dest2="$(dirname -- "$INSTALL_BIN")/flat_check_2"
     [[ -f "$src2" ]] || die "не найден $src2"
-    info "1b) flat_check_2 → /usr/local/bin/flat_check_2"
+    info "2b) flat_check_2 → $dest2"
     if [[ $DRY_RUN -eq 1 ]]; then
-        info "DRY: install -m 0755 $src2 /usr/local/bin/flat_check_2"
+        info "DRY: install -m 0755 $src2 $dest2"
     else
-        install -m 0755 "$src2" /usr/local/bin/flat_check_2
+        install -m 0755 "$src2" "$dest2"
     fi
 fi
-
-info "2) каталоги $CONF_DIR, $LOG_DIR"
-run install -d -m 0755 "$CONF_DIR" "$LOG_DIR"
 
 if [[ -f "$CONF_FILE" && $FORCE_CONF -eq 0 ]]; then
     info "3) $CONF_FILE уже есть — оставляем как есть"
