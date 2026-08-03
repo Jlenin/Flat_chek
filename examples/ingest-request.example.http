@@ -1,0 +1,16 @@
+### Пример запроса, который будет слать агент (curl под капотом --push)
+# Backend Partner должен принять и сохранить снимок по host_id,
+# а GET /health — отдавать уже агрегированное представление для UI.
+
+POST https://partner.example.local/api/v1/health/ingest
+Authorization: Bearer CHANGE_ME
+Content-Type: application/json
+X-Flat-Host-Id: ss-n1
+
+< ./health-payload.example.json
+
+###
+
+# Ожидаемый ответ (пример)
+# HTTP/1.1 202 Accepted
+# { "status": "accepted", "host_id": "ss-n1", "timestamp": "2026-08-03T08:15:00Z" }

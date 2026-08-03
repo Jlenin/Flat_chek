@@ -301,4 +301,7 @@ PKG_DEPS["my-pkg"]="nginx,postgresql"
 |------|---------|
 | `flat_check.sh` | health only (**3.6.2**), без log collector |
 | `flat_check_2.sh` | health + log collector (**3.6.2**) |
+| `examples/` | черновики агента: JSON→Partner, conf, cron, install, remote SSH |
 | `README.md` | этот файл |
+
+Черновики доставки health в дашборд (как Zabbix active): см. [`examples/README.md`](examples/README.md).
