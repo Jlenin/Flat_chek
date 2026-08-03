@@ -251,4 +251,5 @@ JSON/push-блок: `agent/json_report.inc.sh` → оба скрипта.
 | `flat_check_2.sh` | health/JSON + log collector (**3.7.0**) |
 | `agent/` | установщик, conf, cron, README |
 | `examples/` | старые черновики → см. `agent/` |
+| `CONTEXT.md` | handoff-контекст для ИИ (что сделано / паритет / контракт) |
 | `README.md` | этот файл |
