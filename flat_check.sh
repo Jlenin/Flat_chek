@@ -2682,7 +2682,8 @@ _collector_wait_all_jobs() {
 : "${SHOW_REPOS_JSON:=0}"
 
 _json_load_config() {
-    local f="$1" line key val
+    # Conf заполняет только пустые переменные: CLI и env имеют приоритет.
+    local f="$1" line key val cur
     [[ -n "$f" && -f "$f" ]] || return 0
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -2694,24 +2695,30 @@ _json_load_config() {
             val="${val%\'}"; val="${val#\'}"
             case "$key" in
                 HOST_ID|HOST_IP|SERVICE_NAME|PUSH_URLS|PUSH_URL|PUSH_TOKEN|PUSH_TOKENS|PUSH_AUTH_HEADER|PACKAGES|PRODUCT)
-                    printf -v "$key" '%s' "$val"
+                    cur="${!key-}"
+                    if [[ -z "$cur" ]]; then
+                        printf -v "$key" '%s' "$val"
+                    fi
                     ;;
-                PUSH_CONNECT_TIMEOUT|PUSH_MAX_TIME|PUSH_RETRIES|COLLECTOR_JOBS|JOBS)
+                PUSH_CONNECT_TIMEOUT|PUSH_MAX_TIME|PUSH_RETRIES)
+                    if [[ "$val" =~ ^[0-9]+$ ]]; then
+                        printf -v "$key" '%s' "$val"
+                    fi
+                    ;;
+                COLLECTOR_JOBS|JOBS)
                     if [[ "$val" =~ ^[0-9]+$ ]]; then
                         [[ "$key" == "JOBS" ]] && key="COLLECTOR_JOBS"
-                        printf -v "$key" '%s' "$val"
+                        # 0 = авто; не затираем явный -j/--jobs
+                        if [[ "${COLLECTOR_JOBS:-0}" -eq 0 ]]; then
+                            printf -v "$key" '%s' "$val"
+                        fi
                     fi
                     ;;
             esac
         fi
     done < "$f"
-    # алиас одного URL
     if [[ -z "$PUSH_URLS" && -n "${PUSH_URL:-}" ]]; then
         PUSH_URLS="$PUSH_URL"
-    fi
-    if [[ -n "${PACKAGES:-}" && -z "$SINGLE_PKG" ]]; then
-        # PACKAGES=a,b,c — фильтр; полный снимок только по ним делается в run_health_json
-        :
     fi
     if [[ -n "${PRODUCT:-}" && -z "$FILTER_PRODUCT" ]]; then
         FILTER_PRODUCT="$PRODUCT"
@@ -3216,8 +3223,6 @@ push_health_json() {
 run_health_json() {
     local body
     [[ -n "$CONFIG_FILE" ]] && _json_load_config "$CONFIG_FILE"
-    # env перекрывает conf
-    [[ -n "${PUSH_URLS:-}" ]] || true
     body=$(build_health_json) || { fail "не удалось собрать JSON"; return 1; }
     if [[ "$DO_PUSH" -eq 1 ]]; then
         # при --push JSON тоже можно показать через --json; иначе только push

@@ -4,5 +4,6 @@
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Каждые 5 минут: JSON-снимок локальной ноды → Partner (все PUSH_URLS)
-*/5 * * * * root /usr/local/bin/flat_check --config /etc/flat/flat_check.conf --json --push >>/var/log/flat/flat_check_push.log 2>&1
+# Каждые 5 минут: снимок → все PUSH_URLS из conf
+# --push без --json: в лог пишутся только статусы отправки, не весь JSON
+*/5 * * * * root /usr/local/bin/flat_check --config /etc/flat/flat_check.conf --push >>/var/log/flat/flat_check_push.log 2>&1

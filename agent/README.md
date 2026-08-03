@@ -1,49 +1,41 @@
 # Агент flat_check → Flat Partner
 
-Папка с **конфигом, установщиком и контрактом** доставки health JSON на нодах продукта.  
-Модель как у Zabbix active: на каждой ноде свой агент, cron, push на один или несколько HTTP/HTTPS endpoint.
+Установка и настройка периодической отправки health JSON с ноды продукта на ingest Flat Partner.
 
 ```text
-[нода продукта]
-  cron → flat_check --config … --json --push
-           │
-           ▼  POST JSON v2 (+ token)
-     Partner ingest (1..N URL)
-           │
-           ▼
-     GET /health → UI (сводка / пакеты / система / infra)
+нода ── cron ──► flat_check --config … --push
+                      │
+                      ▼  POST JSON (token)
+                 Partner ingest (1…N URL)
+                      │
+                      ▼
+                 GET /health → UI
 ```
 
-Скрипты в корне репозитория:
-
-| Файл | Роль |
-|------|------|
-| `../flat_check.sh` | health + JSON-агент (**ставить на ноды**) |
-| `../flat_check_2.sh` | то же health/JSON **1к1** + сбор логов |
-
-Версия агента: **3.7.0**.
+Скрипт агента — `../flat_check.sh` (тот же health, что у `flat_check_2.sh`).  
+Версия: **3.7.0**.
 
 ---
 
-## Состав папки
+## Состав каталога
 
 | Файл | Назначение |
 |------|------------|
-| `install_flat_check.sh` | установщик: бинарь → conf → cron → пробный прогон |
+| `install_flat_check.sh` | установка: бинарь, conf, cron, пробный прогон |
 | `flat_check.conf.example` | шаблон `/etc/flat/flat_check.conf` |
-| `cron.example` | пример `/etc/cron.d/flat-check` |
-| `service_names.md` | справочник `SERVICE_NAME` (fss-backend, …) |
-| `backend-token.example.yaml` | как принять токен на backend |
-| `health-payload.example.json` | пример тела JSON v2 |
-| `ingest-request.example.http` | пример HTTP-запроса |
-| `cli.examples.sh` | примеры команд |
-| `json_report.inc.sh` | исходный блок JSON/push (вшит в оба скрипта) |
+| `cron.example` | шаблон `/etc/cron.d/flat-check` |
+| `service_names.md` | допустимые `SERVICE_NAME` |
+| `backend-token.example.yaml` | пример приёма токена на backend |
+| `health-payload.example.json` | пример тела запроса |
+| `ingest-request.example.http` | пример HTTP |
+| `cli.examples.sh` | примеры ручных запусков |
+| `json_report.inc.sh` | общий блок JSON/push (вшит в оба скрипта в корне) |
 
 ---
 
-## Быстрая установка
+## Установка
 
-Из корня репозитория (нужен root):
+Из корня репозитория:
 
 ```bash
 chmod +x agent/install_flat_check.sh flat_check.sh
@@ -55,57 +47,52 @@ sudo ./agent/install_flat_check.sh \
   --service-name fss-backend
 ```
 
-Что произойдёт:
+Шаги установщика:
 
 1. `flat_check.sh` → `/usr/local/bin/flat_check`
 2. каталоги `/etc/flat`, `/var/log/flat`
-3. конфиг `/etc/flat/flat_check.conf` (из example + ваши значения)
-4. cron `/etc/cron.d/flat-check` каждые 5 минут: `--json --push`
-5. пробный `--json` (и `--push`, если URL не example.local)
+3. конфиг `/etc/flat/flat_check.conf` (если файла ещё нет)
+4. cron `/etc/cron.d/flat-check` — каждые 5 минут `--push`
+5. пробный `--json`; `--push` только если URL не из `example.*`
 
-### Несколько ingest URL
+### Несколько URL
 
 ```bash
 sudo ./agent/install_flat_check.sh \
-  --push-url 'https://partner-a.example/ingest,https://partner-b.example/ingest' \
+  --push-url 'https://a.example/ingest,https://b.example/ingest' \
   --push-token 'SECRET' \
   --host-id ss-n1 \
   --service-name fss-backend
 ```
 
-### Сбор логов на той же ноде
+### Вместе со сборщиком логов
 
 ```bash
 sudo ./agent/install_flat_check.sh ... --with-logs
-# → ещё /usr/local/bin/flat_check_2
+# дополнительно: /usr/local/bin/flat_check_2
 ```
 
-### Dry-run (без изменений)
+### Прочие флаги
 
-```bash
-./agent/install_flat_check.sh --dry-run \
-  --push-url https://partner.example.local/api/v1/health/ingest \
-  --host-id ss-n1 --service-name fss-backend
-```
-
-### Полезные флаги установщика
-
-| Флаг | Смысл |
-|------|--------|
-| `--bin PATH` | куда положить бинарь |
-| `--conf FILE` | путь конфига |
+| Флаг | Описание |
+|------|----------|
+| `--dry-run` | показать действия без изменений |
+| `--bin PATH` | путь бинаря |
+| `--conf-dir DIR` | каталог конфига (по умолчанию `/etc/flat`) |
+| `--conf FILE` | явный путь conf |
 | `--cron-spec '*/10 * * * *'` | расписание |
-| `--skip-cron` | только бинарь+conf |
+| `--skip-cron` | не ставить cron |
 | `--force-conf` | перезаписать существующий conf |
-| `--no-test` | не делать пробный прогон |
-| `--host-ip IP` | явный IP в conf |
-| `--with-logs` | поставить `flat_check_2` |
+| `--no-test` | без пробного прогона |
+| `--host-ip IP` | зафиксировать IP в conf |
+
+Если conf уже есть, параметры `--push-*` / `--host-*` / `--service-name` **не меняют** его — нужен `--force-conf` либо правка файла вручную.
 
 ---
 
-## Конфиг `/etc/flat/flat_check.conf`
+## Конфиг
 
-Минимум:
+Минимальный рабочий набор:
 
 ```bash
 PUSH_URLS="https://partner.example.local/api/v1/health/ingest"
@@ -114,46 +101,46 @@ HOST_ID="ss-n1"
 SERVICE_NAME="fss-backend"
 ```
 
-| Ключ | Обязателен | Описание |
-|------|------------|----------|
-| `PUSH_URLS` | для push | URL через запятую/пробел, `http://` или `https://` |
+| Ключ | Нужен | Описание |
+|------|-------|----------|
+| `PUSH_URLS` | для push | URL через запятую/пробел (`http`/`https`) |
 | `PUSH_TOKEN` | обычно да | токен стенда |
 | `HOST_ID` | да | id хоста в UI |
-| `HOST_IP` | нет | иначе авто |
-| `SERVICE_NAME` | да* | CI/CD-имя (`fss-backend` …), см. `service_names.md` |
-| `PACKAGES` / `PRODUCT` | нет | сузить снимок |
-| `PUSH_*_TIMEOUT` / `PUSH_RETRIES` | нет | таймауты curl |
+| `SERVICE_NAME` | да | имя сервиса CI/CD, см. `service_names.md` |
+| `HOST_IP` | нет | иначе определяется автоматически |
+| `PACKAGES` / `PRODUCT` | нет | сузить набор проверок |
+| `PUSH_CONNECT_TIMEOUT` / `PUSH_MAX_TIME` / `PUSH_RETRIES` | нет | таймауты curl |
 
-`*` без `SERVICE_NAME` в JSON будет `unknown` (или имя `--pkg`).
+Приоритет значений: **CLI → переменные окружения → conf → автоопределение**.
 
-Переменные окружения с теми же именами тоже работают и **не затираются** конфигом при уже заданном CLI (conf читается в `main` / `run_health_json`).
+Полный шаблон: `flat_check.conf.example`.
 
 ---
 
-## CLI агента
+## Запуск
 
 ```bash
-# локальный снимок
+# снимок в stdout
 flat_check --config /etc/flat/flat_check.conf --json
 
-# снимок + отправка на все PUSH_URLS
-flat_check --config /etc/flat/flat_check.conf --json --push
-
-# только push (JSON в cron-лог не дублируется в stdout)
+# отправка на все PUSH_URLS (без печати JSON)
 flat_check --config /etc/flat/flat_check.conf --push
 
-# один пакет
-flat_check --pkg fss-server --json
+# снимок + отправка
+flat_check --config /etc/flat/flat_check.conf --json --push
 
-# идентичность явно
+# один пакет / явная идентичность
+flat_check --pkg fss-server --json
 flat_check --json --host-id ss-n1 --host-ip 10.0.1.5 --service-name fss-backend
 ```
 
-Те же флаги есть в `flat_check_2.sh` (health/JSON 1к1). Режим `-log` не смешивается с `--json/--push`: JSON обрабатывается раньше и завершает процесс.
+Те же флаги есть в `flat_check_2.sh`. Режим `-log` с `--json`/`--push` в одном запуске не комбинируется: JSON-путь завершает процесс раньше.
+
+Cron по умолчанию вызывает `--push` без `--json`, чтобы лог не раздувался телом снимка.
 
 ---
 
-## JSON v2 (что уходит на ingest)
+## Формат JSON
 
 Обязательные поля идентичности:
 
@@ -161,10 +148,9 @@ flat_check --json --host-id ss-n1 --host-ip 10.0.1.5 --service-name fss-backend
 - `host_ip`
 - `service_name`
 
-Плюс: `timestamp`, `script_version`, `os`, `package_manager`, `products[]`, `infrastructure[]`, `summary`, `system`, `certificates`, …
+Далее: `timestamp`, `script_version`, `os`, `package_manager`, `products`, `infrastructure`, `summary`, `system`, `certificates`, …
 
-Пример: [`health-payload.example.json`](health-payload.example.json).  
-HTTP: [`ingest-request.example.http`](ingest-request.example.http).
+Примеры: `health-payload.example.json`, `ingest-request.example.http`.
 
 Заголовки при push:
 
@@ -175,49 +161,37 @@ X-Flat-Host-Id: <HOST_ID>
 X-Flat-Service-Name: <SERVICE_NAME>
 ```
 
-Backend-настройка токена: [`backend-token.example.yaml`](backend-token.example.yaml).
+Настройка приёма токена на стороне backend: `backend-token.example.yaml`.
 
 ---
 
-## Проверка после установки
+## Проверка
 
 ```bash
-# 1) версия
-flat_check -v          # flat_check 3.7.0
-
-# 2) selftest
+flat_check -v
 flat_check --selftest simple
-
-# 3) валидный JSON
 flat_check --config /etc/flat/flat_check.conf --json | jq '.host_id, .service_name, .summary'
-
-# 4) push вручную
 flat_check --config /etc/flat/flat_check.conf --push
-# ожидайте: [INFO] push: OK 2xx → https://…
-
-# 5) лог cron
 tail -f /var/log/flat/flat_check_push.log
 ```
-
-Типичные проблемы:
 
 | Симптом | Что проверить |
 |---------|----------------|
 | `PUSH_URLS пуст` | conf / env |
-| `curl не найден` | поставить curl |
-| `FAIL … http=401/403` | токен / `PUSH_AUTH_HEADER` |
-| `FAIL … http=000` | DNS, firewall, TLS |
-| `service_name: unknown` | `SERVICE_NAME=` или `--service-name` |
+| `curl не найден` | пакет `curl` |
+| `http=401/403` | токен, `PUSH_AUTH_HEADER` |
+| `http=000` | DNS, firewall, TLS |
+| `service_name: unknown` | `SERVICE_NAME` в conf или `--service-name` |
 
 ---
 
-## Ручная установка (без скрипта)
+## Установка вручную
 
 ```bash
 install -m 0755 flat_check.sh /usr/local/bin/flat_check
 install -d -m 0755 /etc/flat /var/log/flat
 cp agent/flat_check.conf.example /etc/flat/flat_check.conf
-# отредактировать PUSH_URLS, PUSH_TOKEN, HOST_ID, SERVICE_NAME
+# заполнить PUSH_URLS, PUSH_TOKEN, HOST_ID, SERVICE_NAME
 chmod 0640 /etc/flat/flat_check.conf
 cp agent/cron.example /etc/cron.d/flat-check
 chmod 0644 /etc/cron.d/flat-check
@@ -227,7 +201,6 @@ chmod 0644 /etc/cron.d/flat-check
 
 ## Сопровождение
 
-- Меняете JSON/push-логику → правьте `json_report.inc.sh` и **оба** скрипта одинаково (или перегенерируйте вставку из inc).
-- Новые пакеты в health → `PKG_*` в обоих скриптах (см. корневой README).
-- Токены не коммитить: в conf на ноде `chmod 0640`, в git только `CHANGE_ME`.
-- Полный handoff для другого ИИ: [`../CONTEXT.md`](../CONTEXT.md) — обновлять при смене версии/контракта/установщика.
+- Логику JSON/push менять в `json_report.inc.sh` и синхронно в обоих скриптах корня.
+- Новые пакеты health — в `PKG_*` обоих скриптов (см. корневой README).
+- На ноде conf держать с правами `0640`; секреты в git не коммитить.

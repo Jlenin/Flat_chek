@@ -1,164 +1,111 @@
-# flat_check / flat_check_2 — проверка FLAT/FCS и сбор логов
+# flat_check / flat_check_2
 
-Два bash-скрипта для серверов с продуктами линейки FLAT / FCS. **Health (текст и JSON) у них одинаковый.** Отличие — сборщик логов только в `_2`.
+Проверка состояния продуктов FLAT/FCS на Linux-хосте (dpkg/rpm + systemd).
 
-| Файл | Назначение | Версия |
-|------|------------|--------|
-| `flat_check.sh` | health check + **JSON-агент** (без log collector) | **3.7.0** |
-| `flat_check_2.sh` | то же health/JSON **1к1** + сбор логов | **3.7.0** |
-| `agent/` | конфиг, установщик, cron, контракт push → Partner | |
+| Скрипт | Назначение | Версия |
+|--------|------------|--------|
+| `flat_check.sh` | health check | 3.7.0 |
+| `flat_check_2.sh` | тот же health check + сбор логов | 3.7.0 |
 
-Скрипты только читают состояние (и копируют логи в `_2`). Конфиги служб не меняют. Для полного сбора логов обычно нужен **root** или sudo.
+Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
+Для полного сбора логов в `_2` обычно нужен root или sudo.
+
+Периодическая отправка health JSON в Flat Partner (conf, cron, установщик) — в каталоге [`agent/`](agent/).
 
 ---
 
-## Какой скрипт брать
+## Какой скрипт использовать
 
 ```bash
-# мониторинг / cron / Flat Partner (страница «Система» + JSON push)
+# только мониторинг состояния
 ./flat_check.sh
-./flat_check.sh --json
-./flat_check.sh --config /etc/flat/flat_check.conf --json --push
+./flat_check.sh -i          # подробно по всем пакетам
+./flat_check.sh -r          # + репозитории
 
-# то же + сбор логов
+# мониторинг + сбор логов
 ./flat_check_2.sh
 ./flat_check_2.sh -log -off -t 4d
 ```
 
-> **CLI:** в `flat_check.sh` флаг `-i` = `--info`.  
-> В `flat_check_2.sh` флаг `-i` = интерактивный мастер.  
-> Для health/JSON фильтр продукта: `--product`. В `-log` по-прежнему `-p` выбирает продукт для сбора.
+Замечания по CLI:
 
-Установка агента на ноду: **[`agent/README.md`](agent/README.md)**.
+- в `flat_check.sh` флаг `-i` = `--info` (подробный health);
+- в `flat_check_2.sh` флаг `-i` = интерактивный мастер;
+- health у обоих совпадает (общие `PKG_*`, System, пакеты, infrastructure, resource-gate).
 
 ---
 
 ## Быстрый старт
 
 ```bash
-chmod +x flat_check.sh flat_check_2.sh agent/install_flat_check.sh
+chmod +x flat_check.sh flat_check_2.sh
 
 ./flat_check.sh -h
 ./flat_check_2.sh -h
 
-# текст: System → продукты → Infrastructure → Summary
 ./flat_check.sh
-
-# JSON v2 (host_id / host_ip / service_name + products/system/…)
-./flat_check.sh --json --host-id ss-n1 --service-name fss-backend | jq .summary
-```
-
-Версия:
-
-```bash
-./flat_check.sh -v
-# → flat_check 3.7.0
+./flat_check.sh -v    # flat_check 3.7.0
 ```
 
 ---
 
-## JSON-агент → Partner
-
-На каждой ноде продукта агент сам собирает снимок и пушит на HTTP/HTTPS (как Zabbix active).
-
-```bash
-# установка
-sudo ./agent/install_flat_check.sh \
-  --push-url 'https://partner.example.local/api/v1/health/ingest' \
-  --push-token 'SECRET' \
-  --host-id ss-n1 \
-  --service-name fss-backend
-
-# вручную
-flat_check --config /etc/flat/flat_check.conf --json --push
-```
-
-| Возможность | Как |
-|-------------|-----|
-| Несколько URL | `PUSH_URLS=url1,url2` |
-| HTTP и HTTPS | любой `http://` / `https://` |
-| Токен | `PUSH_TOKEN` + заголовок `Authorization: Bearer` (настраивается) |
-| Идентичность | `HOST_ID`, `HOST_IP`, `SERVICE_NAME` (`fss-backend`, `fps-backend`, …) |
-
-Подробно: conf, cron, токен backend, service names — в [`agent/`](agent/).
-
----
-
-## Режимы
-
-### `flat_check.sh` (health + JSON)
-
-| Запуск | Что делает |
-|--------|------------|
-| без аргументов | health: System + установленные пакеты |
-| `-i` / `--info` | подробно по **всем** пакетам |
-| `-r` / `--repo` | + репозитории |
-| `--pkg NAME` | один пакет (текст) |
-| `--product NAME` | фильтр продукта |
-| `--json` | снимок JSON v2 → stdout |
-| `--push` | POST JSON на все `PUSH_URLS` |
-| `--config FILE` | конфиг агента |
-| `--host-id` / `--host-ip` / `--service-name` | идентичность |
-| `--selftest simple` | быстрый самотест (в т.ч. JSON) |
-| `--dev` | полный VERBOSE health |
-
-### `flat_check_2.sh` (health + JSON + логи)
-
-| Запуск | Что делает |
-|--------|------------|
-| без аргументов / `--json` / `--push` | как `flat_check.sh` |
-| `-i` | интерактивный мастер |
-| `-log -on` / `-log -off` | сбор логов |
-| `--selftest` / `--dev` | самотест (health + log-path) |
-
----
-
-## Health check (общий для обоих)
+## Health check
 
 ```bash
 ./flat_check.sh
 ./flat_check.sh -r
-./flat_check_2.sh                 # тот же health-путь
+./flat_check_2.sh     # тот же путь проверки
 ```
 
-### Порядок вывода (текст)
+Порядок вывода:
 
 ```text
 [INFO]  OS: ...
+[INFO]  Package manager: ...
+
 === System ===
 === SoftSwitch ===
 =fss-server=
+...
 === Infrastructure ===
 === Summary ===
 ```
 
-Блок `=== System ===` нужен для дашборда Flat Partner (страница «Система»).
-
-| Ключ | Содержание |
-|------|------------|
+| Блок System | Содержание |
+|-------------|------------|
 | `cpu` / `cpu top` | общая загрузка и % по службам FLAT |
 | `memory` / `memory top` | RAM и % по службам |
 | `disk` | разделы |
-| `database` / `cluster_db` | PostgreSQL/MariaDB, репликация |
-| `network` | rx/tx МБ/с |
-| `cert` | срок сертификатов; `<30` → `[WARN]` |
-| `uptime` | система + службы |
+| `database` / `cluster_db` | PostgreSQL/MariaDB, роль, репликация |
+| `network` | rx/tx МБ/с по интерфейсам |
+| `cert` | срок сертификатов; &lt;30 дней → `[WARN]` |
+| `uptime` | система и systemd-службы |
 
-Метаданные `PKG_*`, `detect_os`, `check_system`, `run_product_checks`, `check_infrastructure`, resource-gate и **JSON-блок** в обоих скриптах совпадают.
+Метки: `[OK]` норма, `[WARN]` обратить внимание, `[FAIL]` проблема, `[INFO]` справка.
+
+### Основные флаги health
+
+| Флаг | Описание |
+|------|----------|
+| `-i` / `--info` | только `flat_check.sh`: все пакеты, включая не установленные |
+| `-r` / `--repo` | показать репозитории |
+| `-j` / `--jobs N` | лимит параллельных воркеров |
+| `--pkg NAME` | один пакет |
+| `--product NAME` | один продукт |
+| `--selftest simple\|extended` | самотест |
+| `--dev` | = `--selftest extended` |
+| `-v` / `--version` | версия |
+
+Дополнительно оба скрипта понимают `--json` / `--push` / `--config` для выгрузки снимка (см. [`agent/`](agent/)).
 
 ---
 
-## Сбор логов (только `flat_check_2.sh`)
+## Сбор логов (`flat_check_2.sh`)
 
-### Online / offline
-
-| | Online `-log -on` | Offline `-log -off` |
-|--|-------------------|---------------------|
-| Когда | проблема «сейчас» | разбор за прошлый интервал |
-| Что | только новые строки после старта | строки по timestamp в файле |
-| tcpdump | по умолчанию (только `--scope extended`) | нет |
-
-### Выбор цели и объём
+| Режим | Когда | Что снимает |
+|-------|-------|-------------|
+| `-log -on` | проблема «сейчас» | новые строки после старта (`tail -F`), tcpdump при `--scope extended` |
+| `-log -off` | разбор прошлого интервала | строки по timestamp внутри файла |
 
 ```bash
 ./flat_check_2.sh -log --list-targets
@@ -170,17 +117,22 @@ flat_check --config /etc/flat/flat_check.conf --json --push
 | Флаг | Смысл |
 |------|--------|
 | `--scope brief` | только логи выбранных служб (по умолчанию) |
-| `--scope extended` | + system/nginx/postgresql/configs (+ tcpdump online) |
-| `-p` / `--product` | продукт для **логов** (при `-log`) |
+| `--scope extended` | + system / nginx / postgresql / configs (+ tcpdump online) |
+| `-p` / `--product` | продукт (в режиме `-log`) |
 | `-s` / `--service` | пакет/служба |
-| `--mgcpclient` / `--no-mgcpclient` | SoftSwitch: `mgcpclient*` |
-| `-j N` | offline / health: макс. воркеров |
+| `--mgcpclient` / `--no-mgcpclient` | SoftSwitch: включать ли `mgcpclient*` |
+| `-j N` | число offline-воркеров |
 | `--chunk-mode size\|lines` | нарезка крупных логов |
-| `--chunk-size` / `--chunk-lines` | лимиты частей |
+| `--chunk-size` / `--chunk-lines` | лимит части |
+| `-o` / `--output DIR` | каталог архива |
 
-**Host-wide 80% (Zabbix):** лишние воркеры не добавляются при CPU/RAM ≥ 80%; минимум 1 воркер всегда разрешён.
+Без `-p`/`-s` собираются пакеты, присутствующие на хосте. Каталоги вне allowlist пропускаются (`[INFO] skip unknown`).
 
-### Offline примеры
+Нагрузка хоста: новые воркеры не стартуют, если CPU или RAM системы уже ≥ 80%; минимум один воркер всегда разрешён.
+
+### Offline: фильтр по времени
+
+Диапазон режет **строки** по метке времени в файле, не по mtime.
 
 ```bash
 ./flat_check_2.sh -log -off -t 15m
@@ -189,7 +141,36 @@ flat_check --config /etc/flat/flat_check.conf --json --push
 ./flat_check_2.sh -log -off -t 1d --chunk-mode size --chunk-size 50M
 ```
 
-Архив: `YYYY.MM.DD_HH-MM_<hostname>.tar.gz`
+| Размер plain-файла | Стратегия |
+|--------------------|-----------|
+| &lt; 1MB | один поток `awk` |
+| ≥ 1MB, упорядочен | bisect границ + параллельный scan окна |
+| ≥ 1GB | то же, чанки крупнее |
+| ≥ 1MB, не упорядочен | параллельный scan всего файла |
+| `.gz` | `zcat \| awk` |
+
+Архив: `YYYY.MM.DD_HH-MM_<hostname>.tar.gz`.
+
+### Сигналы (сбор логов)
+
+| Действие | Поведение |
+|----------|-----------|
+| Enter (online) | останов → архив |
+| `-t` / TERM | graceful → архив |
+| Ctrl+C (INT) | abort, без архива |
+
+Рабочие каталоги удаляются только по шаблону `YYYY.MM.DD_HH-MM_*` внутри каталога вывода.
+
+---
+
+## Лог сессии
+
+| Скрипт | Файл | Куда |
+|--------|------|------|
+| `flat_check.sh` | `flat_check.log` | рядом со скриптом, перезаписывается |
+| `flat_check_2.sh` | `flat_check_2.log` | рядом со скриптом; при `-log` — в архив |
+
+На экран это не влияет: `[OK]`/`[WARN]`/`[FAIL]`/`[INFO]` дублируются с timestamp; подробности поиска логов — только в файл.
 
 ---
 
@@ -197,27 +178,25 @@ flat_check --config /etc/flat/flat_check.conf --json --push
 
 Обязательно: `bash`, coreutils, `awk` (gawk), `grep`.
 
-Для health/JSON: `systemctl`, `dpkg`/`rpm`, `ss`/`netstat`, **`curl`** (API + push), `openssl`, `psql` (по ситуации).
+Health: `systemctl`, `dpkg`/`rpm`, `ss`/`netstat`, `curl`, `openssl`, при необходимости `psql` / `top` / `free` / `df`.
 
-Для сбора логов (`_2`): ещё `tail`, `gzip`/`pigz`, опционально `tcpdump`, `zcat`.
+Сбор логов (`_2`): `tail`, `gzip` или `pigz`; опционально `tcpdump`, `zcat`.
 
 ---
 
-## Cron
+## Cron (текстовый health)
 
 ```bash
-# текстовый health
-0 6 * * * /usr/local/bin/flat_check >> /var/log/flat/health_check.log 2>&1
-
-# JSON → Partner (ставит install_flat_check.sh)
-*/5 * * * * root /usr/local/bin/flat_check --config /etc/flat/flat_check.conf --json --push >>/var/log/flat/flat_check_push.log 2>&1
+0 6 * * * /opt/flat/scripts/flat_check.sh >> /var/log/flat/health_check.log 2>&1
 ```
+
+Для JSON-отправки в Partner см. [`agent/`](agent/).
 
 ---
 
-## Добавить пакет в health check
+## Добавить пакет
 
-Правьте **оба** файла одинаково:
+Правки вносятся в **оба** скрипта одинаково:
 
 ```bash
 PKG_PRODUCT["my-pkg"]="Product Name"
@@ -227,29 +206,13 @@ PKG_API["my-pkg"]="/api/health"
 PKG_DEPS["my-pkg"]="nginx,postgresql"
 ```
 
-JSON/push-блок: `agent/json_report.inc.sh` → оба скрипта.
-
 ---
 
-## Устройство
+## Структура кода
 
 | Блок | `flat_check.sh` | `flat_check_2.sh` |
 |------|-----------------|-------------------|
-| 0–5 | флаги, `PKG_*`, System, пакеты, infra | то же (1к1) |
-| JSON agent | `--json` / `--push` / conf | то же (1к1) |
-| 6–10 | — | discovery и сбор логов |
-| 9 resource-gate | параллельный опрос пакетов | то же + воркеры сбора |
-| 11 | help / argv / main / selftest | wizard + log CLI + main |
-
----
-
-## Связанные файлы
-
-| Файл | Заметка |
-|------|---------|
-| `flat_check.sh` | health + JSON agent (**3.7.0**) |
-| `flat_check_2.sh` | health/JSON + log collector (**3.7.0**) |
-| `agent/` | установщик, conf, cron, README |
-| `examples/` | старые черновики → см. `agent/` |
-| `CONTEXT.md` | handoff-контекст для ИИ (что сделано / паритет / контракт) |
-| `README.md` | этот файл |
+| 0–5 | флаги, `PKG_*`, System, пакеты, infra | то же |
+| 6–10 | — | поиск и сбор логов |
+| 9 | resource-gate опроса пакетов | то же + воркеры сбора |
+| 11 | help / argv / main / selftest | мастер + log CLI + main |
