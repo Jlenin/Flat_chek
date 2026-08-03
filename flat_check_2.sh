@@ -49,7 +49,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.8.0"
+SCRIPT_VERSION="3.9.0"
 
 set -uo pipefail
 
@@ -92,9 +92,22 @@ START_TCPDUMP=1
 TIMEOUT_RAW=""
 FROM_TIME=""
 TO_TIME=""
+# CLI: порядок/контекст -t (last-N) vs -f/-t (from/to)
+CLI_TIMEOUT_SET=0
+CLI_FROM_SET=0
+CLI_TO_SET=0
+CLI_T_AS_TO=0
+CLI_TIMEOUT_BEFORE_FROM=0
+# Мастер: n/нет/none на шаге выбора → не собирать логи
+WIZARD_SKIP_LOG=0
 OUTPUT_DIR=""
 # Выбор логов: brief = только логи приложений; extended = + system/nginx/pg/конфиги (+ tcpdump online)
 LOG_SCOPE="brief"
+# Грубый day-отсев архивов: ±1 календарный день (NYE / TZ), чтобы не выкинуть
+# инцидент «ночь 31.12 → 01.01» при поиске «за 1 января».
+LOG_RANGE_DAY_MARGIN_SEC=$((24 * 3600))
+# Макс. число дней для zgrep-паттернов по календарным датам в диапазоне
+LOG_ZGREP_MAX_DAYS=32
 SELECTED_PRODUCTS=()   # имена продуктов из -p / мастера
 SELECTED_SERVICES=()   # имена пакетов из -s / мастера
 SELECTED_PKGS=()       # итоговый список пакетов для сбора
@@ -915,16 +928,16 @@ _l() {
                 wiz_scope_prompt)  echo "Ваш выбор [1-2]: " ;;
                 wiz_title_products) echo "=== Продукты ===" ;;
                 wiz_products_all)  echo "  a — Все установленные" ;;
-                wiz_products_prompt) echo -n "Номера через запятую/пробел или a: " ;;
+                wiz_products_prompt) echo -n "Номера через запятую/пробел, a=все, n=отмена: " ;;
                 wiz_refine_services) echo -n "Уточнить службы? (y/n, Enter=n): " ;;
                 wiz_title_services) echo "=== Службы ===" ;;
                 wiz_services_all)  echo "  a — Все службы выбранных продуктов" ;;
-                wiz_services_prompt) echo -n "Номера через запятую/пробел или a: " ;;
+                wiz_services_prompt) echo -n "Номера через запятую/пробел, a=все, n=отмена: " ;;
                 wiz_refine_log_types) echo -n "Выбрать конкретные логи служб? (y/n, Enter=n): " ;;
                 wiz_title_log_types) echo "=== Типы логов службы ===" ;;
                 wiz_log_types_for) echo "Логи службы" ;;
                 wiz_log_types_all) echo "  a — все найденные типы" ;;
-                wiz_log_types_prompt) echo -n "Номера через запятую/пробел или a: " ;;
+                wiz_log_types_prompt) echo -n "Номера через запятую/пробел, a=все, n=отмена: " ;;
                 wiz_log_types_none) echo "типы логов не найдены — будут собраны все доступные файлы" ;;
                 wiz_preview_log_types) echo "типы логов" ;;
                 wiz_no_targets)    echo "На хосте не найдено известных продуктов/служб" ;;
@@ -1023,16 +1036,16 @@ _l() {
                 wiz_scope_prompt)  echo "Your choice [1-2]: " ;;
                 wiz_title_products) echo "=== Products ===" ;;
                 wiz_products_all)  echo "  a — All present on host" ;;
-                wiz_products_prompt) echo -n "Numbers (comma/space) or a: " ;;
+                wiz_products_prompt) echo -n "Numbers (comma/space), a=all, n=cancel: " ;;
                 wiz_refine_services) echo -n "Refine services? (y/n, Enter=n): " ;;
                 wiz_title_services) echo "=== Services ===" ;;
                 wiz_services_all)  echo "  a — All services of selected products" ;;
-                wiz_services_prompt) echo -n "Numbers (comma/space) or a: " ;;
+                wiz_services_prompt) echo -n "Numbers (comma/space), a=all, n=cancel: " ;;
                 wiz_refine_log_types) echo -n "Select specific service logs? (y/n, Enter=n): " ;;
                 wiz_title_log_types) echo "=== Service log types ===" ;;
                 wiz_log_types_for) echo "Logs for" ;;
                 wiz_log_types_all) echo "  a — all discovered types" ;;
-                wiz_log_types_prompt) echo -n "Numbers (comma/space) or a: " ;;
+                wiz_log_types_prompt) echo -n "Numbers (comma/space), a=all, n=cancel: " ;;
                 wiz_log_types_none) echo "no log types found — all available files will be collected" ;;
                 wiz_preview_log_types) echo "log types" ;;
                 wiz_no_targets)    echo "No known products/services found on this host" ;;
@@ -4806,10 +4819,17 @@ _log_dedupe_files_stream() {
     mapfile -t kept < <(printf '%s\n' "${files[@]}" | _psl_dedupe_archive_copies)
     if [[ "${#kept[@]}" -ne "${#files[@]}" ]]; then
         local -A kept_set=()
+        local skipped=0
         for f in "${kept[@]}"; do kept_set["$f"]=1; done
         for f in "${files[@]}"; do
-            [[ -z "${kept_set[$f]:-}" ]] && log_debug "discarded (archived twin of a live plain file): $f"
+            if [[ -z "${kept_set[$f]:-}" ]]; then
+                skipped=$((skipped + 1))
+                # Консоль — кратко; session-лог — подробно (plain приоритетнее архива)
+                warn "duplicate skipped: $(basename -- "$f") (plain preferred)"
+                _log_line "WARN" "duplicate archive skipped (plain preferred): $f"
+            fi
         done
+        [[ "$skipped" -gt 0 ]] && info "Duplicates: skipped $skipped archive twin(s), kept plain"
     fi
     printf '%s\0' "${kept[@]+"${kept[@]}"}"
 }
@@ -4834,6 +4854,225 @@ _log_file_in_range() {
     [[ "$fstart" -le "$to_epoch" && "$fend" -ge "$from_epoch" ]]
 }
 
+# Midnight epoch YYYY-MM-DD / YYYY_MM_DD / YYYYMMDD / DD.MM.YYYY из имени файла, или "".
+_log_filename_day_epoch() {
+    local base day
+    base=$(basename -- "$1")
+    if [[ "$base" =~ (^|[^0-9])([0-9]{4})[_-]([0-9]{2})[_-]([0-9]{2})([^0-9]|$) ]]; then
+        day="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]}"
+    elif [[ "$base" =~ (^|[^0-9])([0-9]{4})([0-9]{2})([0-9]{2})([^0-9]|$) ]]; then
+        day="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]}"
+    elif [[ "$base" =~ (^|[^0-9])([0-9]{2})\.([0-9]{2})\.([0-9]{4})([^0-9]|$) ]]; then
+        day="${BASH_REMATCH[4]}-${BASH_REMATCH[3]}-${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+    date -d "$day 00:00:00" "+%s" 2>/dev/null
+}
+
+# Грубый отсев: файл 100% вне [from,to] с запасом ±1 календарный день (NYE/TZ).
+# return 0 = точно вне (можно не открывать); 1 = возможно пересекается.
+_log_coarse_definitely_outside() {
+    local file="$1" from_epoch="$2" to_epoch="$3"
+    local margin="${LOG_RANGE_DAY_MARGIN_SEC:-86400}"
+    local coarse_from=$((from_epoch - margin)) coarse_to=$((to_epoch + margin))
+    local fstart fend day_ep from_mid to_mid from_day to_day
+
+    if day_ep=$(_log_filename_day_epoch "$file"); then
+        # Сравниваем календарные дни, не wall-clock с margin от 00:30 —
+        # иначе 31.12 00:00 ошибочно < (01.01 00:30 − 1d).
+        from_mid=$(date -d "$(date -d "@$from_epoch" "+%Y-%m-%d") 00:00:00" "+%s" 2>/dev/null) || from_mid=$from_epoch
+        to_mid=$(date -d "$(date -d "@$to_epoch" "+%Y-%m-%d") 00:00:00" "+%s" 2>/dev/null) || to_mid=$to_epoch
+        from_day=$((from_mid - margin))
+        to_day=$((to_mid + margin))
+        if [[ "$day_ep" -lt "$from_day" || "$day_ep" -gt "$to_day" ]]; then
+            return 0
+        fi
+        return 1
+    fi
+
+    read -r fstart fend < <(_psl_file_time_span "$file")
+    [[ "$fstart" =~ ^[0-9]+$ && "$fend" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$fend" -lt "$coarse_from" || "$fstart" -gt "$coarse_to" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Паттерн дат DD.MM.YYYY|YYYY-MM-DD на каждый день [from-margin .. to+margin], ≤ LOG_ZGREP_MAX_DAYS.
+_log_day_grep_pattern() {
+    local from_epoch="$1" to_epoch="$2"
+    local margin="${LOG_RANGE_DAY_MARGIN_SEC:-86400}"
+    local maxd="${LOG_ZGREP_MAX_DAYS:-32}"
+    local cur end pat d1 d2 day n=0
+    day=$(date -d "@$((from_epoch - margin))" "+%Y-%m-%d" 2>/dev/null) || return 1
+    cur=$(date -d "$day 00:00:00" "+%s" 2>/dev/null) || return 1
+    day=$(date -d "@$((to_epoch + margin))" "+%Y-%m-%d" 2>/dev/null) || return 1
+    end=$(date -d "$day 23:59:59" "+%s" 2>/dev/null) || return 1
+    pat=""
+    while [[ "$cur" -le "$end" && "$n" -lt "$maxd" ]]; do
+        d1=$(date -d "@$cur" "+%d.%m.%Y" 2>/dev/null) || break
+        d2=$(date -d "@$cur" "+%Y-%m-%d" 2>/dev/null) || break
+        [[ -n "$pat" ]] && pat="${pat}|"
+        pat="${pat}${d1}|${d2}"
+        n=$((n + 1))
+        cur=$((cur + 86400))
+    done
+    [[ -n "$pat" ]] || return 1
+    printf '%s' "$pat"
+}
+
+_log_is_compressed_log() {
+    case "$1" in
+        *.gz|*.bz2|*.xz|*.tgz|*.tar.gz) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Поток распаковки архива в stdout. return 1 если формат/утилита недоступны.
+_log_stream_decompress() {
+    local file="$1"
+    case "$file" in
+        *.tar.gz|*.tgz)
+            command -v tar >/dev/null 2>&1 || return 1
+            tar -xOzf "$file" 2>/dev/null
+            ;;
+        *.gz)
+            if command -v gzip >/dev/null 2>&1; then gzip -dc -- "$file" 2>/dev/null
+            elif command -v zcat >/dev/null 2>&1; then zcat -- "$file" 2>/dev/null
+            else return 1
+            fi
+            ;;
+        *.bz2)
+            if command -v bunzip2 >/dev/null 2>&1; then bunzip2 -c -- "$file" 2>/dev/null
+            elif command -v bzcat >/dev/null 2>&1; then bzcat -- "$file" 2>/dev/null
+            else return 1
+            fi
+            ;;
+        *.xz)
+            if command -v unxz >/dev/null 2>&1; then unxz -c -- "$file" 2>/dev/null
+            elif command -v xzcat >/dev/null 2>&1; then xzcat -- "$file" 2>/dev/null
+            else return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# zgrep/аналог: есть ли в архиве хотя бы одна из календарных дат диапазона (−m 1).
+# 0 = hit; 1 = miss; 2 = инструмент недоступен (не считать miss).
+_log_archive_zgrep_day_hit() {
+    local file="$1" from_epoch="$2" to_epoch="$3"
+    local pat
+    pat=$(_log_day_grep_pattern "$from_epoch" "$to_epoch") || return 2
+    case "$file" in
+        *.gz)
+            if command -v zgrep >/dev/null 2>&1; then
+                zgrep -m 1 -E -- "$pat" "$file" >/dev/null 2>&1 && return 0
+                return 1
+            fi
+            ;;
+        *.bz2)
+            if command -v bzgrep >/dev/null 2>&1; then
+                bzgrep -m 1 -E -- "$pat" "$file" >/dev/null 2>&1 && return 0
+                return 1
+            fi
+            ;;
+        *.xz)
+            if command -v xzgrep >/dev/null 2>&1; then
+                xzgrep -m 1 -E -- "$pat" "$file" >/dev/null 2>&1 && return 0
+                return 1
+            fi
+            ;;
+    esac
+    if _log_stream_decompress "$file" | grep -m 1 -E -- "$pat" >/dev/null 2>&1; then
+        return 0
+    fi
+    # Если даже поток не открылся — не отвергаем здесь
+    _log_stream_decompress "$file" >/dev/null 2>&1 || return 2
+    return 1
+}
+
+# 12-точечная проба epoch по потоку (начало, конец, 10 пропорциональных).
+# return 0 = пересечение с [from,to] вероятно/точно; 1 = нет.
+_log_archive_probe_overlap() {
+    local file="$1" from_epoch="$2" to_epoch="$3"
+    local usize=0
+    case "$file" in
+        *.gz) usize=$(gzip -l -- "$file" 2>/dev/null | awk 'NR==2 {print $2; exit}') ;;
+    esac
+    [[ "$usize" =~ ^[0-9]+$ ]] || usize=0
+    _log_stream_decompress "$file" 2>/dev/null | tr -d '\0' | LC_ALL=C awk \
+        -v from="$from_epoch" -v to="$to_epoch" -v usize="$usize" \
+        -v ref_midnight=0 \
+        "${_AWK_LINE_EPOCH}
+        BEGIN {
+            nprobe = 12
+            for (i = 0; i < nprobe; i++) probe_at[i] = -1
+            bytes = 0; have = 0; hit = 0
+            first = 0; last = 0
+            next_i = 0
+            if (usize > 0) step = usize / (nprobe - 1)
+            else step = 0
+        }
+        {
+            bytes += length(\$0) + 1
+            ep = line_epoch(\$0)
+            if (ep >= 0) {
+                if (!have) { first = ep; have = 1 }
+                last = ep
+                if (ep >= from && ep <= to) { hit = 1; exit }
+            }
+            if (step > 0) {
+                while (next_i < nprobe && bytes >= next_i * step) {
+                    if (ep >= 0) probe_at[next_i] = ep
+                    else if (have) probe_at[next_i] = last
+                    next_i++
+                }
+            }
+        }
+        END {
+            if (hit) exit 0
+            if (have && first <= to && last >= from) exit 0
+            for (i = 0; i < nprobe; i++) {
+                if (probe_at[i] >= from && probe_at[i] <= to) exit 0
+            }
+            if (!have) exit 0
+            exit 1
+        }"
+}
+
+# Стоит ли открывать файл для offline-диапазона (дешёвые проверки → zgrep → 12 точек).
+_log_should_process_for_range() {
+    local file="$1" from_epoch="$2" to_epoch="$3"
+    [[ -n "$from_epoch" || -n "$to_epoch" ]] || return 0
+    from_epoch="${from_epoch:-0}"
+    to_epoch="${to_epoch:-9999999999}"
+
+    if _log_coarse_definitely_outside "$file" "$from_epoch" "$to_epoch"; then
+        log_debug "discarded (coarse day/mtime outside range±1d): $file"
+        return 1
+    fi
+
+    if _log_is_compressed_log "$file"; then
+        local zg=0
+        _log_archive_zgrep_day_hit "$file" "$from_epoch" "$to_epoch"
+        zg=$?
+        if [[ "$zg" -eq 0 ]]; then
+            return 0
+        fi
+        # miss или нет *grep — уточняем 12 точками (HH:MM:SS-only и т.п.)
+        if _log_archive_probe_overlap "$file" "$from_epoch" "$to_epoch"; then
+            return 0
+        fi
+        log_debug "discarded (archive probe/zgrep: no overlap): $file"
+        return 1
+    fi
+
+    # plain: прежняя mtime/ctime эвристика
+    _log_file_in_range "$file" "$from_epoch" "$to_epoch"
+}
+
 # Extracts (or, with no time range, plain-copies) one file into its log-
 # type group accumulator under $work_dir/groups/ — the very accumulator
 # parce_service_logs() itself writes to, so _psl_finalize_groups() can
@@ -4849,13 +5088,33 @@ _log_file_in_range() {
 _log_extract_one_file() {
     local file="$1" from_epoch="$2" to_epoch="$3" work_dir="$4"
     local plain is_scratch=0 group group_file rc=1
-
-    plain=$(_psl_materialize_plain "$file" "$work_dir") || return 1
-    [[ "$plain" != "$file" ]] && is_scratch=1
+    local before_sz=0 after_sz=0
 
     group=$(_psl_log_group_key "$file")
     group_file="$work_dir/groups/${group}.log"
     mkdir -p "$work_dir/groups" 2>/dev/null
+
+    # Сжатые + задан диапазон: один поток decompress|awk без temp plain
+    if [[ -n "$from_epoch" || -n "$to_epoch" ]] && _log_is_compressed_log "$file"; then
+        [[ -n "$from_epoch" && -z "$to_epoch" ]] && to_epoch=$(date +%s)
+        [[ -z "$from_epoch" && -n "$to_epoch" ]] && from_epoch=0
+        before_sz=0
+        [[ -f "$group_file" ]] && before_sz=$(_file_size_bytes "$group_file")
+        _LOG_REF_MIDNIGHT_EPOCH=$(_infer_file_midnight_epoch "$file")
+        _log_stream_decompress "$file" 2>/dev/null \
+            | tr -d '\0' \
+            | LC_ALL=C awk -v from="$from_epoch" -v to="$to_epoch" \
+                -v ref_midnight="${_LOG_REF_MIDNIGHT_EPOCH:-0}" \
+                "$(_awk_filter_range_prog 0)" \
+            >> "$group_file" 2>/dev/null || true
+        after_sz=0
+        [[ -f "$group_file" ]] && after_sz=$(_file_size_bytes "$group_file")
+        [[ "$after_sz" -gt "$before_sz" ]] && return 0
+        return 1
+    fi
+
+    plain=$(_psl_materialize_plain "$file" "$work_dir") || return 1
+    [[ "$plain" != "$file" ]] && is_scratch=1
 
     if [[ -z "$from_epoch" && -z "$to_epoch" ]]; then
         cat "$plain" >> "$group_file" 2>/dev/null && rc=0
@@ -4887,8 +5146,7 @@ _log_extract_dir_by_range() {
         _collector_should_stop && { rm -rf -- "$work_dir"; return 130; }
         seen=$((seen + 1))
         if [[ -n "$from_epoch" || -n "$to_epoch" ]]; then
-            if ! _log_file_in_range "$f" "${from_epoch:-0}" "${to_epoch:-9999999999}"; then
-                log_debug "discarded (mtime/ctime span outside requested range): $f"
+            if ! _log_should_process_for_range "$f" "${from_epoch:-0}" "${to_epoch:-9999999999}"; then
                 continue
             fi
         fi
@@ -5229,6 +5487,39 @@ _run_selftest_simple() {
         _selftest_ok "_wizard_pick_from_list accepts 'все' as all"
     else
         _selftest_bad "_wizard_pick_from_list accepts 'все' as all (n=${#_st_dst[@]})"
+    fi
+    _st_dst=()
+    WIZARD_SKIP_LOG=0
+    _wizard_pick_from_list selftest _st_src _st_dst <<<'n'
+    if [[ ${#_st_dst[@]} -eq 0 && "${WIZARD_SKIP_LOG}" -eq 1 ]]; then
+        _selftest_ok "_wizard_pick_from_list n cancels (empty + WIZARD_SKIP_LOG)"
+    else
+        _selftest_bad "_wizard_pick_from_list n cancels (empty + WIZARD_SKIP_LOG)"
+    fi
+    WIZARD_SKIP_LOG=0
+
+    # from > to → код 2
+    local _obr=0
+    _offline_resolve_time_bounds '03.08.2026 12:09' '14.07.2026 12:14' '' >/dev/null 2>&1 || _obr=$?
+    if [[ "$_obr" -eq 2 ]]; then
+        _selftest_ok "_offline_resolve_time_bounds rejects from>to (rc=2)"
+    else
+        _selftest_bad "_offline_resolve_time_bounds rejects from>to (rc=$_obr)"
+    fi
+
+    # NYE: день 31.12 не отсекается при поиске 01.01 с margin 1d
+    local nye_from nye_to
+    nye_from=$(date -d '2026-01-01 00:30:00' '+%s')
+    nye_to=$(date -d '2026-01-01 12:00:00' '+%s')
+    if ! _log_coarse_definitely_outside 'clustermonitorlog.txt-20251231.gz' "$nye_from" "$nye_to"; then
+        _selftest_ok "_log_coarse_definitely_outside keeps NYE neighbor day (31.12 vs 01.01)"
+    else
+        _selftest_bad "_log_coarse_definitely_outside keeps NYE neighbor day (31.12 vs 01.01)"
+    fi
+    if _log_coarse_definitely_outside 'clustermonitorlog.txt-20250601.gz' "$nye_from" "$nye_to"; then
+        _selftest_ok "_log_coarse_definitely_outside drops far day (01.06 vs 01.01)"
+    else
+        _selftest_bad "_log_coarse_definitely_outside drops far day (01.06 vs 01.01)"
     fi
 
     # discover_log_dirs_for_selected должен заполнять LOG_DIR_OWNER в ТЕКУЩЕМ
@@ -5605,7 +5896,34 @@ _offline_resolve_time_bounds() {
     if [[ -n "$from_time" && -z "$to_time" ]]; then
         to_time=$(date "+%Y-%m-%d %H:%M:%S")
     fi
+    # from > to — явная ошибка (раньше тихо давало пустую выборку)
+    if [[ -n "$from_time" && -n "$to_time" ]]; then
+        local fe te
+        fe=$(date -d "$from_time" "+%s" 2>/dev/null) || return 1
+        te=$(date -d "$to_time" "+%s" 2>/dev/null) || return 1
+        if [[ "$fe" -gt "$te" ]]; then
+            return 2
+        fi
+    fi
     printf '%s\n%s\n' "$from_time" "$to_time"
+}
+
+# Проверка комбинации CLI -t/-f/-e после parse_args (до сбора).
+_validate_time_cli_combo() {
+    local rc=0
+    if [[ "${CLI_TIMEOUT_BEFORE_FROM:-0}" -eq 1 && "${CLI_FROM_SET:-0}" -eq 1 ]]; then
+        die "Invalid flag order: -t before -f. Use -f … -t … (range end) or -t alone (last N / timeout)."
+    fi
+    if [[ "${CLI_TIMEOUT_SET:-0}" -eq 1 && "${CLI_FROM_SET:-0}" -eq 1 && "${CLI_T_AS_TO:-0}" -eq 0 ]]; then
+        die "Cannot combine -t (last N) with -f/--from. Use -f … -t … or -f … -e … for a range."
+    fi
+    # from>to ловим до discover пакетов (понятная ошибка сразу)
+    if [[ -n "${FROM_TIME:-}" && -n "${TO_TIME:-}" ]]; then
+        _offline_resolve_time_bounds "$FROM_TIME" "$TO_TIME" "" >/dev/null 2>&1 || rc=$?
+        if [[ "$rc" -eq 2 ]]; then
+            die "Invalid time range: from is after to (from='${FROM_TIME}' to='${TO_TIME}'). Swap -f/--from and -e/--to (or -t as end)."
+        fi
+    fi
 }
 
 # --- 9. Процессы сборщика / сигналы / безопасное удаление -----------------------
@@ -6533,8 +6851,11 @@ _run_offline_collection() {
     log_debug "resources at start: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
 
     # Разбор from/to для offline-сбора по диапазону (см. _offline_resolve_time_bounds)
-    local bounds_out
-    if ! bounds_out=$(_offline_resolve_time_bounds "$FROM_TIME" "$TO_TIME" "$timeout_raw"); then
+    local bounds_out bounds_rc=0
+    bounds_out=$(_offline_resolve_time_bounds "$FROM_TIME" "$TO_TIME" "$timeout_raw") || bounds_rc=$?
+    if [[ "$bounds_rc" -eq 2 ]]; then
+        die "Invalid time range: from is after to (from='${FROM_TIME:-}' to='${TO_TIME:-}'). Swap -f/--from and -e/--to (or -t as end)."
+    elif [[ "$bounds_rc" -ne 0 ]]; then
         die "Invalid --from/--to: from='${FROM_TIME:-}' to='${TO_TIME:-}'"
     fi
     from_time=$(printf '%s\n' "$bounds_out" | sed -n '1p')
@@ -6724,6 +7045,11 @@ _wizard_pick_from_list() {
         a|A|а|А|all|ALL|All|все|ВСЕ|Все)
             _wpfl_dst=("${_wpfl_src[@]}")
             ;;
+        n|N|нет|НЕТ|Нет|none|NONE|None)
+            # Явная отмена сбора логов (не fallback на «все»)
+            _wpfl_dst=()
+            WIZARD_SKIP_LOG=1
+            ;;
         *)
             # Запятые и пробелы — равноправные разделители ("1,3" и "1 3")
             normalized="${choice//,/ }"
@@ -6740,7 +7066,7 @@ _wizard_pick_from_list() {
             [[ ${#_wpfl_dst[@]} -eq 0 ]] && _wpfl_dst=("${_wpfl_src[@]}")
             ;;
     esac
-    log_debug "wizard: $label choice='$choice' -> selected: ${_wpfl_dst[*]+"${_wpfl_dst[*]}"}"
+    log_debug "wizard: $label choice='$choice' -> selected: ${_wpfl_dst[*]+"${_wpfl_dst[*]}"} skip=${WIZARD_SKIP_LOG:-0}"
 }
 
 _wizard_select_log_targets() {
@@ -6779,6 +7105,10 @@ _wizard_select_log_targets() {
     echo "$(_l wiz_products_all)"
     echo -n "$(_l wiz_products_prompt)"
     _wizard_pick_from_list product prods SELECTED_PRODUCTS
+    if [[ "${WIZARD_SKIP_LOG:-0}" -eq 1 ]]; then
+        warn "Log collection cancelled (n)."
+        return 0
+    fi
 
     # Опциональное уточнение по службам: предлагаем всегда, если выбран хоть один продукт
     echo ""
@@ -6800,6 +7130,10 @@ _wizard_select_log_targets() {
         echo "$(_l wiz_services_all)"
         echo -n "$(_l wiz_services_prompt)"
         _wizard_pick_from_list service svc_list SELECTED_SERVICES
+        if [[ "${WIZARD_SKIP_LOG:-0}" -eq 1 ]]; then
+            warn "Log collection cancelled (n)."
+            return 0
+        fi
         SELECTED_PRODUCTS=()
     fi
 
@@ -6840,6 +7174,10 @@ _wizard_select_log_targets() {
             echo -n "$(_l wiz_log_types_prompt)"
             picked_types=()
             _wizard_pick_from_list "log-type($pkg)" stem_list picked_types
+            if [[ "${WIZARD_SKIP_LOG:-0}" -eq 1 ]]; then
+                warn "Log collection cancelled (n)."
+                return 0
+            fi
             if [[ ${#picked_types[@]} -eq 0 || ${#picked_types[@]} -eq ${#stem_list[@]} ]]; then
                 SELECTED_LOG_TYPES["$pkg"]="*"
             else
@@ -7034,6 +7372,7 @@ _wizard_configure_log_mode() {
     MODE_LOG=1
     MODE_DEV=0
     SELFTEST_MODE=""
+    WIZARD_SKIP_LOG=0
 
     _wizard_step_online_offline
     _wizard_step_scope
@@ -7050,6 +7389,11 @@ _wizard_configure_log_mode() {
     # Выбор продукта / службы
     detect_os
     _wizard_select_log_targets
+    if [[ "${WIZARD_SKIP_LOG:-0}" -eq 1 ]]; then
+        MODE_LOG=0
+        _log_line "INFO" "wizard: сбор логов отменён (n)"
+        return 0
+    fi
     log_debug "wizard: SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]+"${SELECTED_PRODUCTS[*]}"}) SELECTED_SERVICES=(${SELECTED_SERVICES[*]+"${SELECTED_SERVICES[*]}"})"
 
     _wizard_step_output_dir
@@ -7699,11 +8043,12 @@ Modes:
   -log                    Log collector mode
     -on, --online         Real-time capture (tail -F + optional tcpdump)
     -off, --offline       Copy/extract existing logs
-    -t, --timeout DUR     Online: auto-stop after N (e.g. 5h, 30m)
-                          Offline: extract lines from last N (by content timestamp)
+    -t, --timeout DUR     Alone: last N / online timeout (e.g. 5h, 30m).
+                          After -f: range end (alias of -e/--to). Order -t … -f is an error.
     -f, --from TIME       Range start (e.g. -2h, 25.06.2026 10:00)
     -e, --to TIME         Range end (e.g. -1h, 25.06.2026 12:00)
-                          Range: -f -2h -e -1h | -f '25.06.2026 10:00' -e '25.06.2026 12:00'
+    --until TIME          Same as -e/--to
+                          Range: -t 2h | -f -2h -e -1h | -f '…' -t '…' | -f '…' -e '…'
     -n, --no-tcpdump      Skip network capture (online only)
     -j, --jobs N          Offline: parallel file copy workers (default: nproc*80%, max 32)
     --chunk-mode size|lines  Offline: how to split large output logs (default: size)
@@ -7826,10 +8171,12 @@ flat_check_2.sh — проверка FLAT/FCS + сборщик логов
   -log                    Режим сборщика логов
     -on, --online         Сбор в реальном времени (tail -F + опц. tcpdump)
     -off, --offline       Копирование/извлечение готовых логов
-    -t, --timeout ДЛИТ    Online: автостоп через N (например 5h, 30m)
-                          Offline: извлечь строки за последние N (по метке в файле)
+    -t, --timeout ДЛИТ    Одно: last N / online timeout (например 5h, 30m).
+                          После -f: конец диапазона (как -e/--to). Порядок -t … -f — ошибка.
     -f, --from TIME       Начало диапазона (например -2h, 25.06.2026 10:00)
     -e, --to TIME         Конец диапазона (например -1h, 25.06.2026 12:00)
+    --until TIME          То же, что -e/--to
+                          Диапазон: -t 2h | -f -2h -e -1h | -f '…' -t '…' | -f '…' -e '…'
     -n, --no-tcpdump      Не записывать сетевой трафик (только online)
     -j, --jobs N          Offline: число параллельных копий файлов (по умолч. nproc*80%, макс. 32)
     --chunk-mode size|lines  Offline: как резать крупные логи (по умолч. size)
@@ -7964,15 +8311,47 @@ parse_args() {
                 ;;
             -t|--timeout)
                 if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
-                TIMEOUT_RAW="$2"; shift 2
+                # Контекст: если -f уже был — это конец диапазона (alias --to).
+                # Иначе — last-N / online timeout.
+                if [[ "${CLI_FROM_SET:-0}" -eq 1 ]]; then
+                    if [[ "${CLI_TO_SET:-0}" -eq 1 ]]; then
+                        die "Conflicting end time: both -e/--to and -t used as range end"
+                    fi
+                    TO_TIME="$2"
+                    CLI_TO_SET=1
+                    CLI_T_AS_TO=1
+                else
+                    TIMEOUT_RAW="$2"
+                    CLI_TIMEOUT_SET=1
+                fi
+                shift 2
+                ;;
+            --until)
+                if [[ -z "${2:-}" ]]; then die "Missing value for $1"; fi
+                if [[ "${CLI_TO_SET:-0}" -eq 1 ]]; then
+                    die "Conflicting end time: --until with existing -e/-t end"
+                fi
+                TO_TIME="$2"
+                CLI_TO_SET=1
+                shift 2
                 ;;
             -f|--from)
                 if [[ -z "${2:-}" ]]; then die "Missing value for $1"; fi
-                FROM_TIME="$2"; shift 2
+                if [[ "${CLI_TIMEOUT_SET:-0}" -eq 1 && "${CLI_T_AS_TO:-0}" -eq 0 ]]; then
+                    CLI_TIMEOUT_BEFORE_FROM=1
+                fi
+                FROM_TIME="$2"
+                CLI_FROM_SET=1
+                shift 2
                 ;;
             -e|--to)
                 if [[ -z "${2:-}" ]]; then die "Missing value for $1"; fi
-                TO_TIME="$2"; shift 2
+                if [[ "${CLI_TO_SET:-0}" -eq 1 ]]; then
+                    die "Conflicting end time: -e/--to with existing -t/--until end"
+                fi
+                TO_TIME="$2"
+                CLI_TO_SET=1
+                shift 2
                 ;;
             -n|--no-tcpdump)
                 START_TCPDUMP=0; shift
@@ -8104,6 +8483,7 @@ main() {
 
     # -log: только сбор логов
     if [[ $MODE_LOG -eq 1 ]]; then
+        _validate_time_cli_combo
         run_log_collection "$LOG_SUBMODE" "$TIMEOUT_RAW"
         [[ $SHOW_REPO -eq 1 ]] && { detect_os; check_repositories; }
         exit 0

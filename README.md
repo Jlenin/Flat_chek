@@ -5,7 +5,7 @@
 | Скрипт | Назначение | Версия |
 |--------|------------|--------|
 | `flat_check.sh` | health check | 3.7.1 |
-| `flat_check_2.sh` | тот же health check + сбор логов | 3.8.0 |
+| `flat_check_2.sh` | тот же health check + сбор логов | 3.9.0 |
 
 Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
 Для полного сбора логов в `_2` обычно нужен root или sudo.
@@ -139,6 +139,8 @@ chmod +x flat_check.sh flat_check_2.sh
 ./flat_check_2.sh -log -off -t 15m
 ./flat_check_2.sh -log -off -f -2h -e -1h
 ./flat_check_2.sh -log -off -f '14.07.2026 10:00' -e '14.07.2026 14:00'
+./flat_check_2.sh -log -off -f '14.07.2026 10:00' -t '14.07.2026 14:00'  # -t после -f = to
+# -t 2h без -f = за последние 2ч; порядок -t … -f — ошибка; from>to — ошибка
 ./flat_check_2.sh -log -off -t 1d --chunk-mode size --chunk-size 50M
 ```
 
