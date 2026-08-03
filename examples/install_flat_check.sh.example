@@ -1,7 +1,6 @@
 #!/bin/bash
-# Скелет установщика агента flat_check на ноде продукта.
-# НЕ production-ready: без set -e в критичных местах, без rpm/deb.
-# Цель — показать шаги: бинарь → conf → cron → проверка push.
+# Скелет установщика агента flat_check на ноде.
+# Шаги: бинарь → conf (HOST_ID/HOST_IP/SERVICE_NAME + PUSH_URLS) → cron → проверка.
 
 set -uo pipefail
 
@@ -13,46 +12,49 @@ CONF_FILE="${CONF_FILE:-$CONF_DIR/flat_check.conf}"
 LOG_DIR="${LOG_DIR:-/var/log/flat}"
 CRON_FILE="${CRON_FILE:-/etc/cron.d/flat-check}"
 
-PUSH_URL="${PUSH_URL:-}"
+# Можно передать при установке:
+#   PUSH_URLS="https://partner/.../ingest http://other:8054/.../ingest"
+#   PUSH_TOKEN="..."
+#   HOST_ID="ss-n1" HOST_IP="10.0.1.5" SERVICE_NAME="fss-backend"
+PUSH_URLS="${PUSH_URLS:-}"
 PUSH_TOKEN="${PUSH_TOKEN:-}"
 HOST_ID="${HOST_ID:-$(hostname -s 2>/dev/null || hostname)}"
+HOST_IP="${HOST_IP:-}"
+SERVICE_NAME="${SERVICE_NAME:-}"
 CRON_SPEC="${CRON_SPEC:-*/5 * * * *}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "[INFO] $*"; }
 
+detect_ip() {
+    hostname -I 2>/dev/null | awk '{print $1}'
+}
+
 [[ "$(id -u)" -eq 0 ]] || die "нужен root"
 [[ -f "$SRC_CHECK" ]] || die "не найден $SRC_CHECK"
 
-info "1) установка бинаря → $INSTALL_BIN"
+[[ -n "$HOST_IP" ]] || HOST_IP="$(detect_ip)"
+[[ -n "$HOST_IP" ]] || die "не удалось определить HOST_IP — задайте явно"
+[[ -n "$SERVICE_NAME" ]] || die "задайте SERVICE_NAME (например fss-backend, fps-backend) — см. examples/service_names.example.md"
+
+info "1) бинарь → $INSTALL_BIN"
 install -m 0755 "$SRC_CHECK" "$INSTALL_BIN"
 
-info "2) каталоги $CONF_DIR, $LOG_DIR"
+info "2) каталоги"
 install -d -m 0755 "$CONF_DIR" "$LOG_DIR"
 
 if [[ ! -f "$CONF_FILE" ]]; then
     info "3) создаём $CONF_FILE"
-    if [[ -f "$SCRIPT_DIR/examples/flat_check.conf.example" ]]; then
-        cp "$SCRIPT_DIR/examples/flat_check.conf.example" "$CONF_FILE"
-    else
-        cat > "$CONF_FILE" <<EOF
-PUSH_URL="${PUSH_URL}"
-PUSH_TOKEN="${PUSH_TOKEN}"
-HOST_ID="${HOST_ID}"
-PACKAGES=""
-PUSH_CONNECT_TIMEOUT=5
-PUSH_MAX_TIME=30
-PUSH_RETRIES=2
-EOF
-    fi
-    # подставить значения из env, если передали
-    if [[ -n "$PUSH_URL" ]]; then
-        sed -i "s|^PUSH_URL=.*|PUSH_URL=\"${PUSH_URL}\"|" "$CONF_FILE"
+    cp "$SCRIPT_DIR/examples/flat_check.conf.example" "$CONF_FILE"
+    sed -i "s|^HOST_ID=.*|HOST_ID=\"${HOST_ID}\"|" "$CONF_FILE"
+    sed -i "s|^HOST_IP=.*|HOST_IP=\"${HOST_IP}\"|" "$CONF_FILE"
+    sed -i "s|^SERVICE_NAME=.*|SERVICE_NAME=\"${SERVICE_NAME}\"|" "$CONF_FILE"
+    if [[ -n "$PUSH_URLS" ]]; then
+        sed -i "s|^PUSH_URLS=.*|PUSH_URLS=\"${PUSH_URLS}\"|" "$CONF_FILE"
     fi
     if [[ -n "$PUSH_TOKEN" ]]; then
         sed -i "s|^PUSH_TOKEN=.*|PUSH_TOKEN=\"${PUSH_TOKEN}\"|" "$CONF_FILE"
     fi
-    sed -i "s|^HOST_ID=.*|HOST_ID=\"${HOST_ID}\"|" "$CONF_FILE"
     chmod 0640 "$CONF_FILE"
 else
     info "3) $CONF_FILE уже есть — не трогаем"
@@ -67,15 +69,18 @@ ${CRON_SPEC} root ${INSTALL_BIN} --config ${CONF_FILE} --json --push >>${LOG_DIR
 EOF
 chmod 0644 "$CRON_FILE"
 
-info "5) пробный прогон (human)"
-"$INSTALL_BIN" -v || true
-# Когда появится --json:
-# "$INSTALL_BIN" --config "$CONF_FILE" --json | head -c 200
-
 info "готово."
-info "  бинарь:  $INSTALL_BIN"
-info "  конфиг:  $CONF_FILE"
-info "  cron:    $CRON_FILE"
-info "  лог:     $LOG_DIR/flat_check_push.log"
-info "Дальше: прописать PUSH_URL/PUSH_TOKEN в конфиге и дождаться тика cron,"
-info "либо вручную: $INSTALL_BIN --config $CONF_FILE --json --push"
+cat <<EOF
+  bin:           $INSTALL_BIN
+  conf:          $CONF_FILE
+  host_id:       $HOST_ID
+  host_ip:       $HOST_IP
+  service_name:  $SERVICE_NAME
+  push_urls:     ${PUSH_URLS:-(смотрите conf)}
+  cron:          $CRON_FILE
+  log:           $LOG_DIR/flat_check_push.log
+
+Проверка (когда появятся флаги):
+  $INSTALL_BIN --config $CONF_FILE --json | jq '{host_id,host_ip,service_name,summary}'
+  $INSTALL_BIN --config $CONF_FILE --json --push
+EOF

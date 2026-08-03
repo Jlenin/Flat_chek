@@ -1,0 +1,23 @@
+# Пример строки в конфиге бэкенда продукта (Partner / FPS / …),
+# который ПРИНИМАЕТ push от flat_check.
+#
+# Имя ключа — согласовать с командой продукта; смысл один:
+# общий секрет, которым агент подписывается в заголовке запроса.
+
+# --- YAML (типичный Go/backend) ---------------------------------------------
+flat_check:
+  # токен, который агент кладёт в Authorization: Bearer … или X-Flat-Check-Token
+  token: "CHANGE_ME_FLAT_CHECK_TOKEN"
+  # необязательно: список разрешённых host_id
+  # allowed_host_ids: ["ss-n1", "ss-n2", "db-n1"]
+
+# --- .env -------------------------------------------------------------------
+# FLAT_CHECK_TOKEN=CHANGE_ME_FLAT_CHECK_TOKEN
+
+# --- ini / conf -------------------------------------------------------------
+# [flat_check]
+# token = CHANGE_ME_FLAT_CHECK_TOKEN
+
+# Агент на ноде (симметрично):
+#   PUSH_TOKEN="CHANGE_ME_FLAT_CHECK_TOKEN"
+#   PUSH_URLS="https://this-product/api/v1/health/ingest"

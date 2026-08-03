@@ -1,164 +1,225 @@
 {
-  "timestamp": "2026-08-03T08:15:00Z",
+  "timestamp": "2026-08-03T10:45:00Z",
   "host_id": "ss-n1",
-  "host": "ss-n1.example.local",
-  "addr": "10.0.1.5",
+  "host_ip": "10.0.1.5",
+  "service_name": "fss-backend",
   "script_version": "3.6.2",
-  "summary": {
-    "installed": 3,
-    "warnings": 1,
-    "errors": 0
-  },
-  "system": {
-    "cpu": {
-      "usage_percent": 17
-    },
-    "cpu_services": [
-      { "service_name": "fss-server", "usage_percent": 9 },
-      { "service_name": "fss-srclient", "usage_percent": 2 }
-    ],
-    "memory": {
-      "total_mb": 16014,
-      "used_mb": 4200,
-      "available_mb": 11000
-    },
-    "memory_services": [
-      { "service_name": "fss-server", "usage_percent": 12 },
-      { "service_name": "fss-srclient", "usage_percent": 3 }
-    ],
-    "disk": [
-      {
-        "filesystem": "/dev/root",
-        "mount": "/",
-        "used_percent": 42
-      }
-    ],
-    "network": [
-      {
-        "interface": "eth0",
-        "mbps": "1.20"
-      }
-    ],
-    "uptime_seconds": 864000
-  },
-  "uptime_services": [
-    { "service_name": "fss-server", "uptime": 860000 },
-    { "service_name": "fss-srclient", "uptime": 860000 }
-  ],
-  "certificates": [
-    {
-      "path": "/etc/ssl/certs/flat.pem",
-      "subject": "CN=ss-n1.example.local",
-      "days_left": 120
-    }
-  ],
+  "os": "Debian GNU/Linux 11 (bullseye)",
+  "package_manager": "dpkg",
+
   "products": [
     {
       "name": "SoftSwitch",
       "packages": [
         {
           "name": "fss-server",
-          "status": "ok",
-          "version": "2.14.0-1",
-          "host_id": "ss-n1",
-          "depends_meta": ["mariadb"],
-          "depends_pm": ["mariadb-server"],
+          "status": "installed",
+          "version": "4.3.583.2972~exp.deb11",
+          "depends_meta": ["nginx", "postgresql"],
+          "depends_pm": ["nodejs", "libc6", "libssl1.1"],
           "systemd": {
-            "service_name": "fss-server",
-            "unit_path": "/lib/systemd/system/fss-server.service",
-            "status": "active"
+            "unit_path": "/usr/lib/systemd/system/fss-server.service",
+            "service_name": "fss-server.service",
+            "status": "inactive"
           },
           "directories": [
             {
               "type": "opt",
               "path": "/opt/flat/fss-server",
-              "owner": "flat-service",
+              "owner": "flat-service:flat-group",
               "status": "ok"
             },
             {
               "type": "log",
               "path": "/var/log/flat/fss-server",
-              "owner": "flat-service",
+              "owner": "flat-service:flat-group",
               "status": "ok"
             }
           ],
           "configs": [
             {
-              "service_name": "fss-server",
-              "path": "/opt/flat/fss-server/settings.ini",
-              "status": "ok"
+              "service_name": "nginx",
+              "path": "/etc/nginx/sites-available/fss-server",
+              "status": "enabled"
             }
           ],
           "process": {
             "status": "running",
-            "pids": [14201],
+            "pids": [204824],
             "ps_lines": [
-              "14201 flat-service /opt/flat/fss-server/bin/fss-server"
+              "204824 FlatSoftSwitchS /opt/flat/fss-server/FlatSoftSwitchServer start"
             ]
           },
           "ports": [
-            { "number": "5060", "status": "listening" },
-            { "number": "10000-20000", "status": "configured" }
+            {
+              "number": "8080",
+              "status": "not listening"
+            }
           ],
           "api": {
-            "url": "http://127.0.0.1:8080/api/health",
+            "url": "http://localhost:8080/api/v1/health",
             "status_code": 200,
             "status": "ok"
           }
         },
         {
-          "name": "fss-srclient",
-          "status": "ok",
-          "version": "2.14.0-1",
-          "host_id": "ss-n1",
-          "depends_meta": [],
-          "depends_pm": [],
+          "name": "fss-backend",
+          "status": "installed",
+          "version": "1.4.80-1",
+          "depends_meta": ["nginx"],
+          "depends_pm": ["nginx"],
           "systemd": {
-            "service_name": "fss-srclient",
-            "unit_path": "/lib/systemd/system/fss-srclient.service",
+            "unit_path": "/usr/lib/systemd/system/fss-backend.service",
+            "service_name": "fss-backend.service",
             "status": "active"
           },
           "directories": [
             {
               "type": "opt",
-              "path": "/opt/flat/fss-srclient",
-              "owner": "flat-service",
+              "path": "/opt/flat/fss-backend",
+              "owner": "flat-service:flat-group",
               "status": "ok"
             },
             {
               "type": "log",
-              "path": "/var/log/flat/fss-srclient",
-              "owner": "flat-service",
+              "path": "/var/log/flat/fss-backend",
+              "owner": "flat-service:flat-group",
               "status": "ok"
             }
           ],
-          "configs": [],
+          "configs": [
+            {
+              "service_name": "fss-backend",
+              "path": "/opt/flat/fss-backend/config.yml",
+              "status": "ok"
+            }
+          ],
           "process": {
             "status": "running",
-            "pids": [14310],
+            "pids": [205100],
             "ps_lines": [
-              "14310 flat-service /opt/flat/fss-srclient/bin/srclient"
+              "205100 flat-service /opt/flat/fss-backend/bin/fss-backend"
             ]
           },
-          "ports": [],
+          "ports": [
+            {
+              "number": "8051",
+              "status": "listening"
+            }
+          ],
           "api": {
-            "url": "",
-            "status_code": 0,
-            "status": "n/a"
+            "url": "http://localhost:8051/api/health",
+            "status_code": 200,
+            "status": "ok"
           }
         }
       ]
     }
   ],
+
   "infrastructure": [
     {
-      "service_name": "mariadb",
+      "service_name": "nginx",
       "status": "active",
-      "version": "10.6.16",
-      "port_open": "3306",
-      "required_by": "fss-server",
-      "host_id": "db-n1",
-      "note": "на этой ноде может быть пусто; полный статус пришлёт агент с db-n1"
+      "version": "1.18.0",
+      "port_open": "443",
+      "required_by": "fss-server, fss-backend"
+    },
+    {
+      "service_name": "postgresql",
+      "status": "active",
+      "version": "13.11",
+      "port_open": "5432",
+      "required_by": "fss-server"
+    }
+  ],
+
+  "repositories": [
+    "[apt] deb http://deb.debian.org/debian bullseye main",
+    "[apt] deb http://security.debian.org/debian-security bullseye-security main"
+  ],
+  "apt_priorities": [
+    "1001 Package: *\n     Pin: origin nexus.flat.lab\n     Pin-Priority: 1001"
+  ],
+
+  "summary": {
+    "installed": 7,
+    "errors": 1,
+    "warnings": 3
+  },
+
+  "system": {
+    "cpu": {
+      "usage_percent": 12
+    },
+    "cpu_services": [
+      {
+        "service_name": "fss-csta",
+        "usage_percent": 4
+      },
+      {
+        "service_name": "fss-server",
+        "usage_percent": 8
+      }
+    ],
+    "memory": {
+      "total_mb": 16000,
+      "used_mb": 8000,
+      "available_mb": 7000
+    },
+    "memory_services": [
+      {
+        "service_name": "fss-server",
+        "usage_percent": 12
+      },
+      {
+        "service_name": "fss-backend",
+        "usage_percent": 3
+      }
+    ],
+    "disk": [
+      {
+        "filesystem": "/dev/sda1",
+        "mount": "/",
+        "used_percent": 75
+      },
+      {
+        "filesystem": "/dev/sdb1",
+        "mount": "/var",
+        "used_percent": 60
+      }
+    ],
+    "database": {
+      "name": "postgresql",
+      "status": "active (primary)",
+      "replication": "none",
+      "nodes": 1
+    },
+    "network": [
+      {
+        "interface": "eth0",
+        "mbps": 15.2
+      }
+    ],
+    "uptime_seconds": 123456
+  },
+
+  "certificates": [
+    {
+      "path": "/etc/nginx/ssl/server.crt",
+      "subject": "CN=example.com",
+      "days_left": 120
+    }
+  ],
+
+  "uptime_services": [
+    {
+      "service_name": "fss-server",
+      "uptime": 120000
+    },
+    {
+      "service_name": "fss-backend",
+      "uptime": 119500
     }
   ]
 }

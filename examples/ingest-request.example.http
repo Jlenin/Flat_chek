@@ -1,11 +1,23 @@
-### Пример запроса, который будет слать агент (curl под капотом --push)
-# Backend Partner должен принять и сохранить снимок по host_id,
-# а GET /health — отдавать уже агрегированное представление для UI.
+### Push на несколько приёмников — один и тот же JSON body
+### URL: http:// или https://
 
+### 1) Flat Partner
 POST https://partner.example.local/api/v1/health/ingest
-Authorization: Bearer CHANGE_ME
+Authorization: Bearer CHANGE_ME_FLAT_CHECK_TOKEN
 Content-Type: application/json
 X-Flat-Host-Id: ss-n1
+X-Flat-Service-Name: fss-backend
+
+< ./health-payload.example.json
+
+###
+
+### 2) Другой продукт (например FPS-admin / свой ingest) — HTTP допустим
+POST http://fps-admin.example.local:8054/api/v1/health/ingest
+Authorization: Bearer CHANGE_ME_FLAT_CHECK_TOKEN
+Content-Type: application/json
+X-Flat-Host-Id: ss-n1
+X-Flat-Service-Name: fss-backend
 
 < ./health-payload.example.json
 
@@ -13,4 +25,13 @@ X-Flat-Host-Id: ss-n1
 
 # Ожидаемый ответ (пример)
 # HTTP/1.1 202 Accepted
-# { "status": "accepted", "host_id": "ss-n1", "timestamp": "2026-08-03T08:15:00Z" }
+# {
+#   "status": "accepted",
+#   "host_id": "ss-n1",
+#   "host_ip": "10.0.1.5",
+#   "service_name": "fss-backend",
+#   "timestamp": "2026-08-03T10:45:00Z"
+# }
+#
+# Бэкенд продукта сверяет токен с flat_check.token из своего конфига
+# (см. backend-token.example.yaml).
