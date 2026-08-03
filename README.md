@@ -5,7 +5,7 @@
 | Скрипт | Назначение | Версия |
 |--------|------------|--------|
 | `flat_check.sh` | health check | 3.7.1 |
-| `flat_check_2.sh` | тот же health check + сбор логов | 3.7.1 |
+| `flat_check_2.sh` | тот же health check + сбор логов | 3.8.0 |
 
 Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
 Для полного сбора логов в `_2` обычно нужен root или sudo.
@@ -119,13 +119,15 @@ chmod +x flat_check.sh flat_check_2.sh
 | `--scope extended` | + system / nginx / postgresql / configs (+ tcpdump online) |
 | `-p` / `--product` | продукт (в режиме `-log`) |
 | `-s` / `--service` | пакет/служба |
-| `--mgcpclient` / `--no-mgcpclient` | SoftSwitch: включать ли `mgcpclient*` |
+| `--mgcpclient` / `--no-mgcpclient` | SoftSwitch/`fss-server`: включать ли `mgcpclient*` (вопрос только если выбран `fss-server`) |
 | `-j N` | число offline-воркеров |
 | `--chunk-mode size\|lines` | нарезка крупных логов |
 | `--chunk-size` / `--chunk-lines` | лимит части |
 | `-o` / `--output DIR` | каталог архива |
 
 Без `-p`/`-s` собираются пакеты, присутствующие на хосте. Каталоги вне allowlist пропускаются (`[INFO] skip unknown`).
+
+В мастере (`-i`) после выбора продуктов/служб можно уточнить **типы логов** внутри каталога каждой службы (ротации вроде `sipdump.txt.2.gz` схлопываются в `sipdump`). По умолчанию — все типы. Вопрос про `mgcpclient` — только если выбран `fss-server` и конкретные типы не уточняли.
 
 Нагрузка хоста: новые воркеры не стартуют, если CPU или RAM системы уже ≥ 80%; минимум один воркер всегда разрешён.
 

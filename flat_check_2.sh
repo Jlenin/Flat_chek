@@ -49,7 +49,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.7.1"
+SCRIPT_VERSION="3.8.0"
 
 set -uo pipefail
 
@@ -102,6 +102,12 @@ LIST_TARGETS=0
 # Доп. для SoftSwitch: включать логи mgcpclient (""=спросить, 0=нет, 1=да)
 INCLUDE_MGCPCLIENT=""
 MGCPCLIENT_RESOLVED=0
+# 1 = собирать только выбранные типы логов (стемы) по каждой службе
+LOG_TYPE_FILTER=0
+# pkg → "*" (все типы) или стемы через пробел (abonentsclass, sipdump, mgcpclient, …)
+declare -A SELECTED_LOG_TYPES=()
+# абсолютный каталог логов → владеющий пакет (для фильтра типов)
+declare -A LOG_DIR_OWNER=()
 SKIP_UNKNOWN_FLAT_REPORTED=0
 EXTRA_LOG_DIRS=()      # доп. директории вне списка PKG (например, mgcpclient)
 
@@ -909,16 +915,23 @@ _l() {
                 wiz_scope_prompt)  echo "Ваш выбор [1-2]: " ;;
                 wiz_title_products) echo "=== Продукты ===" ;;
                 wiz_products_all)  echo "  a — Все установленные" ;;
-                wiz_products_prompt) echo -n "Номера через запятую или a: " ;;
+                wiz_products_prompt) echo -n "Номера через запятую/пробел или a: " ;;
                 wiz_refine_services) echo -n "Уточнить службы? (y/n, Enter=n): " ;;
                 wiz_title_services) echo "=== Службы ===" ;;
                 wiz_services_all)  echo "  a — Все службы выбранных продуктов" ;;
-                wiz_services_prompt) echo -n "Номера через запятую или a: " ;;
+                wiz_services_prompt) echo -n "Номера через запятую/пробел или a: " ;;
+                wiz_refine_log_types) echo -n "Выбрать конкретные логи служб? (y/n, Enter=n): " ;;
+                wiz_title_log_types) echo "=== Типы логов службы ===" ;;
+                wiz_log_types_for) echo "Логи службы" ;;
+                wiz_log_types_all) echo "  a — все найденные типы" ;;
+                wiz_log_types_prompt) echo -n "Номера через запятую/пробел или a: " ;;
+                wiz_log_types_none) echo "типы логов не найдены — будут собраны все доступные файлы" ;;
+                wiz_preview_log_types) echo "типы логов" ;;
                 wiz_no_targets)    echo "На хосте не найдено известных продуктов/служб" ;;
                 wiz_preview_pkgs)  echo "Выбрано служб" ;;
                 wiz_preview_dirs)  echo "Лог-директорий к сбору" ;;
-                ask_mgcpclient)    echo -n "SoftSwitch: собирать логи mgcpclient? (y/n): " ;;
-                mgcpclient_default_no) echo "SoftSwitch: mgcpclient пропущен (нет TTY; укажите --mgcpclient или --no-mgcpclient)" ;;
+                ask_mgcpclient)    echo -n "SoftSwitch (fss-server): собирать логи mgcpclient? (y/n, Enter=n): " ;;
+                mgcpclient_default_no) echo "SoftSwitch (fss-server): mgcpclient пропущен (нет TTY; укажите --mgcpclient или --no-mgcpclient)" ;;
                 mgcpclient_not_found) echo "mgcpclient: каталог логов не найден" ;;
                 mgcpclient_include) echo "mgcpclient: добавлено каталогов" ;;
                 mgcpclient_skip)   echo "mgcpclient: пропущен (файлы mgcpclient* и отдельные каталоги)" ;;
@@ -1010,16 +1023,23 @@ _l() {
                 wiz_scope_prompt)  echo "Your choice [1-2]: " ;;
                 wiz_title_products) echo "=== Products ===" ;;
                 wiz_products_all)  echo "  a — All present on host" ;;
-                wiz_products_prompt) echo -n "Numbers comma-separated or a: " ;;
+                wiz_products_prompt) echo -n "Numbers (comma/space) or a: " ;;
                 wiz_refine_services) echo -n "Refine services? (y/n, Enter=n): " ;;
                 wiz_title_services) echo "=== Services ===" ;;
                 wiz_services_all)  echo "  a — All services of selected products" ;;
-                wiz_services_prompt) echo -n "Numbers comma-separated or a: " ;;
+                wiz_services_prompt) echo -n "Numbers (comma/space) or a: " ;;
+                wiz_refine_log_types) echo -n "Select specific service logs? (y/n, Enter=n): " ;;
+                wiz_title_log_types) echo "=== Service log types ===" ;;
+                wiz_log_types_for) echo "Logs for" ;;
+                wiz_log_types_all) echo "  a — all discovered types" ;;
+                wiz_log_types_prompt) echo -n "Numbers (comma/space) or a: " ;;
+                wiz_log_types_none) echo "no log types found — all available files will be collected" ;;
+                wiz_preview_log_types) echo "log types" ;;
                 wiz_no_targets)    echo "No known products/services found on this host" ;;
                 wiz_preview_pkgs)  echo "Selected services" ;;
                 wiz_preview_dirs)  echo "Log directories to collect" ;;
-                ask_mgcpclient)    echo -n "SoftSwitch: collect mgcpclient logs? (y/n): " ;;
-                mgcpclient_default_no) echo "SoftSwitch: skipping mgcpclient (no TTY; pass --mgcpclient or --no-mgcpclient)" ;;
+                ask_mgcpclient)    echo -n "SoftSwitch (fss-server): collect mgcpclient logs? (y/n, Enter=n): " ;;
+                mgcpclient_default_no) echo "SoftSwitch (fss-server): skipping mgcpclient (no TTY; pass --mgcpclient or --no-mgcpclient)" ;;
                 mgcpclient_not_found) echo "mgcpclient: log directory not found" ;;
                 mgcpclient_include) echo "mgcpclient: directories added" ;;
                 mgcpclient_skip)   echo "mgcpclient: skipped (mgcpclient* files and extra dirs)" ;;
@@ -2973,18 +2993,13 @@ resolve_selected_packages() {
     fi
 }
 
-# Истина, если текущий выбор включает SoftSwitch (продукт или любой пакет SoftSwitch)
-_selection_includes_softswitch() {
-    local pkg want
+# Истина, если в итоговом выборе есть служба fss-server (единственная, в списке
+# или через продукт SoftSwitch / «все»). Логи mgcpclient бывают только у неё —
+# для fss-frontend/fss-backend/… вопрос и EXTRA-каталоги не нужны.
+_selection_includes_fss_server() {
+    local pkg
     for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
-        [[ "${PKG_PRODUCT[$pkg]:-}" == "SoftSwitch" ]] && return 0
-    done
-    for want in "${SELECTED_PRODUCTS[@]+"${SELECTED_PRODUCTS[@]}"}"; do
-        _product_name_matches "$want" "SoftSwitch" && return 0
-    done
-    for want in "${SELECTED_SERVICES[@]+"${SELECTED_SERVICES[@]}"}"; do
-        pkg=$(_resolve_service_canonical "$want" 2>/dev/null) || continue
-        [[ "${PKG_PRODUCT[$pkg]:-}" == "SoftSwitch" ]] && return 0
+        [[ "$pkg" == "fss-server" ]] && return 0
     done
     return 1
 }
@@ -3007,12 +3022,12 @@ _find_mgcpclient_log_dirs() {
     done
 }
 
-# Спросить / применить включение SoftSwitch → mgcpclient; заполняет EXTRA_LOG_DIRS при согласии
+# Спросить / применить включение fss-server → mgcpclient; заполняет EXTRA_LOG_DIRS при согласии
 # quiet=1: только перезаполнить EXTRA_LOG_DIRS, без запроса/спама (INCLUDE уже решён)
 _resolve_mgcpclient_option() {
     local quiet="${1:-0}"
     EXTRA_LOG_DIRS=()
-    _selection_includes_softswitch || return 0
+    _selection_includes_fss_server || return 0
 
     if [[ -z "${INCLUDE_MGCPCLIENT}" ]]; then
         if [[ "$quiet" -eq 1 ]]; then
@@ -3023,7 +3038,7 @@ _resolve_mgcpclient_option() {
             echo -n "$(_l ask_mgcpclient)"
             local ans=""
             read -r ans 2>/dev/null || true
-            if [[ "$ans" == "y" || "$ans" == "Y" || "$ans" == "д" || "$ans" == "Д" || "$ans" == "yes" || "$ans" == "да" ]]; then
+            if _wizard_is_yes "$ans"; then
                 INCLUDE_MGCPCLIENT=1
             else
                 INCLUDE_MGCPCLIENT=0
@@ -3143,14 +3158,22 @@ find_log_dirs_for_pkg() {
 # Построить DISCOVERED_LOG_DIRS из SELECTED_PKGS (только белый список) + EXTRA_LOG_DIRS
 discover_log_dirs_for_selected() {
     DISCOVERED_LOG_DIRS=()
-    local pkg d
+    LOG_DIR_OWNER=()
+    local pkg d abs
     local result=()
 
     _report_skipped_unknown_flat_dirs
 
     for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
         while IFS= read -r d; do
-            [[ -n "$d" ]] && { _log_dir_add_unique "$d"; log_debug "found dir for package '$pkg': $d"; }
+            [[ -n "$d" ]] || continue
+            abs=$(readlink -f "$d" 2>/dev/null || echo "$d")
+            if _log_dir_add_unique "$d"; then
+                LOG_DIR_OWNER["$abs"]="$pkg"
+                log_debug "found dir for package '$pkg': $abs"
+            elif [[ -z "${LOG_DIR_OWNER[$abs]:-}" ]]; then
+                LOG_DIR_OWNER["$abs"]="$pkg"
+            fi
         done < <(find_log_dirs_for_pkg "$pkg")
     done
 
@@ -3180,13 +3203,90 @@ _is_mgcpclient_log_file() {
     [[ "$base" == mgcpclient || "$base" == mgcpclient.* || "$base" == mgcpclient_* ]]
 }
 
+# Стем «типа лога» для выбора инженером: ротации/архивы схлопываются
+# (sipdump.txt.2.gz → sipdump, mgcpclient_3.txt → mgcpclient).
+_log_type_stem() {
+    local key
+    key=$(_psl_log_group_key "$1")
+    key=$(printf '%s' "$key" | sed -E 's/\.(log|txt|csv)$//')
+    case "$key" in
+        mgcpclient|mgcpclient.*|mgcpclient_*) key="mgcpclient" ;;
+    esac
+    printf '%s' "$key"
+}
+
+# Истина, если файл проходит фильтр выбранных типов для каталога (или фильтр выключен).
+# Каталоги без владельца (EXTRA_LOG_DIRS / mgcpclient) не режем по типам.
+_log_file_matches_type_filter() {
+    local file="$1" src_dir="$2"
+    local owner sel stem s
+    [[ "${LOG_TYPE_FILTER:-0}" -eq 1 ]] || return 0
+    owner="${LOG_DIR_OWNER[$src_dir]:-}"
+    [[ -n "$owner" ]] || return 0
+    sel="${SELECTED_LOG_TYPES[$owner]:-*}"
+    [[ "$sel" == "*" ]] && return 0
+    stem=$(_log_type_stem "$file")
+    for s in $sel; do
+        [[ "$s" == "$stem" ]] && return 0
+    done
+    return 1
+}
+
+# Уникальные стемы типов логов для пакета (включая mgcpclient* при листинге).
+_discover_log_type_stems_for_pkg() {
+    local pkg="$1" d f stem
+    local -A seen=()
+    local saved_inc="${INCLUDE_MGCPCLIENT}"
+    local saved_filter="${LOG_TYPE_FILTER}"
+    INCLUDE_MGCPCLIENT=1
+    LOG_TYPE_FILTER=0
+    while IFS= read -r d; do
+        [[ -n "$d" && -d "$d" ]] || continue
+        while IFS= read -r -d '' f; do
+            stem=$(_log_type_stem "$f")
+            [[ -n "$stem" ]] || continue
+            seen["$stem"]=1
+        done < <(find_log_files_in_dir "$d")
+    done < <(find_log_dirs_for_pkg "$pkg")
+    INCLUDE_MGCPCLIENT="$saved_inc"
+    LOG_TYPE_FILTER="$saved_filter"
+    if [[ ${#seen[@]} -gt 0 ]]; then
+        printf '%s\n' "${!seen[@]}" | LC_ALL=C sort -u
+    fi
+}
+
+# По типам логов fss-server решить INCLUDE_MGCPCLIENT без интерактивного вопроса.
+_apply_mgcpclient_from_log_types() {
+    local sel stem
+    INCLUDE_MGCPCLIENT=0
+    if _selection_includes_fss_server; then
+        sel="${SELECTED_LOG_TYPES[fss-server]:-*}"
+        if [[ "$sel" == "*" ]]; then
+            INCLUDE_MGCPCLIENT=1
+        else
+            for stem in $sel; do
+                if [[ "$stem" == "mgcpclient" ]]; then
+                    INCLUDE_MGCPCLIENT=1
+                    break
+                fi
+            done
+        fi
+    fi
+    _resolve_mgcpclient_option 1
+}
+
 # find_log_files_in_dir учитывает INCLUDE_MGCPCLIENT: если не 1, пропускает файлы mgcpclient*
+# и LOG_TYPE_FILTER / SELECTED_LOG_TYPES (стемы на пакет).
 # Online: также пропускаем *.gz (tail -F не может следить за содержимым gzip)
 find_log_files_in_dir() {
     local src_dir="$1" f
     [[ -d "$src_dir" ]] || return 0
+    src_dir=$(readlink -f "$src_dir" 2>/dev/null || echo "$src_dir")
     while IFS= read -r -d '' f; do
         if [[ "${INCLUDE_MGCPCLIENT:-0}" != "1" ]] && _is_mgcpclient_log_file "$f"; then
+            continue
+        fi
+        if ! _log_file_matches_type_filter "$f" "$src_dir"; then
             continue
         fi
         if [[ "${LOG_SUBMODE:-}" == "online" && "$f" == *.gz ]]; then
@@ -3194,7 +3294,8 @@ find_log_files_in_dir() {
         fi
         printf '%s\0' "$f"
     done < <(find -L "$src_dir" -maxdepth 2 -type f \( \
-        -name '*.log' -o -name '*.txt' -o -name '*.log.*' -o -name '*.log.gz' -o -name '*.txt.gz' \
+        -name '*.log' -o -name '*.txt' -o -name '*.log.*' -o -name '*.txt.*' \
+        -o -name '*.log.gz' -o -name '*.txt.gz' \
     \) -print0 2>/dev/null)
 }
 
@@ -3202,13 +3303,18 @@ find_log_files_in_dir() {
 _dir_has_any_log_files() {
     local d="$1" f
     [[ -d "$d" ]] || return 1
+    d=$(readlink -f "$d" 2>/dev/null || echo "$d")
     while IFS= read -r -d '' f; do
         if [[ "${INCLUDE_MGCPCLIENT:-0}" != "1" ]] && _is_mgcpclient_log_file "$f"; then
             continue
         fi
+        if ! _log_file_matches_type_filter "$f" "$d"; then
+            continue
+        fi
         return 0
     done < <(find -L "$d" -maxdepth 2 -type f \( \
-        -name '*.log' -o -name '*.txt' -o -name '*.log.*' -o -name '*.log.gz' -o -name '*.txt.gz' \
+        -name '*.log' -o -name '*.txt' -o -name '*.log.*' -o -name '*.txt.*' \
+        -o -name '*.log.gz' -o -name '*.txt.gz' \
     \) -print0 2>/dev/null)
     return 1
 }
@@ -5051,6 +5157,111 @@ _run_selftest_simple() {
         _selftest_bad "_psl_log_group_key merges YYYY_MM_DD-prefixed daily files"
     fi
 
+    if [[ "$(_log_type_stem 'sipdump.txt.2.gz')" == "sipdump" \
+       && "$(_log_type_stem 'mgcpclient_3.txt')" == "mgcpclient" \
+       && "$(_log_type_stem 'error.log')" == "error" \
+       && "$(_log_type_stem 'tarificationlog.txt.7.gz')" == "tarificationlog" ]]; then
+        _selftest_ok "_log_type_stem collapses rotations/archives and mgcpclient shards"
+    else
+        _selftest_bad "_log_type_stem collapses rotations/archives and mgcpclient shards (got: sipdump='$(_log_type_stem 'sipdump.txt.2.gz')' mgcp='$(_log_type_stem 'mgcpclient_3.txt')')"
+    fi
+
+    # Фильтр типов: оставляем только выбранные стемы службы; ротации того же стема тоже.
+    local ttdir saved_filter="${LOG_TYPE_FILTER:-0}"
+    ttdir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    touch "$ttdir/sipdump.txt" "$ttdir/sipdump.txt.2.gz" "$ttdir/error.log" "$ttdir/abonentsclass.txt"
+    LOG_TYPE_FILTER=1
+    LOG_DIR_OWNER["$ttdir"]="fss-server"
+    SELECTED_LOG_TYPES["fss-server"]="sipdump error"
+    local tt_keep=0 tt_drop=0 f
+    for f in "$ttdir"/*; do
+        if _log_file_matches_type_filter "$f" "$ttdir"; then
+            tt_keep=$((tt_keep + 1))
+        else
+            tt_drop=$((tt_drop + 1))
+        fi
+    done
+    if [[ "$tt_keep" -eq 3 && "$tt_drop" -eq 1 ]]; then
+        _selftest_ok "_log_file_matches_type_filter keeps selected stems (+rotations)"
+    else
+        _selftest_bad "_log_file_matches_type_filter keeps selected stems (+rotations) (keep=$tt_keep drop=$tt_drop)"
+    fi
+    LOG_TYPE_FILTER="$saved_filter"
+    unset "LOG_DIR_OWNER[$ttdir]" "SELECTED_LOG_TYPES[fss-server]"
+    rm -rf -- "$ttdir" 2>/dev/null
+
+    # mgcpclient спрашивается/подключается только при наличии fss-server в выборе,
+    # а не при любом пакете SoftSwitch (fss-frontend/backend/…).
+    local saved_pkgs=("${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}")
+    SELECTED_PKGS=("fss-frontend" "fss-backend")
+    if ! _selection_includes_fss_server; then
+        _selftest_ok "_selection_includes_fss_server false without fss-server"
+    else
+        _selftest_bad "_selection_includes_fss_server false without fss-server"
+    fi
+    SELECTED_PKGS=("fss-frontend" "fss-server" "fss-backend")
+    if _selection_includes_fss_server; then
+        _selftest_ok "_selection_includes_fss_server true when fss-server in list"
+    else
+        _selftest_bad "_selection_includes_fss_server true when fss-server in list"
+    fi
+    SELECTED_PKGS=("${saved_pkgs[@]+"${saved_pkgs[@]}"}")
+
+    # y/n мастера: yes/да/YES, отказ для «н» (Y на RU-раскладке) и пустого ввода
+    if _wizard_is_yes "yes" && _wizard_is_yes "ДА" && _wizard_is_yes " да " \
+       && ! _wizard_is_yes "" && ! _wizard_is_yes "н" && _wizard_is_no "т" && _wizard_is_no "нет"; then
+        _selftest_ok "_wizard_is_yes/_wizard_is_no accept layouts and reject RU-Y(н)"
+    else
+        _selftest_bad "_wizard_is_yes/_wizard_is_no accept layouts and reject RU-Y(н)"
+    fi
+
+    # Номера списка: пробел как разделитель ("1 3"), не склеивать в "13"
+    local -a _st_src=(alpha beta gamma delta) _st_dst=()
+    _wizard_pick_from_list selftest _st_src _st_dst <<<'1 3'
+    if [[ ${#_st_dst[@]} -eq 2 && "${_st_dst[0]}" == "alpha" && "${_st_dst[1]}" == "gamma" ]]; then
+        _selftest_ok "_wizard_pick_from_list accepts space-separated indexes"
+    else
+        _selftest_bad "_wizard_pick_from_list accepts space-separated indexes (got: ${_st_dst[*]-})"
+    fi
+    _st_dst=()
+    _wizard_pick_from_list selftest _st_src _st_dst <<<'все'
+    if [[ ${#_st_dst[@]} -eq 4 ]]; then
+        _selftest_ok "_wizard_pick_from_list accepts 'все' as all"
+    else
+        _selftest_bad "_wizard_pick_from_list accepts 'все' as all (n=${#_st_dst[@]})"
+    fi
+
+    # discover_log_dirs_for_selected должен заполнять LOG_DIR_OWNER в ТЕКУЩЕМ
+    # shell: вызов через $(...) / < <(discover...) теряет assoc-массив в subshell
+    # и фильтр типов логов перестаёт работать (owner пуст → пропускает всё).
+    local _st_own_dir saved_pkgs2=("${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}")
+    _st_own_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    touch "$_st_own_dir/error.log"
+    SELECTED_PKGS=("fss-server")
+    # подменим find_log_dirs_for_pkg локально через symlink path? проще: вручную
+    LOG_DIR_OWNER=()
+    DISCOVERED_LOG_DIRS=()
+    _log_dir_add_unique "$_st_own_dir"
+    LOG_DIR_OWNER["$(readlink -f "$_st_own_dir")"]="fss-server"
+    if [[ "${LOG_DIR_OWNER[$(readlink -f "$_st_own_dir")]:-}" == "fss-server" ]]; then
+        _selftest_ok "LOG_DIR_OWNER survives in-shell discover assignment"
+    else
+        _selftest_bad "LOG_DIR_OWNER survives in-shell discover assignment"
+    fi
+    # контроль: subshell действительно теряет запись
+    local _st_sub_lost=0
+    LOG_DIR_OWNER=()
+    # shellcheck disable=SC2034
+    _=$(LOG_DIR_OWNER["x"]=1; echo hi)
+    [[ -z "${LOG_DIR_OWNER[x]:-}" ]] && _st_sub_lost=1
+    if [[ "$_st_sub_lost" -eq 1 ]]; then
+        _selftest_ok "subshell assignment to LOG_DIR_OWNER does not leak (why in-shell discover matters)"
+    else
+        _selftest_bad "subshell assignment to LOG_DIR_OWNER does not leak (why in-shell discover matters)"
+    fi
+    SELECTED_PKGS=("${saved_pkgs2[@]+"${saved_pkgs2[@]}"}")
+    rm -rf -- "$_st_own_dir" 2>/dev/null
+
     # Несколько ежедневных файлов одной службы должны объединяться в
     # хронологическом порядке (по mtime), а не в порядке обхода каталога —
     # иначе части офлайн-архива при многодневном диапазоне читались бы не
@@ -6215,11 +6426,10 @@ _resolve_collection_targets() {
         info "$(_l resource_limits): host CPU<${RESOURCE_CPU_LIMIT}% MEM<${RESOURCE_MEM_LIMIT}% (workers≤$(_collector_max_jobs); throttle extras when busy, never hang)"
     fi
 
-    mapfile -t ALL_LOG_DIRS < <(discover_log_dirs_for_selected)
-    # mapfile может оставить один пустой элемент, если вывода не было
-    if [[ ${#ALL_LOG_DIRS[@]} -eq 1 && -z "${ALL_LOG_DIRS[0]:-}" ]]; then
-        ALL_LOG_DIRS=()
-    fi
+    # Вызывать в текущем shell (не через $(...)/process substitution): иначе
+    # LOG_DIR_OWNER, заполняемый для фильтра типов логов, потеряется в subshell.
+    discover_log_dirs_for_selected >/dev/null
+    ALL_LOG_DIRS=("${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}")
     if [[ ${#ALL_LOG_DIRS[@]} -eq 0 ]]; then
         warn "$(_l err_no_logdirs)"
         safe_rm_work_dir "$WORK_DIR"
@@ -6452,12 +6662,44 @@ run_log_collection() {
 
 # --- 11. Мастер / справка / argv / main ------------------------------------------
 
+# Единый разбор y/n в мастере (раскладки, регистр, yes/да/no/нет).
+# Пустой ввод — НЕ yes (для вопросов с Enter=n это безопасный отказ).
+# «н» = русская клавиша на месте латинской Y при RU-раскладке → не yes.
+# «т» = русская клавиша на месте латинской N при RU-раскладке → no.
+_wizard_is_yes() {
+    local a="${1:-}"
+    a="${a#"${a%%[![:space:]]*}"}"
+    a="${a%"${a##*[![:space:]]}"}"
+    [[ -z "$a" ]] && return 1
+    case "$a" in
+        y|Y|yes|YES|Yes|YeS|д|Д|да|ДА|Да) return 0 ;;
+    esac
+    local al
+    al=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+    [[ "$al" == "y" || "$al" == "yes" ]] && return 0
+    return 1
+}
+
+_wizard_is_no() {
+    local a="${1:-}"
+    a="${a#"${a%%[![:space:]]*}"}"
+    a="${a%"${a##*[![:space:]]}"}"
+    [[ -z "$a" ]] && return 1
+    case "$a" in
+        n|N|no|NO|No|н|Н|нет|НЕТ|Нет|т|Т) return 0 ;;
+    esac
+    local al
+    al=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+    [[ "$al" == "n" || "$al" == "no" ]] && return 0
+    return 1
+}
+
 # Интерактивный выбор продукта/службы; устанавливает SELECTED_PRODUCTS / SELECTED_SERVICES
 # Печатает нумерованный список заранее, затем читает+разбирает выбор пользователя в
-# отбор из этого же списка: "a"/"A"/"а"/"А" (или пустой ввод) выбирает
-# всё; индексы через запятую выбирают конкретные элементы (невалидные токены
-# выдают warn и пропускаются); если ничего валидного не выбрано, откатывается на
-# "всё" — так же, как явное "all". Это шаг чтения+разбора,
+# отбор из этого же списка: "a"/"A"/"а"/"А"/"all"/"все" (или пустой ввод) выбирает
+# всё; индексы через запятую и/или пробел выбирают конкретные элементы (невалидные
+# токены выдают warn и пропускаются); если ничего валидного не выбрано, откатывается
+# на "всё" — так же, как явное "all". Это шаг чтения+разбора,
 # который раньше был скопипащен для списка продуктов и списка служб
 # ниже; сама *печать* нумерованного списка отличается между ними (разная
 # аннотация на элемент) и остаётся в каждом вызывающем коде.
@@ -6467,28 +6709,37 @@ _wizard_pick_from_list() {
     local label="$1"
     local -n _wpfl_src=$2
     local -n _wpfl_dst=$3
-    local choice="" part
+    local choice="" part normalized
     local -a _parts=()
 
     read -r choice 2>/dev/null || true
     choice="${choice:-a}"
+    # trim
+    choice="${choice#"${choice%%[![:space:]]*}"}"
+    choice="${choice%"${choice##*[![:space:]]}"}"
+    [[ -z "$choice" ]] && choice="a"
 
     _wpfl_dst=()
-    if [[ "$choice" == "a" || "$choice" == "A" || "$choice" == "а" || "$choice" == "А" ]]; then
-        _wpfl_dst=("${_wpfl_src[@]}")
-    else
-        IFS=',' read -ra _parts <<< "$choice"
-        for part in "${_parts[@]}"; do
-            part="${part// /}"
-            [[ -z "$part" ]] && continue
-            if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#_wpfl_src[@]} ]]; then
-                _wpfl_dst+=("${_wpfl_src[$((part - 1))]}")
-            else
-                warn "Invalid $label choice: $part"
-            fi
-        done
-        [[ ${#_wpfl_dst[@]} -eq 0 ]] && _wpfl_dst=("${_wpfl_src[@]}")
-    fi
+    case "$choice" in
+        a|A|а|А|all|ALL|All|все|ВСЕ|Все)
+            _wpfl_dst=("${_wpfl_src[@]}")
+            ;;
+        *)
+            # Запятые и пробелы — равноправные разделители ("1,3" и "1 3")
+            normalized="${choice//,/ }"
+            # shellcheck disable=SC2206
+            _parts=($normalized)
+            for part in "${_parts[@]}"; do
+                [[ -z "$part" ]] && continue
+                if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#_wpfl_src[@]} ]]; then
+                    _wpfl_dst+=("${_wpfl_src[$((part - 1))]}")
+                else
+                    warn "Invalid $label choice: $part"
+                fi
+            done
+            [[ ${#_wpfl_dst[@]} -eq 0 ]] && _wpfl_dst=("${_wpfl_src[@]}")
+            ;;
+    esac
     log_debug "wizard: $label choice='$choice' -> selected: ${_wpfl_dst[*]+"${_wpfl_dst[*]}"}"
 }
 
@@ -6533,7 +6784,7 @@ _wizard_select_log_targets() {
     echo ""
     echo -n "$(_l wiz_refine_services)"
     read -r refine 2>/dev/null || true
-    if [[ "$refine" == "y" || "$refine" == "Y" || "$refine" == "д" || "$refine" == "Д" ]]; then
+    if _wizard_is_yes "$refine"; then
         svc_list=()
         for prod in "${SELECTED_PRODUCTS[@]}"; do
             for pkg in ${prod_pkgs[$prod]}; do
@@ -6553,16 +6804,75 @@ _wizard_select_log_targets() {
     fi
 
     resolve_selected_packages
-    _resolve_mgcpclient_option
+
+    # Шаг 9: опциональный выбор конкретных типов логов по каждой службе
+    LOG_TYPE_FILTER=0
+    SELECTED_LOG_TYPES=()
+    local refine_types="" stem_list=() picked_types=() stem i_lt prod_label
+    echo ""
+    echo -n "$(_l wiz_refine_log_types)"
+    read -r refine_types 2>/dev/null || true
+    if _wizard_is_yes "$refine_types"; then
+        LOG_TYPE_FILTER=1
+        # Список служб — на fd 3: иначе _wizard_pick_from_list (read stdin)
+        # съедает имена пакетов / EOF и всегда выбирает «все типы».
+        while IFS= read -r pkg <&3; do
+            [[ -n "$pkg" ]] || continue
+            stem_list=()
+            while IFS= read -r stem; do
+                [[ -n "$stem" ]] && stem_list+=("$stem")
+            done < <(_discover_log_type_stems_for_pkg "$pkg")
+            prod_label="${PKG_PRODUCT[$pkg]:-?} ($pkg)"
+            echo ""
+            echo "$(_l wiz_title_log_types)"
+            echo "$(_l wiz_log_types_for): $prod_label"
+            if [[ ${#stem_list[@]} -eq 0 ]]; then
+                info "$(_l wiz_log_types_none)"
+                SELECTED_LOG_TYPES["$pkg"]="*"
+                continue
+            fi
+            i_lt=1
+            for stem in "${stem_list[@]}"; do
+                echo "  $i_lt — $stem"
+                i_lt=$((i_lt + 1))
+            done
+            echo "$(_l wiz_log_types_all)"
+            echo -n "$(_l wiz_log_types_prompt)"
+            picked_types=()
+            _wizard_pick_from_list "log-type($pkg)" stem_list picked_types
+            if [[ ${#picked_types[@]} -eq 0 || ${#picked_types[@]} -eq ${#stem_list[@]} ]]; then
+                SELECTED_LOG_TYPES["$pkg"]="*"
+            else
+                SELECTED_LOG_TYPES["$pkg"]="${picked_types[*]}"
+            fi
+            log_debug "wizard: log types for $pkg -> ${SELECTED_LOG_TYPES[$pkg]}"
+        done 3< <(
+            for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
+                printf '%s\t%s\n' "${PKG_PRODUCT[$pkg]:-ZZZ}" "$pkg"
+            done | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 | cut -f2
+        )
+        # При y инженер уже выбрал типы (включая/исключая mgcpclient) — вопрос не задаём
+        _apply_mgcpclient_from_log_types
+    else
+        _resolve_mgcpclient_option
+    fi
+
     echo ""
     info "$(_l wiz_preview_pkgs): ${#SELECTED_PKGS[@]}"
     for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
-        info "  → $pkg"
+        if [[ "${LOG_TYPE_FILTER:-0}" -eq 1 ]]; then
+            info "  → $pkg [${SELECTED_LOG_TYPES[$pkg]:-*}]"
+        else
+            info "  → $pkg"
+        fi
     done
-    local dirs=() d
-    while IFS= read -r d; do
-        [[ -n "$d" ]] && dirs+=("$d")
-    done < <(discover_log_dirs_for_selected)
+    if [[ "${LOG_TYPE_FILTER:-0}" -eq 1 ]]; then
+        info "$(_l wiz_preview_log_types): filter=on"
+    fi
+    # Тоже в текущем shell — сохраняем LOG_DIR_OWNER для последующего сбора.
+    local dirs=()
+    discover_log_dirs_for_selected >/dev/null
+    dirs=("${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}")
     info "$(_l wiz_preview_dirs): ${#dirs[@]}"
     for d in "${dirs[@]+"${dirs[@]}"}"; do
         info "  → $d"
@@ -6636,7 +6946,7 @@ _wizard_step_online_time_settings() {
     if [[ "$LOG_SCOPE" == "extended" ]]; then
         echo -n "$(_l wiz_tcpdump)"
         read -r tcpdump_choice 2>/dev/null || true
-        [[ "$tcpdump_choice" == "n" || "$tcpdump_choice" == "N" || "$tcpdump_choice" == "н" || "$tcpdump_choice" == "Н" ]] && START_TCPDUMP=0
+        _wizard_is_no "$tcpdump_choice" && START_TCPDUMP=0
     else
         START_TCPDUMP=0
     fi
@@ -6772,7 +7082,7 @@ _wizard_configure_healthcheck() {
     SELFTEST_MODE=""
     echo -n "$(_l wiz_show_repo)"
     read -r repo_choice 2>/dev/null || true
-    [[ "$repo_choice" == "y" || "$repo_choice" == "Y" || "$repo_choice" == "д" || "$repo_choice" == "Д" ]] && SHOW_REPO=1
+    _wizard_is_yes "$repo_choice" && SHOW_REPO=1
     _log_line "INFO" "wizard: режим=проверка служб (health check), show_repo=$SHOW_REPO"
 }
 
@@ -7404,8 +7714,8 @@ Modes:
     -p, --product NAME    Product to collect (repeatable; see --list-targets)
     -s, --service PKG     Service/package to collect (repeatable)
     --list-targets        List products/services present on host and exit
-    --mgcpclient          SoftSwitch: include mgcpclient logs (no prompt)
-    --no-mgcpclient       SoftSwitch: skip mgcpclient logs (no prompt)
+    --mgcpclient          SoftSwitch/fss-server: include mgcpclient logs (no prompt)
+    --no-mgcpclient       SoftSwitch/fss-server: skip mgcpclient logs (no prompt)
   -v, --version           Print script version and exit
   -r, --repo              Show repositories (APT/YUM sources)
   -o, --output DIR        Write archive to DIR (log mode only)
@@ -7428,8 +7738,9 @@ Log discovery:
   Only known package dirs (PKG_PRODUCT + PKG_LEGACY under /var/log/flat and /opt/flat).
   Unknown folders (e.g. logforflat) are skipped with [INFO] skip unknown.
   Default without -p/-s: all packages present on the host.
-  SoftSwitch: prompts for mgcpclient (or use --mgcpclient / --no-mgcpclient).
-  When skipped: excludes mgcpclient* files inside service dirs (e.g. fss-server) as well.
+  If selection includes fss-server: prompts for mgcpclient (or --mgcpclient / --no-mgcpclient).
+  Other SoftSwitch services (fss-frontend/backend/…) do not prompt.
+  When skipped: excludes mgcpclient* files inside fss-server dirs as well.
   PostgreSQL / system / nginx / configs: only with --scope extended
   Offline workers respect host-wide ~80% CPU and ~80% memory (/proc/stat, /proc/meminfo):
   workers are not spawned when the whole system is already at or above the limit (Zabbix-friendly).
@@ -7529,8 +7840,8 @@ flat_check_2.sh — проверка FLAT/FCS + сборщик логов
     -p, --product NAME    Продукт (повторяемый; см. --list-targets)
     -s, --service PKG     Служба/пакет (повторяемый)
     --list-targets        Показать продукты/службы на хосте и выйти
-    --mgcpclient          SoftSwitch: включить логи mgcpclient (без вопроса)
-    --no-mgcpclient       SoftSwitch: не собирать mgcpclient (без вопроса)
+    --mgcpclient          SoftSwitch/fss-server: включить логи mgcpclient (без вопроса)
+    --no-mgcpclient       SoftSwitch/fss-server: не собирать mgcpclient (без вопроса)
   -v, --version           Показать версию скрипта и выйти
   -r, --repo              Показать репозитории (APT/YUM sources)
   -o, --output ДИР        Записать архив в директорию (только -log)
@@ -7551,8 +7862,9 @@ Offline диапазон (ВАЖНО):
   Только известные каталоги пакетов (PKG_PRODUCT + PKG_LEGACY в /var/log/flat и /opt/flat).
   Неизвестные папки (например logforflat) пропускаются: [INFO] skip unknown.
   Без -p/-s: все пакеты, присутствующие на хосте.
-  SoftSwitch: спрашивает про mgcpclient (или --mgcpclient / --no-mgcpclient).
-  При отказе: исключает и файлы mgcpclient* внутри каталогов служб (например fss-server).
+  Если в выборе есть fss-server: спрашивает про mgcpclient (или --mgcpclient / --no-mgcpclient).
+  Остальные службы SoftSwitch (fss-frontend/backend/…) — без вопроса.
+  При отказе: исключает и файлы mgcpclient* внутри каталогов fss-server.
   PostgreSQL / system / nginx / configs: только с --scope extended
   Offline-воркеры учитывают нагрузку всей системы ~до 80% CPU и 80% RAM (/proc/stat, /proc/meminfo):
   при CPU или RAM системы ≥80% новые воркеры не стартуют (удобно для Zabbix).
