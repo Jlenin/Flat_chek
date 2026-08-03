@@ -930,8 +930,8 @@ _l() {
                 wiz_no_targets)    echo "На хосте не найдено известных продуктов/служб" ;;
                 wiz_preview_pkgs)  echo "Выбрано служб" ;;
                 wiz_preview_dirs)  echo "Лог-директорий к сбору" ;;
-                ask_mgcpclient)    echo -n "SoftSwitch: собирать логи mgcpclient? (y/n, Enter=n): " ;;
-                mgcpclient_default_no) echo "SoftSwitch: mgcpclient пропущен (нет TTY; укажите --mgcpclient или --no-mgcpclient)" ;;
+                ask_mgcpclient)    echo -n "SoftSwitch (fss-server): собирать логи mgcpclient? (y/n, Enter=n): " ;;
+                mgcpclient_default_no) echo "SoftSwitch (fss-server): mgcpclient пропущен (нет TTY; укажите --mgcpclient или --no-mgcpclient)" ;;
                 mgcpclient_not_found) echo "mgcpclient: каталог логов не найден" ;;
                 mgcpclient_include) echo "mgcpclient: добавлено каталогов" ;;
                 mgcpclient_skip)   echo "mgcpclient: пропущен (файлы mgcpclient* и отдельные каталоги)" ;;
@@ -1038,8 +1038,8 @@ _l() {
                 wiz_no_targets)    echo "No known products/services found on this host" ;;
                 wiz_preview_pkgs)  echo "Selected services" ;;
                 wiz_preview_dirs)  echo "Log directories to collect" ;;
-                ask_mgcpclient)    echo -n "SoftSwitch: collect mgcpclient logs? (y/n, Enter=n): " ;;
-                mgcpclient_default_no) echo "SoftSwitch: skipping mgcpclient (no TTY; pass --mgcpclient or --no-mgcpclient)" ;;
+                ask_mgcpclient)    echo -n "SoftSwitch (fss-server): collect mgcpclient logs? (y/n, Enter=n): " ;;
+                mgcpclient_default_no) echo "SoftSwitch (fss-server): skipping mgcpclient (no TTY; pass --mgcpclient or --no-mgcpclient)" ;;
                 mgcpclient_not_found) echo "mgcpclient: log directory not found" ;;
                 mgcpclient_include) echo "mgcpclient: directories added" ;;
                 mgcpclient_skip)   echo "mgcpclient: skipped (mgcpclient* files and extra dirs)" ;;
@@ -2993,18 +2993,13 @@ resolve_selected_packages() {
     fi
 }
 
-# Истина, если текущий выбор включает SoftSwitch (продукт или любой пакет SoftSwitch)
-_selection_includes_softswitch() {
-    local pkg want
+# Истина, если в итоговом выборе есть служба fss-server (единственная, в списке
+# или через продукт SoftSwitch / «все»). Логи mgcpclient бывают только у неё —
+# для fss-frontend/fss-backend/… вопрос и EXTRA-каталоги не нужны.
+_selection_includes_fss_server() {
+    local pkg
     for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
-        [[ "${PKG_PRODUCT[$pkg]:-}" == "SoftSwitch" ]] && return 0
-    done
-    for want in "${SELECTED_PRODUCTS[@]+"${SELECTED_PRODUCTS[@]}"}"; do
-        _product_name_matches "$want" "SoftSwitch" && return 0
-    done
-    for want in "${SELECTED_SERVICES[@]+"${SELECTED_SERVICES[@]}"}"; do
-        pkg=$(_resolve_service_canonical "$want" 2>/dev/null) || continue
-        [[ "${PKG_PRODUCT[$pkg]:-}" == "SoftSwitch" ]] && return 0
+        [[ "$pkg" == "fss-server" ]] && return 0
     done
     return 1
 }
@@ -3027,12 +3022,12 @@ _find_mgcpclient_log_dirs() {
     done
 }
 
-# Спросить / применить включение SoftSwitch → mgcpclient; заполняет EXTRA_LOG_DIRS при согласии
+# Спросить / применить включение fss-server → mgcpclient; заполняет EXTRA_LOG_DIRS при согласии
 # quiet=1: только перезаполнить EXTRA_LOG_DIRS, без запроса/спама (INCLUDE уже решён)
 _resolve_mgcpclient_option() {
     local quiet="${1:-0}"
     EXTRA_LOG_DIRS=()
-    _selection_includes_softswitch || return 0
+    _selection_includes_fss_server || return 0
 
     if [[ -z "${INCLUDE_MGCPCLIENT}" ]]; then
         if [[ "$quiet" -eq 1 ]]; then
@@ -3260,25 +3255,22 @@ _discover_log_type_stems_for_pkg() {
     fi
 }
 
-# По типам логов SoftSwitch решить INCLUDE_MGCPCLIENT без интерактивного вопроса.
+# По типам логов fss-server решить INCLUDE_MGCPCLIENT без интерактивного вопроса.
 _apply_mgcpclient_from_log_types() {
-    local pkg sel stem
+    local sel stem
     INCLUDE_MGCPCLIENT=0
-    if _selection_includes_softswitch; then
-        for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
-            [[ "${PKG_PRODUCT[$pkg]:-}" == "SoftSwitch" ]] || continue
-            sel="${SELECTED_LOG_TYPES[$pkg]:-*}"
-            if [[ "$sel" == "*" ]]; then
-                INCLUDE_MGCPCLIENT=1
-                break
-            fi
+    if _selection_includes_fss_server; then
+        sel="${SELECTED_LOG_TYPES[fss-server]:-*}"
+        if [[ "$sel" == "*" ]]; then
+            INCLUDE_MGCPCLIENT=1
+        else
             for stem in $sel; do
                 if [[ "$stem" == "mgcpclient" ]]; then
                     INCLUDE_MGCPCLIENT=1
-                    break 2
+                    break
                 fi
             done
-        done
+        fi
     fi
     _resolve_mgcpclient_option 1
 }
@@ -5197,6 +5189,23 @@ _run_selftest_simple() {
     LOG_TYPE_FILTER="$saved_filter"
     unset "LOG_DIR_OWNER[$ttdir]" "SELECTED_LOG_TYPES[fss-server]"
     rm -rf -- "$ttdir" 2>/dev/null
+
+    # mgcpclient спрашивается/подключается только при наличии fss-server в выборе,
+    # а не при любом пакете SoftSwitch (fss-frontend/backend/…).
+    local saved_pkgs=("${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}")
+    SELECTED_PKGS=("fss-frontend" "fss-backend")
+    if ! _selection_includes_fss_server; then
+        _selftest_ok "_selection_includes_fss_server false without fss-server"
+    else
+        _selftest_bad "_selection_includes_fss_server false without fss-server"
+    fi
+    SELECTED_PKGS=("fss-frontend" "fss-server" "fss-backend")
+    if _selection_includes_fss_server; then
+        _selftest_ok "_selection_includes_fss_server true when fss-server in list"
+    else
+        _selftest_bad "_selection_includes_fss_server true when fss-server in list"
+    fi
+    SELECTED_PKGS=("${saved_pkgs[@]+"${saved_pkgs[@]}"}")
 
     # Несколько ежедневных файлов одной службы должны объединяться в
     # хронологическом порядке (по mtime), а не в порядке обхода каталога —
@@ -7608,8 +7617,8 @@ Modes:
     -p, --product NAME    Product to collect (repeatable; see --list-targets)
     -s, --service PKG     Service/package to collect (repeatable)
     --list-targets        List products/services present on host and exit
-    --mgcpclient          SoftSwitch: include mgcpclient logs (no prompt)
-    --no-mgcpclient       SoftSwitch: skip mgcpclient logs (no prompt)
+    --mgcpclient          SoftSwitch/fss-server: include mgcpclient logs (no prompt)
+    --no-mgcpclient       SoftSwitch/fss-server: skip mgcpclient logs (no prompt)
   -v, --version           Print script version and exit
   -r, --repo              Show repositories (APT/YUM sources)
   -o, --output DIR        Write archive to DIR (log mode only)
@@ -7632,8 +7641,9 @@ Log discovery:
   Only known package dirs (PKG_PRODUCT + PKG_LEGACY under /var/log/flat and /opt/flat).
   Unknown folders (e.g. logforflat) are skipped with [INFO] skip unknown.
   Default without -p/-s: all packages present on the host.
-  SoftSwitch: prompts for mgcpclient (or use --mgcpclient / --no-mgcpclient).
-  When skipped: excludes mgcpclient* files inside service dirs (e.g. fss-server) as well.
+  If selection includes fss-server: prompts for mgcpclient (or --mgcpclient / --no-mgcpclient).
+  Other SoftSwitch services (fss-frontend/backend/…) do not prompt.
+  When skipped: excludes mgcpclient* files inside fss-server dirs as well.
   PostgreSQL / system / nginx / configs: only with --scope extended
   Offline workers respect host-wide ~80% CPU and ~80% memory (/proc/stat, /proc/meminfo):
   workers are not spawned when the whole system is already at or above the limit (Zabbix-friendly).
@@ -7733,8 +7743,8 @@ flat_check_2.sh — проверка FLAT/FCS + сборщик логов
     -p, --product NAME    Продукт (повторяемый; см. --list-targets)
     -s, --service PKG     Служба/пакет (повторяемый)
     --list-targets        Показать продукты/службы на хосте и выйти
-    --mgcpclient          SoftSwitch: включить логи mgcpclient (без вопроса)
-    --no-mgcpclient       SoftSwitch: не собирать mgcpclient (без вопроса)
+    --mgcpclient          SoftSwitch/fss-server: включить логи mgcpclient (без вопроса)
+    --no-mgcpclient       SoftSwitch/fss-server: не собирать mgcpclient (без вопроса)
   -v, --version           Показать версию скрипта и выйти
   -r, --repo              Показать репозитории (APT/YUM sources)
   -o, --output ДИР        Записать архив в директорию (только -log)
@@ -7755,8 +7765,9 @@ Offline диапазон (ВАЖНО):
   Только известные каталоги пакетов (PKG_PRODUCT + PKG_LEGACY в /var/log/flat и /opt/flat).
   Неизвестные папки (например logforflat) пропускаются: [INFO] skip unknown.
   Без -p/-s: все пакеты, присутствующие на хосте.
-  SoftSwitch: спрашивает про mgcpclient (или --mgcpclient / --no-mgcpclient).
-  При отказе: исключает и файлы mgcpclient* внутри каталогов служб (например fss-server).
+  Если в выборе есть fss-server: спрашивает про mgcpclient (или --mgcpclient / --no-mgcpclient).
+  Остальные службы SoftSwitch (fss-frontend/backend/…) — без вопроса.
+  При отказе: исключает и файлы mgcpclient* внутри каталогов fss-server.
   PostgreSQL / system / nginx / configs: только с --scope extended
   Offline-воркеры учитывают нагрузку всей системы ~до 80% CPU и 80% RAM (/proc/stat, /proc/meminfo):
   при CPU или RAM системы ≥80% новые воркеры не стартуют (удобно для Zabbix).
