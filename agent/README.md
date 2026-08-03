@@ -35,7 +35,7 @@
 
 ## Установка
 
-Из корня репозитория:
+Из корня репозитория (**нужен sudo** для установки в `/usr/local` и `/etc`):
 
 ```bash
 chmod +x agent/install_flat_check.sh flat_check.sh
@@ -45,6 +45,17 @@ sudo ./agent/install_flat_check.sh \
   --push-token 'SECRET' \
   --host-id ss-n1 \
   --service-name fss-backend
+```
+
+Без root — только в свой префикс:
+
+```bash
+./agent/install_flat_check.sh \
+  --bin "$HOME/flat/bin/flat_check" \
+  --conf-dir "$HOME/flat/etc" \
+  --skip-cron \
+  --push-url 'https://…/ingest' --push-token 'SECRET' \
+  --host-id ss-n1 --service-name fss-backend
 ```
 
 Шаги установщика:
