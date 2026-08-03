@@ -4,7 +4,7 @@
 Обновлять при смене версии, JSON-контракта, установщика или паритета скриптов.
 
 **Обновлено:** 2026-08-03  
-**Версия скриптов:** `3.7.0`
+**Версия скриптов:** `3.7.1`
 
 ---
 
@@ -40,12 +40,14 @@
 - `PKG_*`, System/packages/infra, resource-gate
 - блок JSON/push = `agent/json_report.inc.sh`
 
-Только в `_2`: `-log`, wizard `-i`, seek/chunk, tcpdump и т.п.
+Только в `_2`: `-log`, wizard `-i`, seek/chunk, tcpdump и т.п.  
+В `flat_check.sh` флаг `-i` **не используется** (чтобы не путать с мастером `_2`).  
+VERBOSE health по всем пакетам — через `--dev` / `--selftest extended` (одинаково в обоих).
 
-CLI-ловушки:
+CLI:
 
-- `-i`: info в `flat_check`, мастер в `_2`
-- `-p` в `_2`: при `-log` — выбор логов; иначе фильтр health/JSON
+- `-i`: только `_2` (мастер); в `flat_check` — unknown option
+- `-p` / `--product`: health/JSON фильтр; в `_2` при `-log` — выбор логов
 - `--json`/`--push` обрабатываются до `-log` и завершают процесс
 
 Приоритет настроек агента: **CLI > env > conf > авто**.

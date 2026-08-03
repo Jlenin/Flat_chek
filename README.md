@@ -4,8 +4,8 @@
 
 | Скрипт | Назначение | Версия |
 |--------|------------|--------|
-| `flat_check.sh` | health check | 3.7.0 |
-| `flat_check_2.sh` | тот же health check + сбор логов | 3.7.0 |
+| `flat_check.sh` | health check | 3.7.1 |
+| `flat_check_2.sh` | тот же health check + сбор логов | 3.7.1 |
 
 Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
 Для полного сбора логов в `_2` обычно нужен root или sudo.
@@ -19,19 +19,17 @@
 ```bash
 # только мониторинг состояния
 ./flat_check.sh
-./flat_check.sh -i          # подробно по всем пакетам
 ./flat_check.sh -r          # + репозитории
+./flat_check.sh --dev       # самотест + VERBOSE health по всем пакетам
 
 # мониторинг + сбор логов
 ./flat_check_2.sh
+./flat_check_2.sh -i        # интерактивный мастер
 ./flat_check_2.sh -log -off -t 4d
 ```
 
-Замечания по CLI:
-
-- в `flat_check.sh` флаг `-i` = `--info` (подробный health);
-- в `flat_check_2.sh` флаг `-i` = интерактивный мастер;
-- health у обоих совпадает (общие `PKG_*`, System, пакеты, infrastructure, resource-gate).
+Health-путь у обоих совпадает (`PKG_*`, System, пакеты, infrastructure, resource-gate, JSON/push).  
+`-i` есть только в `flat_check_2.sh` (мастер). В `flat_check.sh` не используется.
 
 ---
 
@@ -44,7 +42,7 @@ chmod +x flat_check.sh flat_check_2.sh
 ./flat_check_2.sh -h
 
 ./flat_check.sh
-./flat_check.sh -v    # flat_check 3.7.0
+./flat_check.sh -v    # flat_check 3.7.1
 ```
 
 ---
@@ -83,20 +81,21 @@ chmod +x flat_check.sh flat_check_2.sh
 
 Метки: `[OK]` норма, `[WARN]` обратить внимание, `[FAIL]` проблема, `[INFO]` справка.
 
-### Основные флаги health
+### Общие флаги health (оба скрипта)
 
 | Флаг | Описание |
 |------|----------|
-| `-i` / `--info` | только `flat_check.sh`: все пакеты, включая не установленные |
 | `-r` / `--repo` | показать репозитории |
 | `-j` / `--jobs N` | лимит параллельных воркеров |
 | `--pkg NAME` | один пакет |
-| `--product NAME` | один продукт |
+| `-p` / `--product NAME` | один продукт |
 | `--selftest simple\|extended` | самотест |
-| `--dev` | = `--selftest extended` |
+| `--dev` | = `--selftest extended` (VERBOSE health по всем пакетам) |
 | `-v` / `--version` | версия |
 
-Дополнительно оба скрипта понимают `--json` / `--push` / `--config` для выгрузки снимка (см. [`agent/`](agent/)).
+Дополнительно оба понимают `--json` / `--push` / `--config` (см. [`agent/`](agent/)).
+
+Только в `flat_check_2.sh`: `-i` (мастер), `-log` и связанные флаги сбора логов.
 
 ---
 
@@ -105,7 +104,7 @@ chmod +x flat_check.sh flat_check_2.sh
 | Режим | Когда | Что снимает |
 |-------|-------|-------------|
 | `-log -on` | проблема «сейчас» | новые строки после старта (`tail -F`), tcpdump при `--scope extended` |
-| `-log -off` | разбор прошлого интервала | строки по timestamp внутри файла |
+| `-log -off` | разбор за прошлый интервал | строки по timestamp внутри файла |
 
 ```bash
 ./flat_check_2.sh -log --list-targets
@@ -169,8 +168,6 @@ chmod +x flat_check.sh flat_check_2.sh
 |--------|------|------|
 | `flat_check.sh` | `flat_check.log` | рядом со скриптом, перезаписывается |
 | `flat_check_2.sh` | `flat_check_2.log` | рядом со скриптом; при `-log` — в архив |
-
-На экран это не влияет: `[OK]`/`[WARN]`/`[FAIL]`/`[INFO]` дублируются с timestamp; подробности поиска логов — только в файл.
 
 ---
 

@@ -5,12 +5,12 @@
 #
 # Режимы:
 #   (по умолчанию) проверка установленных служб и ресурсов хоста
-#   -i / --info     подробный вывод по всем пакетам (включая не установленные)
 #   -r / --repo     показать репозитории
 #   -v / --version  версия скрипта
 #   --json / --push агент JSON v2 → stdout / PUSH_URLS (см. agent/)
 #   --config/--pkg/--product/--host-id/--host-ip/--service-name
-#   --dev / --selftest  самотест (simple|extended)
+#   --dev / --selftest  самотест (simple|extended); extended = VERBOSE health
+#   -i не используется здесь (в flat_check_2.sh = интерактивный мастер)
 #
 # Это health-only вариант flat_check_2.sh: тот же опрос ОС/CPU/MEM/диска/БД/
 # сети/сертификатов/uptime, пакетов, портов, API и инфраструктуры — без
@@ -30,7 +30,7 @@
 # Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log рядом со скриптом
 #   (перезаписывается). Сборщик логов — в flat_check_2.sh.
 
-SCRIPT_VERSION="3.7.0"
+SCRIPT_VERSION="3.7.1"
 
 set -uo pipefail
 
@@ -3331,16 +3331,15 @@ Usage:
   $0 [OPTIONS]
 
 Health (text):
-  -i, --info            detailed info for all packages
   -r, --repo            show repositories
   -j, --jobs N          parallel package-check workers
+  -p, --product NAME    single product only
+  --pkg NAME            single package only
   -v, --version         print version
   -h, --help            this help
 
 JSON agent (dashboard / multi-product):
   --config FILE         agent config (/etc/flat/flat_check.conf)
-  --pkg NAME            single package only
-  --product NAME        single product only
   --json                emit health JSON v2 to stdout
   --push                POST JSON to all PUSH_URLS (http/https)
   --host-id ID          override HOST_ID
@@ -3349,7 +3348,9 @@ JSON agent (dashboard / multi-product):
 
 Selftest:
   --selftest [simple|extended]
-  --dev                 = --selftest extended
+  --dev                 = --selftest extended (VERBOSE health по всем пакетам)
+
+Note: -i здесь не используется. В flat_check_2.sh -i = интерактивный мастер.
 
 Examples:
   $0
@@ -3366,8 +3367,6 @@ EOF
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -i|--info|-info) VERBOSE=1; shift ;;
-            --no-info) VERBOSE=0; shift ;;
             -r|--repo|-repo) SHOW_REPO=1; SHOW_REPOS_JSON=1; shift ;;
             -v|--version) echo "flat_check ${SCRIPT_VERSION}"; exit 0 ;;
             -j|--jobs)
@@ -3380,7 +3379,7 @@ parse_args() {
             --pkg)
                 [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
                 SINGLE_PKG="$2"; shift 2 ;;
-            --product)
+            -p|--product)
                 [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
                 FILTER_PRODUCT="$2"; shift 2 ;;
             --json) OUTPUT_JSON=1; shift ;;

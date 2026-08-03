@@ -49,7 +49,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.7.0"
+SCRIPT_VERSION="3.7.1"
 
 set -uo pipefail
 
@@ -7383,7 +7383,7 @@ Usage: flat_check_2.sh [MODE] [OPTIONS]
 Modes:
   (no args)               Health check (installed services only)
   -i, --interactive       Interactive wizard (language, mode, log options)
-  --dev                   Extended self-test (variants + verbose health + seek/chunk)
+  --dev                   Extended self-test (VERBOSE health all packages + seek/chunk)
   --selftest simple|extended
                           Self-test: simple = functions launch; extended = same as --dev
   -log                    Log collector mode
@@ -7509,7 +7509,7 @@ flat_check_2.sh — проверка FLAT/FCS + сборщик логов
 Режимы:
   (без аргументов)        Проверка установленных служб
   -i, --interactive       Интерактивный мастер (язык, режим, параметры логов)
-  --dev                   Расширенный самотест (варианты + health + seek/chunk)
+  --dev                   Расширенный самотест (VERBOSE health по всем пакетам + seek/chunk)
   --selftest simple|extended
                           Самотест: simple = запуск функций; extended = как --dev
   -log                    Режим сборщика логов
