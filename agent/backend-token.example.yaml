@@ -1,0 +1,33 @@
+# Пример настройки токена на стороне Partner / ingest backend.
+# Агент шлёт заголовок по умолчанию:
+#   Authorization: Bearer <PUSH_TOKEN>
+# плюс идентификация:
+#   X-Flat-Host-Id: <HOST_ID>
+#   X-Flat-Service-Name: <SERVICE_NAME>
+#   Content-Type: application/json
+
+flat_check_ingest:
+  # Список стендовых токенов (сверьте с PUSH_TOKEN на нодах)
+  tokens:
+    - name: stand-lab
+      value: "CHANGE_ME"
+      hosts_allow: ["ss-n1", "ss-n2", "fps-n1"]
+    - name: stand-prod
+      value: "CHANGE_ME_PROD"
+      hosts_allow: ["*"]
+
+  # Альтернатива Bearer — общий API-ключ
+  # Тогда на ноде в conf:
+  #   PUSH_AUTH_HEADER="X-Api-Key"
+  #   PUSH_TOKEN="..."
+  api_key_header: "X-Api-Key"
+
+  endpoints:
+    - path: /api/v1/health/ingest
+      methods: [POST]
+      auth: bearer   # или api_key
+      # тело = JSON v2 от flat_check --json
+      # ключ хранения: host_id (+ service_name)
+
+  # После приёма UI читает уже агрегат:
+  #   GET /health  → summary / products / system / infrastructure

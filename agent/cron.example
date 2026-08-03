@@ -1,0 +1,8 @@
+# /etc/cron.d/flat-check
+# Ставится install_flat_check.sh (или вручную).
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Каждые 5 минут: JSON-снимок локальной ноды → Partner (все PUSH_URLS)
+*/5 * * * * root /usr/local/bin/flat_check --config /etc/flat/flat_check.conf --json --push >>/var/log/flat/flat_check_push.log 2>&1
