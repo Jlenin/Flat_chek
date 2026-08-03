@@ -1,41 +1,13 @@
-# Примеры: агент health → Partner (как Zabbix active)
+# examples/ — устаревшие черновики
 
-Черновики контрактов и установки. Код `flat_check.sh` пока **не** умеет `--json`/`--push` —
-это целевой вид после доработки.
+Рабочий комплект агента (conf, install, cron, README установщика) перенесён в **[`../agent/`](../agent/)**.
 
-## Схема
-
-```text
-[каждая нода продукта]
-  cron → flat_check --json --push
-           │
-           ▼
-     Partner ingest API
-           │
-           ▼
-     GET /health → UI (сводка / пакеты / система / infra)
-```
-
-## Файлы
-
-| Файл | Назначение |
-|------|------------|
-| `health-payload.example.json` | снимок одной ноды под поля дашборда |
-| `flat_check.conf.example` | конфиг агента на ноде |
-| `flat_check.hosts.example` | опциональный remote-map (bastion/SSH) |
-| `cron.example` | crontab |
-| `install_flat_check.sh.example` | скелет установщика |
-| `cli.examples.sh` | примеры команд |
-
-## Быстрый просмотр CLI
+Используйте:
 
 ```bash
-# локально, один пакет (будущий флаг)
-./flat_check.sh --pkg fss-server --json
-
-# нода → push на Partner
-./flat_check.sh --json --push
-
-# bastion: удаленная проверка по карте хостов (опционально)
-./flat_check.sh --remote-map /etc/flat/flat_check.hosts --json
+sudo ./agent/install_flat_check.sh --help
+# документация:
+less agent/README.md
 ```
+
+Файлы в этой папке оставлены для совместимости со старыми ссылками; при расхождении источник истины — `agent/`.

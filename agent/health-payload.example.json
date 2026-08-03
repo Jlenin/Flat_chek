@@ -1,0 +1,196 @@
+{
+  "timestamp": "2026-08-03T08:15:00Z",
+  "host_id": "ss-n1",
+  "host_ip": "10.0.1.5",
+  "service_name": "fss-backend",
+  "script_version": "3.7.0",
+  "summary": {
+    "installed": 3,
+    "warnings": 1,
+    "errors": 0
+  },
+  "system": {
+    "cpu": {
+      "usage_percent": 17
+    },
+    "cpu_services": [
+      {
+        "service_name": "fss-server",
+        "usage_percent": 9
+      },
+      {
+        "service_name": "fss-srclient",
+        "usage_percent": 2
+      }
+    ],
+    "memory": {
+      "total_mb": 16014,
+      "used_mb": 4200,
+      "available_mb": 11000
+    },
+    "memory_services": [
+      {
+        "service_name": "fss-server",
+        "usage_percent": 12
+      },
+      {
+        "service_name": "fss-srclient",
+        "usage_percent": 3
+      }
+    ],
+    "disk": [
+      {
+        "filesystem": "/dev/root",
+        "mount": "/",
+        "used_percent": 42
+      }
+    ],
+    "network": [
+      {
+        "interface": "eth0",
+        "mbps": "1.20"
+      }
+    ],
+    "uptime_seconds": 864000
+  },
+  "uptime_services": [
+    {
+      "service_name": "fss-server",
+      "uptime": 860000
+    },
+    {
+      "service_name": "fss-srclient",
+      "uptime": 860000
+    }
+  ],
+  "certificates": [
+    {
+      "path": "/etc/ssl/certs/flat.pem",
+      "subject": "CN=ss-n1.example.local",
+      "days_left": 120
+    }
+  ],
+  "products": [
+    {
+      "name": "SoftSwitch",
+      "packages": [
+        {
+          "name": "fss-server",
+          "status": "ok",
+          "version": "2.14.0-1",
+          "host_id": "ss-n1",
+          "depends_meta": [
+            "mariadb"
+          ],
+          "depends_pm": [
+            "mariadb-server"
+          ],
+          "systemd": {
+            "service_name": "fss-server",
+            "unit_path": "/lib/systemd/system/fss-server.service",
+            "status": "active"
+          },
+          "directories": [
+            {
+              "type": "opt",
+              "path": "/opt/flat/fss-server",
+              "owner": "flat-service",
+              "status": "ok"
+            },
+            {
+              "type": "log",
+              "path": "/var/log/flat/fss-server",
+              "owner": "flat-service",
+              "status": "ok"
+            }
+          ],
+          "configs": [
+            {
+              "service_name": "fss-server",
+              "path": "/opt/flat/fss-server/settings.ini",
+              "status": "ok"
+            }
+          ],
+          "process": {
+            "status": "running",
+            "pids": [
+              14201
+            ],
+            "ps_lines": [
+              "14201 flat-service /opt/flat/fss-server/bin/fss-server"
+            ]
+          },
+          "ports": [
+            {
+              "number": "5060",
+              "status": "listening"
+            },
+            {
+              "number": "10000-20000",
+              "status": "configured"
+            }
+          ],
+          "api": {
+            "url": "http://127.0.0.1:8080/api/health",
+            "status_code": 200,
+            "status": "ok"
+          }
+        },
+        {
+          "name": "fss-srclient",
+          "status": "ok",
+          "version": "2.14.0-1",
+          "host_id": "ss-n1",
+          "depends_meta": [],
+          "depends_pm": [],
+          "systemd": {
+            "service_name": "fss-srclient",
+            "unit_path": "/lib/systemd/system/fss-srclient.service",
+            "status": "active"
+          },
+          "directories": [
+            {
+              "type": "opt",
+              "path": "/opt/flat/fss-srclient",
+              "owner": "flat-service",
+              "status": "ok"
+            },
+            {
+              "type": "log",
+              "path": "/var/log/flat/fss-srclient",
+              "owner": "flat-service",
+              "status": "ok"
+            }
+          ],
+          "configs": [],
+          "process": {
+            "status": "running",
+            "pids": [
+              14310
+            ],
+            "ps_lines": [
+              "14310 flat-service /opt/flat/fss-srclient/bin/srclient"
+            ]
+          },
+          "ports": [],
+          "api": {
+            "url": "",
+            "status_code": 0,
+            "status": "n/a"
+          }
+        }
+      ]
+    }
+  ],
+  "infrastructure": [
+    {
+      "service_name": "mariadb",
+      "status": "active",
+      "version": "10.6.16",
+      "port_open": "3306",
+      "required_by": "fss-server",
+      "host_id": "db-n1",
+      "note": "на этой ноде может быть пусто; полный статус пришлёт агент с db-n1"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+### Пример запроса, который шлёт агент (curl под капотом --push)
+# Backend Partner принимает и сохраняет снимок по host_id (+ service_name),
+# а GET /health отдаёт агрегат для UI.
+
+POST https://partner.example.local/api/v1/health/ingest
+Authorization: Bearer CHANGE_ME
+Content-Type: application/json
+X-Flat-Host-Id: ss-n1
+X-Flat-Service-Name: fss-backend
+
+< ./health-payload.example.json
+
+###
+
+# Ожидаемый ответ (пример)
+# HTTP/1.1 202 Accepted
+# { "status": "accepted", "host_id": "ss-n1", "timestamp": "2026-08-03T08:15:00Z" }
