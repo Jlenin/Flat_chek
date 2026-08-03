@@ -1,6 +1,9 @@
 #!/bin/bash
 # flat_check_2.sh — проверка состояния FLAT/FCS + сборщик логов
 #
+# Health-only вариант (без сборщика логов) — flat_check.sh: тот же опрос
+# ОС/ресурсов/служб (1к1 с блоками 0–5 и resource-gate), CLI: -i/--info.
+#
 # Работает на: Debian/Ubuntu, RHEL/CentOS/ALMA/Rocky/РЕД ОС, Astra, … (dpkg/rpm + systemd)
 #
 # Режимы:
