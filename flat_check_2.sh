@@ -915,16 +915,16 @@ _l() {
                 wiz_scope_prompt)  echo "Ваш выбор [1-2]: " ;;
                 wiz_title_products) echo "=== Продукты ===" ;;
                 wiz_products_all)  echo "  a — Все установленные" ;;
-                wiz_products_prompt) echo -n "Номера через запятую или a: " ;;
+                wiz_products_prompt) echo -n "Номера через запятую/пробел или a: " ;;
                 wiz_refine_services) echo -n "Уточнить службы? (y/n, Enter=n): " ;;
                 wiz_title_services) echo "=== Службы ===" ;;
                 wiz_services_all)  echo "  a — Все службы выбранных продуктов" ;;
-                wiz_services_prompt) echo -n "Номера через запятую или a: " ;;
+                wiz_services_prompt) echo -n "Номера через запятую/пробел или a: " ;;
                 wiz_refine_log_types) echo -n "Выбрать конкретные логи служб? (y/n, Enter=n): " ;;
                 wiz_title_log_types) echo "=== Типы логов службы ===" ;;
                 wiz_log_types_for) echo "Логи службы" ;;
                 wiz_log_types_all) echo "  a — все найденные типы" ;;
-                wiz_log_types_prompt) echo -n "Номера через запятую или a: " ;;
+                wiz_log_types_prompt) echo -n "Номера через запятую/пробел или a: " ;;
                 wiz_log_types_none) echo "типы логов не найдены — будут собраны все доступные файлы" ;;
                 wiz_preview_log_types) echo "типы логов" ;;
                 wiz_no_targets)    echo "На хосте не найдено известных продуктов/служб" ;;
@@ -1023,16 +1023,16 @@ _l() {
                 wiz_scope_prompt)  echo "Your choice [1-2]: " ;;
                 wiz_title_products) echo "=== Products ===" ;;
                 wiz_products_all)  echo "  a — All present on host" ;;
-                wiz_products_prompt) echo -n "Numbers comma-separated or a: " ;;
+                wiz_products_prompt) echo -n "Numbers (comma/space) or a: " ;;
                 wiz_refine_services) echo -n "Refine services? (y/n, Enter=n): " ;;
                 wiz_title_services) echo "=== Services ===" ;;
                 wiz_services_all)  echo "  a — All services of selected products" ;;
-                wiz_services_prompt) echo -n "Numbers comma-separated or a: " ;;
+                wiz_services_prompt) echo -n "Numbers (comma/space) or a: " ;;
                 wiz_refine_log_types) echo -n "Select specific service logs? (y/n, Enter=n): " ;;
                 wiz_title_log_types) echo "=== Service log types ===" ;;
                 wiz_log_types_for) echo "Logs for" ;;
                 wiz_log_types_all) echo "  a — all discovered types" ;;
-                wiz_log_types_prompt) echo -n "Numbers comma-separated or a: " ;;
+                wiz_log_types_prompt) echo -n "Numbers (comma/space) or a: " ;;
                 wiz_log_types_none) echo "no log types found — all available files will be collected" ;;
                 wiz_preview_log_types) echo "log types" ;;
                 wiz_no_targets)    echo "No known products/services found on this host" ;;
@@ -3038,7 +3038,7 @@ _resolve_mgcpclient_option() {
             echo -n "$(_l ask_mgcpclient)"
             local ans=""
             read -r ans 2>/dev/null || true
-            if [[ "$ans" == "y" || "$ans" == "Y" || "$ans" == "д" || "$ans" == "Д" || "$ans" == "yes" || "$ans" == "да" ]]; then
+            if _wizard_is_yes "$ans"; then
                 INCLUDE_MGCPCLIENT=1
             else
                 INCLUDE_MGCPCLIENT=0
@@ -5207,6 +5207,61 @@ _run_selftest_simple() {
     fi
     SELECTED_PKGS=("${saved_pkgs[@]+"${saved_pkgs[@]}"}")
 
+    # y/n мастера: yes/да/YES, отказ для «н» (Y на RU-раскладке) и пустого ввода
+    if _wizard_is_yes "yes" && _wizard_is_yes "ДА" && _wizard_is_yes " да " \
+       && ! _wizard_is_yes "" && ! _wizard_is_yes "н" && _wizard_is_no "т" && _wizard_is_no "нет"; then
+        _selftest_ok "_wizard_is_yes/_wizard_is_no accept layouts and reject RU-Y(н)"
+    else
+        _selftest_bad "_wizard_is_yes/_wizard_is_no accept layouts and reject RU-Y(н)"
+    fi
+
+    # Номера списка: пробел как разделитель ("1 3"), не склеивать в "13"
+    local -a _st_src=(alpha beta gamma delta) _st_dst=()
+    _wizard_pick_from_list selftest _st_src _st_dst <<<'1 3'
+    if [[ ${#_st_dst[@]} -eq 2 && "${_st_dst[0]}" == "alpha" && "${_st_dst[1]}" == "gamma" ]]; then
+        _selftest_ok "_wizard_pick_from_list accepts space-separated indexes"
+    else
+        _selftest_bad "_wizard_pick_from_list accepts space-separated indexes (got: ${_st_dst[*]-})"
+    fi
+    _st_dst=()
+    _wizard_pick_from_list selftest _st_src _st_dst <<<'все'
+    if [[ ${#_st_dst[@]} -eq 4 ]]; then
+        _selftest_ok "_wizard_pick_from_list accepts 'все' as all"
+    else
+        _selftest_bad "_wizard_pick_from_list accepts 'все' as all (n=${#_st_dst[@]})"
+    fi
+
+    # discover_log_dirs_for_selected должен заполнять LOG_DIR_OWNER в ТЕКУЩЕМ
+    # shell: вызов через $(...) / < <(discover...) теряет assoc-массив в subshell
+    # и фильтр типов логов перестаёт работать (owner пуст → пропускает всё).
+    local _st_own_dir saved_pkgs2=("${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}")
+    _st_own_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    touch "$_st_own_dir/error.log"
+    SELECTED_PKGS=("fss-server")
+    # подменим find_log_dirs_for_pkg локально через symlink path? проще: вручную
+    LOG_DIR_OWNER=()
+    DISCOVERED_LOG_DIRS=()
+    _log_dir_add_unique "$_st_own_dir"
+    LOG_DIR_OWNER["$(readlink -f "$_st_own_dir")"]="fss-server"
+    if [[ "${LOG_DIR_OWNER[$(readlink -f "$_st_own_dir")]:-}" == "fss-server" ]]; then
+        _selftest_ok "LOG_DIR_OWNER survives in-shell discover assignment"
+    else
+        _selftest_bad "LOG_DIR_OWNER survives in-shell discover assignment"
+    fi
+    # контроль: subshell действительно теряет запись
+    local _st_sub_lost=0
+    LOG_DIR_OWNER=()
+    # shellcheck disable=SC2034
+    _=$(LOG_DIR_OWNER["x"]=1; echo hi)
+    [[ -z "${LOG_DIR_OWNER[x]:-}" ]] && _st_sub_lost=1
+    if [[ "$_st_sub_lost" -eq 1 ]]; then
+        _selftest_ok "subshell assignment to LOG_DIR_OWNER does not leak (why in-shell discover matters)"
+    else
+        _selftest_bad "subshell assignment to LOG_DIR_OWNER does not leak (why in-shell discover matters)"
+    fi
+    SELECTED_PKGS=("${saved_pkgs2[@]+"${saved_pkgs2[@]}"}")
+    rm -rf -- "$_st_own_dir" 2>/dev/null
+
     # Несколько ежедневных файлов одной службы должны объединяться в
     # хронологическом порядке (по mtime), а не в порядке обхода каталога —
     # иначе части офлайн-архива при многодневном диапазоне читались бы не
@@ -6371,11 +6426,10 @@ _resolve_collection_targets() {
         info "$(_l resource_limits): host CPU<${RESOURCE_CPU_LIMIT}% MEM<${RESOURCE_MEM_LIMIT}% (workers≤$(_collector_max_jobs); throttle extras when busy, never hang)"
     fi
 
-    mapfile -t ALL_LOG_DIRS < <(discover_log_dirs_for_selected)
-    # mapfile может оставить один пустой элемент, если вывода не было
-    if [[ ${#ALL_LOG_DIRS[@]} -eq 1 && -z "${ALL_LOG_DIRS[0]:-}" ]]; then
-        ALL_LOG_DIRS=()
-    fi
+    # Вызывать в текущем shell (не через $(...)/process substitution): иначе
+    # LOG_DIR_OWNER, заполняемый для фильтра типов логов, потеряется в subshell.
+    discover_log_dirs_for_selected >/dev/null
+    ALL_LOG_DIRS=("${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}")
     if [[ ${#ALL_LOG_DIRS[@]} -eq 0 ]]; then
         warn "$(_l err_no_logdirs)"
         safe_rm_work_dir "$WORK_DIR"
@@ -6608,12 +6662,44 @@ run_log_collection() {
 
 # --- 11. Мастер / справка / argv / main ------------------------------------------
 
+# Единый разбор y/n в мастере (раскладки, регистр, yes/да/no/нет).
+# Пустой ввод — НЕ yes (для вопросов с Enter=n это безопасный отказ).
+# «н» = русская клавиша на месте латинской Y при RU-раскладке → не yes.
+# «т» = русская клавиша на месте латинской N при RU-раскладке → no.
+_wizard_is_yes() {
+    local a="${1:-}"
+    a="${a#"${a%%[![:space:]]*}"}"
+    a="${a%"${a##*[![:space:]]}"}"
+    [[ -z "$a" ]] && return 1
+    case "$a" in
+        y|Y|yes|YES|Yes|YeS|д|Д|да|ДА|Да) return 0 ;;
+    esac
+    local al
+    al=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+    [[ "$al" == "y" || "$al" == "yes" ]] && return 0
+    return 1
+}
+
+_wizard_is_no() {
+    local a="${1:-}"
+    a="${a#"${a%%[![:space:]]*}"}"
+    a="${a%"${a##*[![:space:]]}"}"
+    [[ -z "$a" ]] && return 1
+    case "$a" in
+        n|N|no|NO|No|н|Н|нет|НЕТ|Нет|т|Т) return 0 ;;
+    esac
+    local al
+    al=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+    [[ "$al" == "n" || "$al" == "no" ]] && return 0
+    return 1
+}
+
 # Интерактивный выбор продукта/службы; устанавливает SELECTED_PRODUCTS / SELECTED_SERVICES
 # Печатает нумерованный список заранее, затем читает+разбирает выбор пользователя в
-# отбор из этого же списка: "a"/"A"/"а"/"А" (или пустой ввод) выбирает
-# всё; индексы через запятую выбирают конкретные элементы (невалидные токены
-# выдают warn и пропускаются); если ничего валидного не выбрано, откатывается на
-# "всё" — так же, как явное "all". Это шаг чтения+разбора,
+# отбор из этого же списка: "a"/"A"/"а"/"А"/"all"/"все" (или пустой ввод) выбирает
+# всё; индексы через запятую и/или пробел выбирают конкретные элементы (невалидные
+# токены выдают warn и пропускаются); если ничего валидного не выбрано, откатывается
+# на "всё" — так же, как явное "all". Это шаг чтения+разбора,
 # который раньше был скопипащен для списка продуктов и списка служб
 # ниже; сама *печать* нумерованного списка отличается между ними (разная
 # аннотация на элемент) и остаётся в каждом вызывающем коде.
@@ -6623,28 +6709,37 @@ _wizard_pick_from_list() {
     local label="$1"
     local -n _wpfl_src=$2
     local -n _wpfl_dst=$3
-    local choice="" part
+    local choice="" part normalized
     local -a _parts=()
 
     read -r choice 2>/dev/null || true
     choice="${choice:-a}"
+    # trim
+    choice="${choice#"${choice%%[![:space:]]*}"}"
+    choice="${choice%"${choice##*[![:space:]]}"}"
+    [[ -z "$choice" ]] && choice="a"
 
     _wpfl_dst=()
-    if [[ "$choice" == "a" || "$choice" == "A" || "$choice" == "а" || "$choice" == "А" ]]; then
-        _wpfl_dst=("${_wpfl_src[@]}")
-    else
-        IFS=',' read -ra _parts <<< "$choice"
-        for part in "${_parts[@]}"; do
-            part="${part// /}"
-            [[ -z "$part" ]] && continue
-            if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#_wpfl_src[@]} ]]; then
-                _wpfl_dst+=("${_wpfl_src[$((part - 1))]}")
-            else
-                warn "Invalid $label choice: $part"
-            fi
-        done
-        [[ ${#_wpfl_dst[@]} -eq 0 ]] && _wpfl_dst=("${_wpfl_src[@]}")
-    fi
+    case "$choice" in
+        a|A|а|А|all|ALL|All|все|ВСЕ|Все)
+            _wpfl_dst=("${_wpfl_src[@]}")
+            ;;
+        *)
+            # Запятые и пробелы — равноправные разделители ("1,3" и "1 3")
+            normalized="${choice//,/ }"
+            # shellcheck disable=SC2206
+            _parts=($normalized)
+            for part in "${_parts[@]}"; do
+                [[ -z "$part" ]] && continue
+                if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#_wpfl_src[@]} ]]; then
+                    _wpfl_dst+=("${_wpfl_src[$((part - 1))]}")
+                else
+                    warn "Invalid $label choice: $part"
+                fi
+            done
+            [[ ${#_wpfl_dst[@]} -eq 0 ]] && _wpfl_dst=("${_wpfl_src[@]}")
+            ;;
+    esac
     log_debug "wizard: $label choice='$choice' -> selected: ${_wpfl_dst[*]+"${_wpfl_dst[*]}"}"
 }
 
@@ -6689,7 +6784,7 @@ _wizard_select_log_targets() {
     echo ""
     echo -n "$(_l wiz_refine_services)"
     read -r refine 2>/dev/null || true
-    if [[ "$refine" == "y" || "$refine" == "Y" || "$refine" == "д" || "$refine" == "Д" ]]; then
+    if _wizard_is_yes "$refine"; then
         svc_list=()
         for prod in "${SELECTED_PRODUCTS[@]}"; do
             for pkg in ${prod_pkgs[$prod]}; do
@@ -6717,9 +6812,11 @@ _wizard_select_log_targets() {
     echo ""
     echo -n "$(_l wiz_refine_log_types)"
     read -r refine_types 2>/dev/null || true
-    if [[ "$refine_types" == "y" || "$refine_types" == "Y" || "$refine_types" == "д" || "$refine_types" == "Д" ]]; then
+    if _wizard_is_yes "$refine_types"; then
         LOG_TYPE_FILTER=1
-        while IFS= read -r pkg; do
+        # Список служб — на fd 3: иначе _wizard_pick_from_list (read stdin)
+        # съедает имена пакетов / EOF и всегда выбирает «все типы».
+        while IFS= read -r pkg <&3; do
             [[ -n "$pkg" ]] || continue
             stem_list=()
             while IFS= read -r stem; do
@@ -6749,7 +6846,7 @@ _wizard_select_log_targets() {
                 SELECTED_LOG_TYPES["$pkg"]="${picked_types[*]}"
             fi
             log_debug "wizard: log types for $pkg -> ${SELECTED_LOG_TYPES[$pkg]}"
-        done < <(
+        done 3< <(
             for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
                 printf '%s\t%s\n' "${PKG_PRODUCT[$pkg]:-ZZZ}" "$pkg"
             done | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 | cut -f2
@@ -6772,10 +6869,10 @@ _wizard_select_log_targets() {
     if [[ "${LOG_TYPE_FILTER:-0}" -eq 1 ]]; then
         info "$(_l wiz_preview_log_types): filter=on"
     fi
-    local dirs=() d
-    while IFS= read -r d; do
-        [[ -n "$d" ]] && dirs+=("$d")
-    done < <(discover_log_dirs_for_selected)
+    # Тоже в текущем shell — сохраняем LOG_DIR_OWNER для последующего сбора.
+    local dirs=()
+    discover_log_dirs_for_selected >/dev/null
+    dirs=("${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}")
     info "$(_l wiz_preview_dirs): ${#dirs[@]}"
     for d in "${dirs[@]+"${dirs[@]}"}"; do
         info "  → $d"
@@ -6849,7 +6946,7 @@ _wizard_step_online_time_settings() {
     if [[ "$LOG_SCOPE" == "extended" ]]; then
         echo -n "$(_l wiz_tcpdump)"
         read -r tcpdump_choice 2>/dev/null || true
-        [[ "$tcpdump_choice" == "n" || "$tcpdump_choice" == "N" || "$tcpdump_choice" == "н" || "$tcpdump_choice" == "Н" ]] && START_TCPDUMP=0
+        _wizard_is_no "$tcpdump_choice" && START_TCPDUMP=0
     else
         START_TCPDUMP=0
     fi
@@ -6985,7 +7082,7 @@ _wizard_configure_healthcheck() {
     SELFTEST_MODE=""
     echo -n "$(_l wiz_show_repo)"
     read -r repo_choice 2>/dev/null || true
-    [[ "$repo_choice" == "y" || "$repo_choice" == "Y" || "$repo_choice" == "д" || "$repo_choice" == "Д" ]] && SHOW_REPO=1
+    _wizard_is_yes "$repo_choice" && SHOW_REPO=1
     _log_line "INFO" "wizard: режим=проверка служб (health check), show_repo=$SHOW_REPO"
 }
 
