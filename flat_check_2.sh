@@ -50,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.10.0"
+SCRIPT_VERSION="3.10.1"
 
 set -uo pipefail
 
@@ -3933,9 +3933,7 @@ _filter_byte_range_parallel() {
     [[ "$end_off" -gt "$start_off" ]] || return 1
     range=$((end_off - start_off))
     size=$(_file_size_bytes "$file")
-    max_jobs=$(_collector_max_jobs)
-    # Вложено под copy-воркер: оставляем запас для соседних copy-задач
-    [[ "$max_jobs" -gt 4 ]] && max_jobs=$(( (max_jobs + 1) / 2 ))
+    max_jobs=$(_collector_inner_max_jobs)
     [[ "$max_jobs" -lt 1 ]] && max_jobs=1
     chunk_sz="${SEEK_CHUNK_BYTES:-67108864}"
 
@@ -4328,7 +4326,8 @@ _psl_copy_chunks() {
     local n=$((${#bounds[@]} - 1))
     local max_jobs i off next len part idx=0 count=0
 
-    max_jobs=$(_collector_max_jobs)
+    max_jobs=$(_collector_inner_max_jobs)
+    [[ "$max_jobs" -lt 1 ]] && max_jobs=1
     _SEEK_JOB_PIDS=()
 
     for (( i=0; i<n; i++ )); do
@@ -5302,7 +5301,9 @@ _log_extract_one_file() {
     return "$rc"
 }
 
-# --- прогресс offline-extract (общий счётчик между parallel dir-jobs) ----------
+# --- прогресс offline-extract (общий счётчик между parallel file-jobs) ----------
+# Sticky-строка: всегда \r + CSI K (стереть до конца), иначе хвост прошлого
+# имени «наезжает» (ping.log + agent.log → ping.loggent.log).
 _collect_progress_init() {
     local total="$1"
     _COLLECT_PROGRESS_TOTAL="$total"
@@ -5319,12 +5320,22 @@ _collect_progress_init() {
     fi
 }
 
+_collect_progress_fmt_label() {
+    # убрать CR/CSI из имени; обрезать, чтобы строка не разъезжалась
+    local s="$1"
+    s="${s//$'\r'/}"
+    s="${s//$'\033'/}"
+    s="${s:0:48}"
+    printf '%s' "$s"
+}
+
 _collect_progress_tick() {
     local label="${1:-}"
-    local done total pct last_pct lock
+    local done total pct last_pct lock shown
     [[ -n "${_COLLECT_PROGRESS_DIR:-}" && -d "$_COLLECT_PROGRESS_DIR" ]] || return 0
     total="${_COLLECT_PROGRESS_TOTAL:-0}"
     [[ "$total" -gt 0 ]] || return 0
+    label=$(_collect_progress_fmt_label "$label")
     lock="$_COLLECT_PROGRESS_DIR/lock"
     (
         if command -v flock >/dev/null 2>&1; then
@@ -5336,16 +5347,17 @@ _collect_progress_tick() {
         [[ -n "$label" ]] && printf '%s\n' "$label" > "$_COLLECT_PROGRESS_DIR/label"
         pct=$((done * 100 / total))
         last_pct=$(cat "$_COLLECT_PROGRESS_DIR/last_pct" 2>/dev/null || echo -1)
-        # консоль: sticky \r; в лог — каждый ≥5% или последний файл
+        shown="extract: ${pct}% (${done}/${total}) ${label}"
+        # консоль: sticky \r + clear-to-EOL; в лог — каждый ≥5% или последний
         if [[ -t 1 ]]; then
-            printf '\r[INFO] extract: %d%% (%d/%d) %s' "$pct" "$done" "$total" "$label"
+            printf '\r\033[K[INFO] %s' "$shown"
             [[ "$done" -ge "$total" ]] && printf '\n'
         fi
         if [[ "$pct" -ge $((last_pct + 5)) || "$done" -ge "$total" ]]; then
             printf '%s\n' "$pct" > "$_COLLECT_PROGRESS_DIR/last_pct"
-            _log_line "INFO" "extract: ${pct}% (${done}/${total}) ${label}"
+            _log_line "INFO" "$shown"
             if [[ ! -t 1 ]]; then
-                info "extract: ${pct}% (${done}/${total}) ${label}"
+                info "$shown"
             fi
         fi
     ) 9>"$lock" 2>/dev/null || true
@@ -5357,7 +5369,7 @@ _collect_progress_finish() {
     done=$(cat "$_COLLECT_PROGRESS_DIR/done" 2>/dev/null || echo 0)
     total="${_COLLECT_PROGRESS_TOTAL:-0}"
     if [[ -t 1 ]]; then
-        printf '\r[INFO] extract: 100%% (%s/%s) done\n' "$done" "$total"
+        printf '\r\033[K[INFO] extract: 100%% (%s/%s) done\n' "$done" "$total"
     fi
     log_debug "extract progress finished: ${done}/${total}"
     rm -rf -- "$_COLLECT_PROGRESS_DIR" 2>/dev/null
@@ -5420,62 +5432,159 @@ _log_count_all_candidates() {
     echo "$n"
 }
 
-# Runs _log_extract_dir_by_range() for every directory in the global
-# ALL_LOG_DIRS, one background job per directory on the same resource-
-# aware collector job pool the rest of the offline path already uses
-# (COLLECTOR_JOB_PIDS/_collector_wait_slot) — parce_service_log()'s own
-# inner chunk-extraction workers use the separate _SEEK_JOB_PIDS pool, the
-# same nested-pools pattern _copy_log_files_parallel()/
-# _filter_byte_range_parallel() already rely on elsewhere in this file.
-# Directories that end up with nothing in range get an "absent" note
-# instead of a silently empty folder.
+# Один файл → изолированный inbox/$idx.log (+ .group), без гонок по groups/*.
+# Порядок склейки потом — по idx (как обход кандидатов).
+_log_extract_one_file_to_inbox() {
+    local file="$1" from_epoch="$2" to_epoch="$3" work_dir="$4" idx="$5"
+    local group tmp_work out
+    group=$(_psl_log_group_key "$file")
+    mkdir -p "$work_dir/inbox" 2>/dev/null || return 1
+    printf '%s\n' "$group" > "$work_dir/inbox/${idx}.group"
+    tmp_work="$work_dir/inbox/${idx}.work"
+    mkdir -p "$tmp_work/groups" 2>/dev/null || return 1
+    if _log_extract_one_file "$file" "$from_epoch" "$to_epoch" "$tmp_work"; then
+        out="$tmp_work/groups/${group}.log"
+        if [[ -s "$out" ]]; then
+            mv -- "$out" "$work_dir/inbox/${idx}.log" 2>/dev/null \
+                || cp -- "$out" "$work_dir/inbox/${idx}.log" 2>/dev/null
+            rm -rf -- "$tmp_work" 2>/dev/null
+            return 0
+        fi
+    fi
+    rm -rf -- "$tmp_work" 2>/dev/null
+    return 1
+}
+
+# Склеить inbox/*.log в groups/<group>.log в порядке idx (числовом).
+_log_merge_inbox_to_groups() {
+    local work_dir="$1"
+    local idx group f
+    local -a idxs=()
+
+    mkdir -p "$work_dir/groups" 2>/dev/null || return 1
+    mapfile -t idxs < <(
+        for f in "$work_dir"/inbox/*.group; do
+            [[ -f "$f" ]] || continue
+            basename -- "$f" .group
+        done | sort -n
+    )
+    for idx in "${idxs[@]+"${idxs[@]}"}"; do
+        [[ -s "$work_dir/inbox/${idx}.log" ]] || continue
+        group=$(cat "$work_dir/inbox/${idx}.group" 2>/dev/null) || continue
+        [[ -n "$group" ]] || continue
+        cat "$work_dir/inbox/${idx}.log" >> "$work_dir/groups/${group}.log" 2>/dev/null || true
+    done
+}
+
+# Воркер пула файлов: аргументы раскрываются родителем до & (без гонки $idx).
+_log_file_pool_worker() {
+    local file="$1" from_epoch="$2" to_epoch="$3" work_dir="$4" idx="$5" base="$6" inner_jobs="$7"
+    export FLAT_FILE_POOL_WORKER=1
+    export FLAT_INNER_MAX_JOBS="$inner_jobs"
+    renice -n 10 $$ >/dev/null 2>&1 || true
+    ionice -c 2 -n 7 -p $$ >/dev/null 2>&1 || true
+    if [[ -n "$from_epoch" || -n "$to_epoch" ]]; then
+        if ! _log_should_process_for_range "$file" "${from_epoch:-0}" "${to_epoch:-9999999999}"; then
+            _collect_progress_tick "skip:$base"
+            return 0
+        fi
+    fi
+    _collect_progress_tick "$base"
+    if _log_extract_one_file_to_inbox "$file" "$from_epoch" "$to_epoch" "$work_dir" "$idx"; then
+        log_debug "kept: $file"
+    else
+        log_debug "discarded (no lines in requested range or read error): $file"
+    fi
+}
+
+# Offline по ВСЕМ ALL_LOG_DIRS: пул воркеров по ФАЙЛАМ (не по каталогам),
+# под host-wide gate CPU/MEM ≤ RESOURCE_*%. Вложенный chunk-seek при
+# max_jobs≥2 приглушён (FLAT_INNER_MAX_JOBS=1), чтобы не было N×M > 80%.
+# Каталоги без строк в диапазоне — "absent", как раньше.
 _log_extract_all_dirs_by_range() {
     local work_root="$1" from_epoch="$2" to_epoch="$3"
-    local logdir dest_name max_jobs result_dir rf idx=0 ctx="plain" total=0
-    local -a labels=()
+    local logdir dest_name max_jobs idx=0 ctx="plain" total=0
+    local work_dir f base inner_jobs chunk_count
+    local -A dest_work=()
+    local -a dest_order=()
 
     [[ -n "$from_epoch" || -n "$to_epoch" ]] && ctx="period"
     max_jobs=$(_collector_max_jobs)
-    result_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_logscan.XXXXXX") || return 1
     COLLECTOR_JOB_PIDS=()
 
-    total=$(_log_count_all_candidates)
+    # Per-dir scratch + подсчёт кандидатов
+    for logdir in "${ALL_LOG_DIRS[@]}"; do
+        dest_name=$(_archive_subdir_name "$logdir")
+        dest_order+=("$dest_name")
+        work_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_logdir.XXXXXX") || continue
+        mkdir -p "$work_dir/inbox" "$work_dir/groups" 2>/dev/null
+        dest_work["$dest_name"]="$work_dir"
+        while IFS= read -r -d '' f; do
+            total=$((total + 1))
+        done < <(_log_candidate_files_for_dir "$logdir")
+    done
+
     _collect_progress_init "$total" || true
 
+    # При нескольких file-воркерах — без fan-out chunk-seek внутри каждого
+    if [[ "$max_jobs" -ge 2 ]]; then
+        inner_jobs=1
+    else
+        inner_jobs=$(_collector_max_jobs)
+    fi
+    info "Parallel file workers: $max_jobs (host-wide CPU/MEM gate ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}%; inner chunks≤${inner_jobs})"
+
     for logdir in "${ALL_LOG_DIRS[@]}"; do
-        _collector_should_stop && {
-            _collector_kill_jobs
-            _collect_progress_finish
-            rm -rf -- "$result_dir"
-            return 130
-        }
-        if ! _collector_wait_slot "$max_jobs"; then
-            _collector_kill_jobs
-            _collect_progress_finish
-            rm -rf -- "$result_dir"
-            return 130
-        fi
         dest_name=$(_archive_subdir_name "$logdir")
-        labels+=("$dest_name")
-        idx=$((idx + 1))
-        rf="$result_dir/$idx"
-        (
-            renice -n 10 $$ >/dev/null 2>&1 || true
-            ionice -c 2 -n 7 -p $$ >/dev/null 2>&1 || true
-            _log_extract_dir_by_range "$logdir" "$work_root/$dest_name" "$from_epoch" "$to_epoch" \
-                && echo "OK" > "$rf"
-        ) &
-        COLLECTOR_JOB_PIDS+=($!)
+        work_dir="${dest_work[$dest_name]:-}"
+        [[ -n "$work_dir" && -d "$work_dir" ]] || continue
+
+        while IFS= read -r -d '' f; do
+            _collector_should_stop && {
+                _collector_kill_jobs
+                _collect_progress_finish
+                for dest_name in "${dest_order[@]+"${dest_order[@]}"}"; do
+                    rm -rf -- "${dest_work[$dest_name]:-}" 2>/dev/null
+                done
+                return 130
+            }
+            if ! _collector_wait_slot "$max_jobs"; then
+                _collector_kill_jobs
+                _collect_progress_finish
+                for dest_name in "${dest_order[@]+"${dest_order[@]}"}"; do
+                    rm -rf -- "${dest_work[$dest_name]:-}" 2>/dev/null
+                done
+                return 130
+            fi
+            idx=$((idx + 1))
+            base=$(basename -- "$f")
+            _log_file_pool_worker "$f" "$from_epoch" "$to_epoch" "$work_dir" "$idx" "$base" "$inner_jobs" &
+            COLLECTOR_JOB_PIDS+=($!)
+        done < <(_log_candidate_files_for_dir "$logdir")
     done
+
     _collector_wait_all_jobs
     _collect_progress_finish
 
-    idx=0
-    for dest_name in "${labels[@]}"; do
-        idx=$((idx + 1))
-        [[ -f "$result_dir/$idx" ]] || info "${dest_name}: $(_log_absent_reason "$ctx")"
+    for dest_name in "${dest_order[@]+"${dest_order[@]}"}"; do
+        work_dir="${dest_work[$dest_name]:-}"
+        if [[ -z "$work_dir" || ! -d "$work_dir" ]]; then
+            info "${dest_name}: $(_log_absent_reason "$ctx")"
+            continue
+        fi
+        _log_merge_inbox_to_groups "$work_dir"
+        if compgen -G "$work_dir/groups/*.log" >/dev/null 2>&1; then
+            mkdir -p "$work_root/$dest_name" 2>/dev/null || true
+            chunk_count=$(_psl_finalize_groups "$work_dir" "$work_root/$dest_name")
+            log_debug "$dest_name: merged inbox -> $work_root/$dest_name (chunks=${chunk_count:-0})"
+            if [[ ! "$chunk_count" =~ ^[0-9]+$ ]] || [[ "$chunk_count" -eq 0 ]]; then
+                info "${dest_name}: $(_log_absent_reason "$ctx")"
+            fi
+        else
+            info "${dest_name}: $(_log_absent_reason "$ctx")"
+        fi
+        rm -rf -- "$work_dir" 2>/dev/null
     done
-    rm -rf -- "$result_dir" 2>/dev/null
 }
 
 # Встроенный юнит-тест seek (используется расширенным selftest / --dev)
@@ -5851,6 +5960,48 @@ _run_selftest_simple() {
         _selftest_bad "_log_extract_one_file stream archive keeps only [from,to]"
     fi
     rm -rf -- "$gwork" 2>/dev/null
+
+    # inbox → groups: порядок склейки по idx (как обход кандидатов)
+    local ibox merged_txt
+    ibox=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    mkdir -p "$ibox/inbox" "$ibox/groups"
+    printf 'sipdump\n' > "$ibox/inbox/2.group"
+    printf 'line-b\n' > "$ibox/inbox/2.log"
+    printf 'sipdump\n' > "$ibox/inbox/1.group"
+    printf 'line-a\n' > "$ibox/inbox/1.log"
+    _log_merge_inbox_to_groups "$ibox"
+    merged_txt=$(tr '\n' '|' < "$ibox/groups/sipdump.log" 2>/dev/null)
+    if [[ "$merged_txt" == "line-a|line-b|" ]]; then
+        _selftest_ok "_log_merge_inbox_to_groups keeps candidate order by idx"
+    else
+        _selftest_bad "_log_merge_inbox_to_groups keeps candidate order by idx (got: $merged_txt)"
+    fi
+    rm -rf -- "$ibox" 2>/dev/null
+
+    # inner max jobs уважает FLAT_INNER_MAX_JOBS (file-pool не плодит N×M)
+    local inner_got
+    inner_got=$(FLAT_INNER_MAX_JOBS=1 _collector_inner_max_jobs)
+    if [[ "$inner_got" == "1" ]]; then
+        _selftest_ok "_collector_inner_max_jobs respects FLAT_INNER_MAX_JOBS=1"
+    else
+        _selftest_bad "_collector_inner_max_jobs respects FLAT_INNER_MAX_JOBS=1 (got: $inner_got)"
+    fi
+
+    # sticky progress: очистка хвоста (короткая метка не оставляет мусор)
+    local prog_out
+    _collect_progress_init 2 >/dev/null || true
+    if [[ -n "${_COLLECT_PROGRESS_DIR:-}" ]]; then
+        # эмулируем длинную → короткую метку; fmt режет/чистит CSI
+        prog_out=$(_collect_progress_fmt_label $'agent.log\r\033[Cping')
+        if [[ "$prog_out" != *$'\r'* && "$prog_out" != *$'\033'* ]]; then
+            _selftest_ok "_collect_progress_fmt_label strips CR/CSI"
+        else
+            _selftest_bad "_collect_progress_fmt_label strips CR/CSI"
+        fi
+        _collect_progress_finish >/dev/null 2>&1 || true
+    else
+        _selftest_bad "_collect_progress_init creates state dir"
+    fi
 
     # discover_log_dirs_for_selected должен заполнять LOG_DIR_OWNER в ТЕКУЩЕМ
     # shell: вызов через $(...) / < <(discover...) теряет assoc-массив в subshell
@@ -6555,6 +6706,20 @@ _collector_max_jobs() {
     echo "$n"
 }
 
+# Вложенный пул (chunk-seek внутри file-worker): не размножать сверх host-gate.
+# FLAT_INNER_MAX_JOBS задаёт родитель (file-pool); иначе — половина outer max.
+_collector_inner_max_jobs() {
+    local n
+    if [[ "${FLAT_INNER_MAX_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$FLAT_INNER_MAX_JOBS"
+        return 0
+    fi
+    n=$(_collector_max_jobs)
+    [[ "$n" -gt 4 ]] && n=$(( (n + 1) / 2 ))
+    [[ "$n" -lt 1 ]] && n=1
+    echo "$n"
+}
+
 # Процент использованной памяти по всему хосту (100 - MemAvailable/MemTotal*100)
 _get_mem_usage_percent() {
     local pct
@@ -7108,6 +7273,7 @@ _run_online_collection() {
     start_resource_monitor
     _get_cpu_usage_percent >/dev/null   # первый вызов лишь инициализирует дельту /proc/stat
     log_debug "resources at start: CPU=$(_get_cpu_usage_percent)% MEM=$(_get_mem_usage_percent)%"
+    info "Online: host-wide CPU/MEM gate ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}% (tails I/O-bound; archive/post uses same worker pool)"
 
     for logdir in "${ALL_LOG_DIRS[@]}"; do
         dest_name=$(_archive_subdir_name "$logdir")
@@ -7196,10 +7362,10 @@ _run_offline_collection() {
     else
         info "$(_l log_all)"
     fi
-    info "Parallel copy workers: $(_collector_max_jobs) (host-wide CPU/MEM gate ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}%)"
     local range_from_epoch="" range_to_epoch=""
     [[ -n "$from_time" ]] && range_from_epoch=$(time_to_epoch "$from_time")
     [[ -n "$to_time" ]] && range_to_epoch=$(time_to_epoch "$to_time")
+    # Пул по файлам + host-gate — см. _log_extract_all_dirs_by_range
     _log_extract_all_dirs_by_range "$WORK_DIR" "$range_from_epoch" "$range_to_epoch"
     if [[ "$collect_infra" -eq 1 ]]; then
         for sysfile in /var/log/messages /var/log/syslog; do
