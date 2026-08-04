@@ -1,0 +1,96 @@
+
+2026-08-04 11:35:26 [INFO ] === flat_check_2.sh v3.9.0 — сессия начата ===
+2026-08-04 11:35:26 [INFO ] Запуск: ./flat_check_2.sh -i (аргументов: 1)
+2026-08-04 11:35:27 [DEBUG] wizard: lang_choice='1' -> CURRENT_LANG=ru
+2026-08-04 11:35:27 [DEBUG] wizard: mode_choice='2'
+2026-08-04 11:35:29 [DEBUG] wizard: submode_choice='2' -> LOG_SUBMODE=offline
+2026-08-04 11:35:30 [DEBUG] wizard: scope_choice='1' -> LOG_SCOPE=brief
+2026-08-04 11:35:34 [DEBUG] wizard: range_choice='1' -> TIMEOUT_RAW='1h' FROM_TIME='' TO_TIME=''
+2026-08-04 11:35:37 [DEBUG] wizard: chunk_choice='1' value='' -> LOG_CHUNK_MODE=size LOG_CHUNK_SIZE_BYTES=104857600 LOG_CHUNK_LINES=500000
+2026-08-04 11:35:37 [INFO ] OS: Debian GNU/Linux 11.8
+2026-08-04 11:35:37 [INFO ] Package manager: dpkg
+2026-08-04 11:35:40 [DEBUG] wizard: available products on host: flat-file SoftSwitch LC
+2026-08-04 11:35:42 [DEBUG] wizard: product choice='2' -> selected: SoftSwitch skip=0
+2026-08-04 11:35:48 [DEBUG] wizard: service choice='4' -> selected: fss-server skip=0
+2026-08-04 11:35:54 [INFO ] mgcpclient: пропущен (файлы mgcpclient* и отдельные каталоги)
+2026-08-04 11:35:54 [INFO ] Выбрано служб: 1
+2026-08-04 11:35:54 [INFO ]   → fss-server
+2026-08-04 11:35:55 [DEBUG] found dir for package 'fss-server': /var/log/flat/fss-server
+2026-08-04 11:35:55 [DEBUG] found dir for package 'fss-server': /opt/flat/fss-server/log
+2026-08-04 11:35:55 [DEBUG] discarded (no log-like files inside): /opt/flat/fss-server/log
+2026-08-04 11:35:55 [INFO ] Лог-директорий к сбору: 1
+2026-08-04 11:35:55 [INFO ]   → /var/log/flat/fss-server
+2026-08-04 11:35:55 [DEBUG] wizard: SELECTED_PRODUCTS=() SELECTED_SERVICES=(fss-server)
+2026-08-04 11:35:57 [INFO ] wizard: режим=сбор логов offline, scope=brief, output_dir='(по умолчанию)'
+2026-08-04 11:35:57 [INFO ] Режим логов: offline / scope=brief (flat_check_2 v3.9.0)
+2026-08-04 11:35:57 [INFO ] Рабочая директория: /root/2026.08.04_11-35_ts-ss-n1
+2026-08-04 11:35:57 [DEBUG] Аргументы run_log_collection: mode=offline timeout_raw='1h' LOG_SCOPE=brief FROM_TIME='' TO_TIME='' OUTPUT_DIR='' INCLUDE_MGCPCLIENT='0' SELECTED_PRODUCTS=() SELECTED_SERVICES=(fss-server)
+2026-08-04 11:35:57 [INFO ] OS: Debian GNU/Linux 11.8
+2026-08-04 11:35:57 [INFO ] Package manager: dpkg
+2026-08-04 11:35:58 [INFO ] Найдено служб: 1 (selected)
+2026-08-04 11:35:58 [INFO ]   → fss-server [SoftSwitch]
+2026-08-04 11:35:58 [INFO ] Лимиты нагрузки системы (host-wide): host CPU<80% MEM<80% (workers≤3; throttle extras when busy, never hang)
+2026-08-04 11:35:59 [DEBUG] found dir for package 'fss-server': /var/log/flat/fss-server
+2026-08-04 11:35:59 [DEBUG] found dir for package 'fss-server': /opt/flat/fss-server/log
+2026-08-04 11:35:59 [DEBUG] discarded (no log-like files inside): /opt/flat/fss-server/log
+2026-08-04 11:35:59 [INFO ] Найдено лог-директорий: 1
+2026-08-04 11:35:59 [INFO ]   → /var/log/flat/fss-server
+2026-08-04 11:35:59 [DEBUG] resources at start: CPU=0% MEM=18%
+2026-08-04 11:35:59 [INFO ] Extracting log lines from 2026-08-04 10:35:59 to 2026-08-04 11:35:59 (by content timestamp)
+2026-08-04 11:35:59 [INFO ] Parallel copy workers: 3 (host-wide CPU/MEM gate 80%/80%)
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/error.log
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/snmplog.txt.2.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/subscribeservice.txt.1.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipsigthr_log.txt.4.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/tarificationlog.txt.7.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipdump.txt.7.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/tarificationlog.txt.6.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sippbx.txt.1.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipdump.txt.6.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipsigthr_log.txt.3.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/tarificationlog.txt.5.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/snmplog.txt.1.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipdump.txt.5.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/dbqueue_log.txt.1.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/tarificationlog.txt.4.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/clustermonitorlog.txt.1.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipsigthr_log.txt.2.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipdump.txt.4.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/tarificationlog.txt.3.gz
+2026-08-04 11:36:00 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipdump.txt.3.gz
+2026-08-04 11:36:01 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/tarificationlog.txt.2.gz
+2026-08-04 11:36:01 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipsigthr_log.txt.1.gz
+2026-08-04 11:36:01 [DEBUG] discarded (coarse day/mtime outside range±1d): /var/log/flat/fss-server/sipdump.txt.2.gz
+2026-08-04 11:36:29 [DEBUG] resources: CPU=31% MEM=18%
+2026-08-04 11:36:59 [DEBUG] resources: CPU=30% MEM=18%
+2026-08-04 11:37:29 [DEBUG] resources: CPU=30% MEM=18%
+2026-08-04 11:37:55 [DEBUG] discarded (no lines in requested range or read error): /var/log/flat/fss-server/tarificationlog.txt.1.gz
+2026-08-04 11:37:59 [DEBUG] resources: CPU=30% MEM=18%
+2026-08-04 11:38:29 [DEBUG] resources: CPU=29% MEM=18%
+2026-08-04 11:38:59 [DEBUG] resources: CPU=30% MEM=18%
+2026-08-04 11:39:22 [DEBUG] discarded (no lines in requested range or read error): /var/log/flat/fss-server/sipdump.txt.1.gz
+2026-08-04 11:39:23 [DEBUG] kept: /var/log/flat/fss-server/routerlog.txt
+2026-08-04 11:39:24 [WARN ] parce_service_log: /var/log/flat/fss-server/clustercommand.txt does not look chronologically sorted — scanning the whole file instead of seeking
+2026-08-04 11:39:29 [DEBUG] resources: CPU=29% MEM=18%
+2026-08-04 11:39:30 [DEBUG] kept: /var/log/flat/fss-server/clustercommand.txt
+2026-08-04 11:39:37 [DEBUG] kept: /var/log/flat/fss-server/tarificationlog.txt
+2026-08-04 11:39:38 [DEBUG] kept: /var/log/flat/fss-server/sip_log.txt
+2026-08-04 11:39:40 [DEBUG] kept: /var/log/flat/fss-server/subscribeservice.txt
+2026-08-04 11:39:41 [DEBUG] kept: /var/log/flat/fss-server/abonentsclass.txt
+2026-08-04 11:39:42 [DEBUG] kept: /var/log/flat/fss-server/cstaserverlog.txt
+2026-08-04 11:39:43 [DEBUG] kept: /var/log/flat/fss-server/dbqueue_log.txt
+2026-08-04 11:39:43 [WARN ] parce_service_log: /var/log/flat/fss-server/sipdump.txt does not look chronologically sorted — scanning the whole file instead of seeking
+2026-08-04 11:39:59 [DEBUG] resources: CPU=29% MEM=18%
+2026-08-04 11:40:29 [DEBUG] resources: CPU=29% MEM=18%
+2026-08-04 11:40:41 [DEBUG] kept: /var/log/flat/fss-server/sipdump.txt
+2026-08-04 11:40:42 [DEBUG] kept: /var/log/flat/fss-server/sipregister_log.txt
+2026-08-04 11:40:46 [DEBUG] kept: /var/log/flat/fss-server/sipsigthr_log.txt
+2026-08-04 11:40:50 [DEBUG] kept: /var/log/flat/fss-server/snmplog.txt
+2026-08-04 11:40:50 [WARN ] parce_service_log: /var/log/flat/fss-server/clustermonitorlog.txt does not look chronologically sorted — scanning the whole file instead of seeking
+2026-08-04 11:40:59 [DEBUG] resources: CPU=29% MEM=18%
+2026-08-04 11:41:17 [DEBUG] kept: /var/log/flat/fss-server/clustermonitorlog.txt
+2026-08-04 11:41:19 [DEBUG] kept: /var/log/flat/fss-server/sippbx.txt
+2026-08-04 11:41:22 [DEBUG] /var/log/flat/fss-server: candidates=45 kept=14 -> /root/2026.08.04_11-35_ts-ss-n1/fss-server (chunks=14)
+2026-08-04 11:41:22 [DEBUG] resources at stop: CPU=31% MEM=18%
+2026-08-04 11:41:22 [OK   ] Копирование завершено
+2026-08-04 11:41:22 [INFO ] Лог-файлов с данными в архиве: 15 (78239 KB)
