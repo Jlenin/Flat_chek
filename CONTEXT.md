@@ -4,7 +4,7 @@
 Обновлять при смене версии, JSON-контракта, установщика или паритета скриптов.
 
 **Обновлено:** 2026-08-04  
-**Версия:** `flat_check.sh` 3.7.1 / `flat_check_2.sh` 3.10.0
+**Версия:** `flat_check.sh` 3.7.1 / `flat_check_2.sh` 3.10.1
 
 ---
 
@@ -33,6 +33,7 @@
 6. **3.8.0 (`_2`):** в мастере третий слой выбора логов — типы внутри каталога службы; `mgcpclient` спрашивается только если выбран `fss-server` и типы не уточняли.
 7. **3.9.0 (`_2`):** `-t` контекст (last-N vs to после `-f`); `from<=to`; отсев архивов (day±1 + zgrep/12-probe); stream-extract `.gz` без temp; `n` в pick = отмена сбора.
 8. **3.10.0 (`_2`):** ускорение offline — hour-zgrep для коротких окон, skip `.N.gz` если live plain покрывает диапазон, без 12-point после zgrep-miss, stream early-stop, soft-sorted seek для plain; TUNABLES-блок в начале; прогресс `%` в консоли. Host CPU/MEM 80% не трогаем (Zabbix).
+9. **3.10.1 (`_2`):** offline пул по **файлам** (не по каталогам) под host-gate; inner chunk≤1 при нескольких file-workers; sticky progress `\r`+`CSI K`; check уже на том же пуле.
 
 ---
 
