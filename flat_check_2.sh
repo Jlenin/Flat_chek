@@ -16,9 +16,10 @@
 #   -v            вывести версию
 #
 # Offline-фильтр по диапазону времени отбирает СТРОКИ по timestamp внутри файла (не по mtime).
-# Крупные обычные логи (>=1MB): бинарный поиск границ + параллельное сканирование окна по чанкам.
+# Крупные ordinary логи (>=1MB): seek (sorted/soft) + параллельное сканирование окна по чанкам.
 # Основная цель — монолиты SoftSwitch fss-server (десятки ГБ).
-# .gz и неотсортированные файлы: линейное / параллельное сканирование всего файла по чанкам.
+# .gz: coarse → hour/day zgrep → один stream-extract (early-stop); без лишнего 12-point.
+# TUNABLES в блоке 0 — правьте перед запуском (host CPU/MEM 80% — для Zabbix, не трогать).
 #
 # Внутренняя структура (искать "# --- N."):
 #   0  глобальные переменные / флаги (включая SCRIPT_DIR/LOG_FILE)
@@ -49,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.9.0"
+SCRIPT_VERSION="3.10.0"
 
 set -uo pipefail
 
@@ -103,11 +104,6 @@ WIZARD_SKIP_LOG=0
 OUTPUT_DIR=""
 # Выбор логов: brief = только логи приложений; extended = + system/nginx/pg/конфиги (+ tcpdump online)
 LOG_SCOPE="brief"
-# Грубый day-отсев архивов: ±1 календарный день (NYE / TZ), чтобы не выкинуть
-# инцидент «ночь 31.12 → 01.01» при поиске «за 1 января».
-LOG_RANGE_DAY_MARGIN_SEC=$((24 * 3600))
-# Макс. число дней для zgrep-паттернов по календарным датам в диапазоне
-LOG_ZGREP_MAX_DAYS=32
 SELECTED_PRODUCTS=()   # имена продуктов из -p / мастера
 SELECTED_SERVICES=()   # имена пакетов из -s / мастера
 SELECTED_PKGS=()       # итоговый список пакетов для сбора
@@ -134,23 +130,30 @@ TCPDUMP_PID=""
 TIMEOUT_KILL_PID=""
 DISK_WATCH_PID=""
 RESOURCE_WATCH_PID=""
-# Как часто фоновый монитор ресурсов (start_resource_monitor) пишет снимок CPU/MEM в лог сессии
-RESOURCE_LOG_INTERVAL_SEC=30
 DISCOVERED_LOG_DIRS=()
 PG_LOG_SOURCES=()
 COLLECTOR_ABORTED=0
 COLLECTOR_TIMEOUT_STOP=0
-# Offline параллельное копирование: 0 = авто (nproc*0.8), либо задать через COLLECTOR_JOBS env / -j
+
+# =============================================================================
+# TUNABLES — правьте здесь перед запуском (CLI/мастер перекрывают только часть).
+# Host-wide CPU/MEM gate специально для Zabbix: не поднимать «под скрипт».
+# =============================================================================
+
+# --- ресурсы хоста (не доля скрипта) -----------------------------------------
+# Offline параллельное копирование: 0 = авто (nproc * RESOURCE_CPU_LIMIT/100)
 COLLECTOR_JOBS=0
-# Общесистемный лимит CPU/MEM (дружелюбно к Zabbix): придерживать лишние воркеры, когда вся
-# система достигла этих лимитов или превысила их (/proc — не доля этого скрипта).
-# ВАЖНО: никогда не допускать deadlock — минимум 1 воркер всегда разрешён, чтобы offline
-# сбор не мог зависнуть навечно на уже загруженном хосте (обычное дело при MEM≥80%).
+# Общесистемный лимит CPU/MEM: придерживать лишние воркеры, когда ВСЯ
+# система достигла этих лимитов (/proc). Минимум 1 воркер всегда разрешён.
 RESOURCE_CPU_LIMIT=80
 RESOURCE_MEM_LIMIT=80
-# Максимум секунд ожидания запаса ресурсов перед запуском ещё одного воркера (когда ≥1 уже работает)
+# Макс. секунд ожидания запаса ресурсов перед ещё одним воркером (≥1 уже работает)
 RESOURCE_WAIT_MAX=120
-# Минимальный размер для бисекции + параллельного извлечения чанков (ниже → однопоточный awk)
+# Как часто фоновый монитор ресурсов пишет снимок CPU/MEM в лог сессии
+RESOURCE_LOG_INTERVAL_SEC=30
+
+# --- seek / параллельное извлечение plain ------------------------------------
+# Минимальный размер для бисекции + параллельного извлечения чанков
 SEEK_MIN_BYTES=$((1 * 1024 * 1024))
 # Монолиты масштаба SoftSwitch: увеличенное окно параллелизма
 SEEK_HUGE_BYTES=$((1024 * 1024 * 1024))
@@ -158,26 +161,44 @@ SEEK_HUGE_BYTES=$((1024 * 1024 * 1024))
 SEEK_CHUNK_BYTES=$((64 * 1024 * 1024))
 # Проба-чанк для выборки timestamp по смещению
 SEEK_PROBE_BYTES=131072
-# Отступ перед начальным смещением, чтобы не упустить первую подходящую строку
+# Отступ перед начальным смещением (строгий sorted)
 SEEK_BACKOFF_BYTES=$((1024 * 1024))
+# Отступ для soft-sorted (середина «плавает», но first≤last) — шире, без early-stop
+SEEK_SOFT_SORT_BACKOFF_BYTES=$((32 * 1024 * 1024))
 # Внутренняя гранулярность параллельного извлечения ОДНОГО файла в
-# parce_service_log() (не путать с LOG_CHUNK_* ниже — это чисто про то, как
-# крупно резать работу между воркерами _psl_copy_chunks(), а не про итоговый
-# размер part_*.log в архиве; итоговая нарезка делается один раз в конце,
-# см. _psl_split_final_output()).
+# parce_service_log() (не итоговый part_*.log — см. LOG_CHUNK_*).
 MAX_LOG_CHUNK_SIZE=$((100 * 1024 * 1024))
 
-# Как резать ИТОГОВЫЕ part_*.log при offline-сборе (только offline —
-# online просто tail -F в один файл на источник, без нарезки): "size" —
-# по размеру (split -C, LOG_CHUNK_SIZE_BYTES байт на часть), "lines" — по
-# числу строк (split -l, LOG_CHUNK_LINES строк на часть). Настраивается
-# -log --chunk-mode/--chunk-size/--chunk-lines или мастером (-i).
+# --- offline archive filter / stream extract ---------------------------------
+# Грубый day-отсев: ±1 календарный день (NYE / TZ)
+LOG_RANGE_DAY_MARGIN_SEC=$((24 * 3600))
+# Макс. число дней для zgrep-паттернов по календарным датам
+LOG_ZGREP_MAX_DAYS=32
+# Макс. число часов для hour-level zgrep-паттернов
+LOG_ZGREP_MAX_HOURS=48
+# При длине диапазона ≤ этого — hour-level zgrep (−m 1); miss → skip файла
+LOG_ZGREP_HOUR_MAX_SEC=$((24 * 3600))
+# Короткое окно: не читать stem.N.gz, если живой stem покрывает [from,to]
+LOG_PLAIN_COVERS_ROTATED_MAX_SEC=$((24 * 3600))
+# После zgrep-miss не гонять 12-point full-decompress (dated → skip;
+# undated без инструмента → один extract). 0 = старое поведение (12-point).
+LOG_ARCHIVE_SKIP_PROBE_ON_ZGREP_MISS=1
+# Stream-extract архива: early-stop после to (+ grace), как у sorted plain
+LOG_ARCHIVE_STREAM_SORTED=1
+# Допуск (сек) после to перед early-stop — мелкий reorder потоков SoftSwitch
+LOG_ARCHIVE_EARLY_STOP_GRACE_SEC=300
+
+# --- итоговая нарезка part_*.log (offline; CLI/мастер тоже задают) ------------
 LOG_CHUNK_MODE="size"
 LOG_CHUNK_SIZE_BYTES=$((100 * 1024 * 1024))
 LOG_CHUNK_LINES=500000
+
 # Снимок /proc/stat для расчёта дельты CPU
 _CPU_PREV_IDLE=""
 _CPU_PREV_TOTAL=""
+# Прогресс offline-extract (файлы состояния между parallel dir-jobs)
+_COLLECT_PROGRESS_DIR=""
+_COLLECT_PROGRESS_TOTAL=0
 
 # Epoch полуночи дня файла, который сейчас разбирает line_epoch() (awk, см.
 # _AWK_LINE_EPOCH) — нужен только логам без даты в самой строке (только
@@ -3715,8 +3736,8 @@ _probe_line_at_offset() {
     return 0
 }
 
-# Истина, если timestamp'ы начала/середины/почти-конца не убывают (типично для append-only логов)
-_logs_appear_sorted() {
+# Три пробы epoch (начало / середина / почти-конец). Печатает "e1 e2 e3" или "".
+_logs_probe_epochs() {
     local file="$1" size="$2"
     local e1 e2 e3 near_end line1 line2 line3
     line1=$(_probe_line_at_offset "$file" 0)
@@ -3727,16 +3748,34 @@ _logs_appear_sorted() {
         near_end=$((size - SEEK_PROBE_BYTES))
         line3=$(_probe_line_at_offset "$file" "$near_end")
     else
-        # Файл меньше окна пробы: "около конца" совпало бы со смещением 0
-        # (тем же, что и "начало") — вместо этого берём реально последнюю
-        # непустую строку файла, иначе такие файлы почти всегда ошибочно
-        # определялись бы как неотсортированные только из-за своего размера.
+        # Маленький файл: "почти-конец" ≠ offset 0 — берём последнюю строку.
         line3=$(tail -n 1 -- "$file" 2>/dev/null | tr -d '\0')
     fi
     e3=$(_epoch_of_line "$line3")
     [[ "$e1" =~ ^[0-9]+$ && "$e2" =~ ^[0-9]+$ && "$e3" =~ ^[0-9]+$ ]] || return 1
     [[ "$e1" -gt 0 && "$e2" -gt 0 && "$e3" -gt 0 ]] || return 1
-    [[ "$e1" -le "$e2" && "$e2" -le "$e3" ]]
+    echo "$e1 $e2 $e3"
+}
+
+# Режим хронологии plain-файла: sorted | soft | unsorted.
+# soft = first≤last, но середина «плавает» (типичный sipdump/clustermonitor
+# SoftSwitch с несколькими писателями) — seek с широким backoff, без early-stop.
+_logs_sort_mode() {
+    local file="$1" size="$2"
+    local e1 e2 e3
+    read -r e1 e2 e3 < <(_logs_probe_epochs "$file" "$size") || { echo unsorted; return; }
+    if [[ "$e1" -le "$e2" && "$e2" -le "$e3" ]]; then
+        echo sorted
+    elif [[ "$e1" -le "$e3" ]]; then
+        echo soft
+    else
+        echo unsorted
+    fi
+}
+
+# Истина только для строгого sorted (совместимость со старыми вызовами).
+_logs_appear_sorted() {
+    [[ "$(_logs_sort_mode "$1" "$2")" == "sorted" ]]
 }
 
 # Бинарный поиск: приблизительное байтовое смещение первой строки с epoch >= target
@@ -3765,16 +3804,19 @@ _binsearch_offset_ge() {
     echo "$lo"
 }
 
-# Потоковый фильтр: печатает строки в [from,to]; если sorted=1, останавливается после to (и пропускает до from)
+# Потоковый фильтр: строки в [from,to].
+# sorted=1 → early-stop когда ep > to+grace (grace смягчает мелкий reorder).
 _awk_filter_range_prog() {
     local sorted="${1:-0}"
+    local grace="${2:-0}"
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=0
     printf '%s\n' "$_AWK_LINE_EPOCH"
     cat <<EOF
-BEGIN { in_range = 0; sorted = $sorted }
+BEGIN { in_range = 0; sorted = $sorted; grace = $grace }
 {
     ep = line_epoch(\$0)
     if (ep >= 0) {
-        if (sorted && ep > to) exit
+        if (sorted && ep > to + grace) exit
         if (ep >= from && ep <= to) { print; in_range = 1 }
         else { in_range = 0 }
     } else if (in_range) {
@@ -3966,6 +4008,7 @@ filter_log_file_by_range() {
     local from_epoch="$3" to_epoch="$4"
     local reader="cat" size=0 sorted=0 start_off=0 end_off=0
     local min_sz="${SEEK_MIN_BYTES:-1048576}"
+    local sort_mode backoff
 
     [[ "$src_file" == *.gz ]] && reader="zcat"
     _collector_should_stop && return 1
@@ -3975,25 +4018,27 @@ filter_log_file_by_range() {
     if [[ "$reader" == "cat" && -f "$src_file" ]]; then
         size=$(_file_size_bytes "$src_file")
         if [[ "$size" -ge "$min_sz" ]]; then
-            if _logs_appear_sorted "$src_file" "$size"; then
-                sorted=1
+            sort_mode=$(_logs_sort_mode "$src_file" "$size")
+            if [[ "$sort_mode" == "sorted" || "$sort_mode" == "soft" ]]; then
+                [[ "$sort_mode" == "sorted" ]] && sorted=1 || sorted=0
+                [[ "$sort_mode" == "sorted" ]] \
+                    && backoff="${SEEK_BACKOFF_BYTES:-1048576}" \
+                    || backoff="${SEEK_SOFT_SORT_BACKOFF_BYTES:-33554432}"
                 start_off=$(_binsearch_offset_ge "$src_file" "$from_epoch" "$size")
-                # Конец: первая строка строго после to (to+1), затем небольшой запас вперёд
                 end_off=$(_binsearch_offset_ge "$src_file" "$((to_epoch + 1))" "$size")
-                if [[ "$start_off" -gt "${SEEK_BACKOFF_BYTES:-1048576}" ]]; then
-                    start_off=$((start_off - SEEK_BACKOFF_BYTES))
+                if [[ "$start_off" -gt "$backoff" ]]; then
+                    start_off=$((start_off - backoff))
                 else
                     start_off=0
                 fi
-                # Включаем немного байт после примерного конца (последние подходящие строки / многострочность)
-                end_off=$((end_off + SEEK_BACKOFF_BYTES))
+                end_off=$((end_off + backoff))
                 [[ "$end_off" -gt "$size" ]] && end_off=$size
                 [[ "$end_off" -le "$start_off" ]] && end_off=$size
                 _filter_byte_range_parallel "$src_file" "$dest_file" "$from_epoch" "$to_epoch" \
-                    "$start_off" "$end_off" 1
+                    "$start_off" "$end_off" "$sorted"
                 return $?
             fi
-            # Неотсортированный, но большой: параллельное сканирование по чанкам всего файла (без раннего выхода)
+            # Неотсортированный, но большой: параллельное сканирование всего файла
             _filter_byte_range_parallel "$src_file" "$dest_file" "$from_epoch" "$to_epoch" \
                 0 "$size" 0
             return $?
@@ -4207,9 +4252,11 @@ _psl_find_offset_for_epoch() {
 # полностью содержит истинную границу, а содержательный фильтр по epoch,
 # применяемый на шаге копирования (не в этой функции), отбрасывает все
 # лишние строки, которые этот запас захватывает с любой стороны.
+# $5 = опциональный backoff в байтах (default SEEK_BACKOFF_BYTES; soft → SEEK_SOFT_SORT_*).
 _psl_locate_range() {
     local file="$1" size="$2" from_epoch="$3" to_epoch="$4"
-    local start_off end_off backoff="${SEEK_BACKOFF_BYTES:-1048576}"
+    local backoff="${5:-${SEEK_BACKOFF_BYTES:-1048576}}"
+    local start_off end_off
 
     start_off=$(_psl_find_offset_for_epoch "$file" "$size" "$from_epoch")
     [[ "$start_off" -gt "$backoff" ]] && start_off=$((start_off - backoff)) || start_off=0
@@ -4327,7 +4374,7 @@ _psl_copy_chunks() {
 parce_service_log() {
     local log_path="$1" ts_from_raw="$2" ts_to_raw="$3"
     local real_path from_epoch to_epoch size range_str start_off end_off sorted=1
-    local out_dir raw_dir combined raw_count chunk_count
+    local sort_mode backoff out_dir raw_dir combined raw_count chunk_count
     local -a bounds=()
 
     unset PSL_OUTPUT_PATH PSL_OUTPUT_CHUNKS
@@ -4351,19 +4398,27 @@ parce_service_log() {
     # (line_epoch() в awk читает эту переменную через -v ref_midnight=...).
     _LOG_REF_MIDNIGHT_EPOCH=$(_infer_file_midnight_epoch "$real_path")
 
-    if _logs_appear_sorted "$real_path" "$size"; then
-        range_str=$(_psl_locate_range "$real_path" "$size" "$from_epoch" "$to_epoch") || return 1
-        read -r start_off end_off <<< "$range_str"
-    else
-        # Неотсортированный: интерполяционный поиск не заслуживает доверия (он
-        # предполагает монотонные по offset timestamp'ы) — как и
-        # filter_log_file_by_range() в другом месте этого файла, сканируем
-        # файл целиком, каждый чанк — без раннего выхода по timestamp.
-        sorted=0
-        warn "parce_service_log: $real_path does not look chronologically sorted — scanning the whole file instead of seeking"
-        start_off=0
-        end_off="$size"
-    fi
+    sort_mode=$(_logs_sort_mode "$real_path" "$size")
+    case "$sort_mode" in
+        sorted)
+            range_str=$(_psl_locate_range "$real_path" "$size" "$from_epoch" "$to_epoch") || return 1
+            read -r start_off end_off <<< "$range_str"
+            ;;
+        soft)
+            # first≤last, середина плавает — seek с широким окном, без early-stop.
+            sorted=0
+            backoff="${SEEK_SOFT_SORT_BACKOFF_BYTES:-33554432}"
+            log_debug "parce_service_log: soft-sorted seek ($real_path), backoff=${backoff}"
+            range_str=$(_psl_locate_range "$real_path" "$size" "$from_epoch" "$to_epoch" "$backoff") || return 1
+            read -r start_off end_off <<< "$range_str"
+            ;;
+        *)
+            sorted=0
+            warn "parce_service_log: $real_path does not look chronologically sorted — scanning the whole file instead of seeking"
+            start_off=0
+            end_off="$size"
+            ;;
+    esac
 
     out_dir=$(_psl_make_output_dir "$real_path" "$from_epoch" "$to_epoch")
     [[ -n "$out_dir" && -d "$out_dir" ]] || { warn "parce_service_log: cannot create output dir under /tmp"; return 1; }
@@ -4899,6 +4954,14 @@ _log_coarse_definitely_outside() {
     return 1
 }
 
+# Длина диапазона в секундах (для выбора hour vs day zgrep и skip .N.gz).
+_log_range_span_sec() {
+    local from_epoch="$1" to_epoch="$2"
+    local span=$((to_epoch - from_epoch))
+    [[ "$span" -lt 0 ]] && span=0
+    echo "$span"
+}
+
 # Паттерн дат DD.MM.YYYY|YYYY-MM-DD на каждый день [from-margin .. to+margin], ≤ LOG_ZGREP_MAX_DAYS.
 _log_day_grep_pattern() {
     local from_epoch="$1" to_epoch="$2"
@@ -4920,6 +4983,39 @@ _log_day_grep_pattern() {
     done
     [[ -n "$pat" ]] || return 1
     printf '%s' "$pat"
+}
+
+# Паттерн часов SoftSwitch: «DD.MM.YYYY HH:» | «YYYY-MM-DD HH:» (±1h), ≤ LOG_ZGREP_MAX_HOURS.
+_log_hour_grep_pattern() {
+    local from_epoch="$1" to_epoch="$2"
+    local maxh="${LOG_ZGREP_MAX_HOURS:-48}"
+    local cur end pat d1 d2 hh n=0
+    cur=$(( (from_epoch / 3600) * 3600 - 3600 ))
+    end=$(( (to_epoch / 3600) * 3600 + 3600 ))
+    [[ "$cur" -lt 0 ]] && cur=0
+    pat=""
+    while [[ "$cur" -le "$end" && "$n" -lt "$maxh" ]]; do
+        d1=$(date -d "@$cur" "+%d.%m.%Y %H:" 2>/dev/null) || break
+        d2=$(date -d "@$cur" "+%Y-%m-%d %H:" 2>/dev/null) || break
+        [[ -n "$pat" ]] && pat="${pat}|"
+        pat="${pat}${d1}|${d2}"
+        n=$((n + 1))
+        cur=$((cur + 3600))
+    done
+    [[ -n "$pat" ]] || return 1
+    printf '%s' "$pat"
+}
+
+# Выбрать zgrep-паттерн: короткий диапазон → часы, иначе дни.
+_log_archive_grep_pattern() {
+    local from_epoch="$1" to_epoch="$2"
+    local span hour_max
+    span=$(_log_range_span_sec "$from_epoch" "$to_epoch")
+    hour_max="${LOG_ZGREP_HOUR_MAX_SEC:-86400}"
+    if [[ "$span" -le "$hour_max" ]]; then
+        _log_hour_grep_pattern "$from_epoch" "$to_epoch" && return 0
+    fi
+    _log_day_grep_pattern "$from_epoch" "$to_epoch"
 }
 
 _log_is_compressed_log() {
@@ -4959,12 +5055,12 @@ _log_stream_decompress() {
     esac
 }
 
-# zgrep/аналог: есть ли в архиве хотя бы одна из календарных дат диапазона (−m 1).
-# 0 = hit; 1 = miss; 2 = инструмент недоступен (не считать miss).
-_log_archive_zgrep_day_hit() {
+# zgrep/аналог по выбранному паттерну (−m 1).
+# 0 = hit; 1 = miss; 2 = инструмент/паттерн недоступен (не считать miss).
+_log_archive_zgrep_hit() {
     local file="$1" from_epoch="$2" to_epoch="$3"
     local pat
-    pat=$(_log_day_grep_pattern "$from_epoch" "$to_epoch") || return 2
+    pat=$(_log_archive_grep_pattern "$from_epoch" "$to_epoch") || return 2
     case "$file" in
         *.gz)
             if command -v zgrep >/dev/null 2>&1; then
@@ -4988,13 +5084,49 @@ _log_archive_zgrep_day_hit() {
     if _log_stream_decompress "$file" | grep -m 1 -E -- "$pat" >/dev/null 2>&1; then
         return 0
     fi
-    # Если даже поток не открылся — не отвергаем здесь
     _log_stream_decompress "$file" >/dev/null 2>&1 || return 2
+    return 1
+}
+
+# Совместимость: старое имя = day/hour zgrep hit.
+_log_archive_zgrep_day_hit() {
+    _log_archive_zgrep_hit "$@"
+}
+
+# Живой plain для ротации stem.N.gz → dir/stem (sipdump.txt.1.gz → sipdump.txt).
+_log_live_plain_for_rotated_archive() {
+    local file="$1" dir base identity live
+    dir=$(dirname -- "$file")
+    base=$(basename -- "$file")
+    identity=$(_psl_strip_archive_ext "$base")
+    [[ "$identity" == "$base" ]] && return 1
+    # убрать конечный .N ротации (logrotate)
+    if [[ "$identity" =~ ^(.*)\.[0-9]+$ ]]; then
+        live="$dir/${BASH_REMATCH[1]}"
+        [[ -f "$live" ]] && { echo "$live"; return 0; }
+    fi
+    return 1
+}
+
+# Короткое окно + есть live plain, покрывающий [from,to] → .N.gz не читаем.
+# return 0 = skip archive; 1 = не skip.
+_log_skip_rotated_archive_if_plain_covers() {
+    local file="$1" from_epoch="$2" to_epoch="$3"
+    local span max_span live
+    span=$(_log_range_span_sec "$from_epoch" "$to_epoch")
+    max_span="${LOG_PLAIN_COVERS_ROTATED_MAX_SEC:-86400}"
+    [[ "$span" -le "$max_span" ]] || return 1
+    live=$(_log_live_plain_for_rotated_archive "$file") || return 1
+    if _log_file_in_range "$live" "$from_epoch" "$to_epoch"; then
+        log_debug "discarded (live plain covers short range): $file (plain=$live)"
+        return 0
+    fi
     return 1
 }
 
 # 12-точечная проба epoch по потоку (начало, конец, 10 пропорциональных).
 # return 0 = пересечение с [from,to] вероятно/точно; 1 = нет.
+# Дорого (full decompress) — вызывается только если zgrep недоступен / undated fallback.
 _log_archive_probe_overlap() {
     local file="$1" from_epoch="$2" to_epoch="$3"
     local usize=0
@@ -5042,7 +5174,48 @@ _log_archive_probe_overlap() {
         }"
 }
 
-# Стоит ли открывать файл для offline-диапазона (дешёвые проверки → zgrep → 12 точек).
+# Решение по архиву после coarse: zgrep → (опц.) probe. 0=process, 1=skip.
+_log_archive_should_process() {
+    local file="$1" from_epoch="$2" to_epoch="$3"
+    local zg=0
+
+    if _log_skip_rotated_archive_if_plain_covers "$file" "$from_epoch" "$to_epoch"; then
+        return 1
+    fi
+
+    _log_archive_zgrep_hit "$file" "$from_epoch" "$to_epoch"
+    zg=$?
+    if [[ "$zg" -eq 0 ]]; then
+        return 0
+    fi
+    if [[ "$zg" -eq 1 ]]; then
+        # miss: dated SoftSwitch / короткий hour-zgrep — не жжём второй full-decompress
+        if [[ "${LOG_ARCHIVE_SKIP_PROBE_ON_ZGREP_MISS:-1}" -eq 1 ]]; then
+            log_debug "discarded (archive zgrep miss, skip probe): $file"
+            return 1
+        fi
+        if _log_archive_probe_overlap "$file" "$from_epoch" "$to_epoch"; then
+            return 0
+        fi
+        log_debug "discarded (archive probe/zgrep: no overlap): $file"
+        return 1
+    fi
+    # zg=2: нет *grep/паттерна — undated/HH:MM:SS: один extract лучше, чем слепой skip
+    if _log_filename_day_epoch "$file" >/dev/null 2>&1; then
+        # имя с датой, но zgrep недоступен: дешёвый coarse уже прошёл → пробуем extract
+        return 0
+    fi
+    if [[ "${LOG_ARCHIVE_SKIP_PROBE_ON_ZGREP_MISS:-1}" -eq 1 ]]; then
+        return 0
+    fi
+    if _log_archive_probe_overlap "$file" "$from_epoch" "$to_epoch"; then
+        return 0
+    fi
+    log_debug "discarded (archive probe: no overlap): $file"
+    return 1
+}
+
+# Стоит ли открывать файл для offline-диапазона (дешёвые проверки → zgrep → …).
 _log_should_process_for_range() {
     local file="$1" from_epoch="$2" to_epoch="$3"
     [[ -n "$from_epoch" || -n "$to_epoch" ]] || return 0
@@ -5055,18 +5228,8 @@ _log_should_process_for_range() {
     fi
 
     if _log_is_compressed_log "$file"; then
-        local zg=0
-        _log_archive_zgrep_day_hit "$file" "$from_epoch" "$to_epoch"
-        zg=$?
-        if [[ "$zg" -eq 0 ]]; then
-            return 0
-        fi
-        # miss или нет *grep — уточняем 12 точками (HH:MM:SS-only и т.п.)
-        if _log_archive_probe_overlap "$file" "$from_epoch" "$to_epoch"; then
-            return 0
-        fi
-        log_debug "discarded (archive probe/zgrep: no overlap): $file"
-        return 1
+        _log_archive_should_process "$file" "$from_epoch" "$to_epoch"
+        return $?
     fi
 
     # plain: прежняя mtime/ctime эвристика
@@ -5085,32 +5248,40 @@ _log_should_process_for_range() {
 # Если задан только from (режим «за последние Nd»), to по умолчанию —
 # сейчас: иначе пустой to раньше доходил до date -d "" → полночь сегодня
 # и обрезал хвост текущего дня.
+# Один decompress|awk в group_file. sorted/grace — из TUNABLES.
+# return 0 если хоть что-то дописалось.
+_log_stream_extract_to_group() {
+    local file="$1" from_epoch="$2" to_epoch="$3" group_file="$4"
+    local before_sz=0 after_sz=0 sorted=0 grace=0
+
+    [[ -f "$group_file" ]] && before_sz=$(_file_size_bytes "$group_file")
+    _LOG_REF_MIDNIGHT_EPOCH=$(_infer_file_midnight_epoch "$file")
+    sorted="${LOG_ARCHIVE_STREAM_SORTED:-1}"
+    grace="${LOG_ARCHIVE_EARLY_STOP_GRACE_SEC:-300}"
+    _log_stream_decompress "$file" 2>/dev/null \
+        | tr -d '\0' \
+        | LC_ALL=C awk -v from="$from_epoch" -v to="$to_epoch" \
+            -v ref_midnight="${_LOG_REF_MIDNIGHT_EPOCH:-0}" \
+            "$(_awk_filter_range_prog "$sorted" "$grace")" \
+        >> "$group_file" 2>/dev/null || true
+    [[ -f "$group_file" ]] && after_sz=$(_file_size_bytes "$group_file")
+    [[ "$after_sz" -gt "$before_sz" ]]
+}
+
 _log_extract_one_file() {
     local file="$1" from_epoch="$2" to_epoch="$3" work_dir="$4"
     local plain is_scratch=0 group group_file rc=1
-    local before_sz=0 after_sz=0
 
     group=$(_psl_log_group_key "$file")
     group_file="$work_dir/groups/${group}.log"
     mkdir -p "$work_dir/groups" 2>/dev/null
 
-    # Сжатые + задан диапазон: один поток decompress|awk без temp plain
+    # Сжатые + диапазон: один поток decompress|awk (без temp plain, с early-stop)
     if [[ -n "$from_epoch" || -n "$to_epoch" ]] && _log_is_compressed_log "$file"; then
         [[ -n "$from_epoch" && -z "$to_epoch" ]] && to_epoch=$(date +%s)
         [[ -z "$from_epoch" && -n "$to_epoch" ]] && from_epoch=0
-        before_sz=0
-        [[ -f "$group_file" ]] && before_sz=$(_file_size_bytes "$group_file")
-        _LOG_REF_MIDNIGHT_EPOCH=$(_infer_file_midnight_epoch "$file")
-        _log_stream_decompress "$file" 2>/dev/null \
-            | tr -d '\0' \
-            | LC_ALL=C awk -v from="$from_epoch" -v to="$to_epoch" \
-                -v ref_midnight="${_LOG_REF_MIDNIGHT_EPOCH:-0}" \
-                "$(_awk_filter_range_prog 0)" \
-            >> "$group_file" 2>/dev/null || true
-        after_sz=0
-        [[ -f "$group_file" ]] && after_sz=$(_file_size_bytes "$group_file")
-        [[ "$after_sz" -gt "$before_sz" ]] && return 0
-        return 1
+        _log_stream_extract_to_group "$file" "$from_epoch" "$to_epoch" "$group_file"
+        return $?
     fi
 
     plain=$(_psl_materialize_plain "$file" "$work_dir") || return 1
@@ -5131,6 +5302,69 @@ _log_extract_one_file() {
     return "$rc"
 }
 
+# --- прогресс offline-extract (общий счётчик между parallel dir-jobs) ----------
+_collect_progress_init() {
+    local total="$1"
+    _COLLECT_PROGRESS_TOTAL="$total"
+    _COLLECT_PROGRESS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/flat_prog.XXXXXX") || {
+        _COLLECT_PROGRESS_DIR=""
+        return 1
+    }
+    printf '0\n' > "$_COLLECT_PROGRESS_DIR/done"
+    : > "$_COLLECT_PROGRESS_DIR/label"
+    if [[ -t 1 ]]; then
+        printf '[INFO] extract: 0%% (0/%s)\n' "$total"
+    else
+        info "extract: 0% (0/$total)"
+    fi
+}
+
+_collect_progress_tick() {
+    local label="${1:-}"
+    local done total pct last_pct lock
+    [[ -n "${_COLLECT_PROGRESS_DIR:-}" && -d "$_COLLECT_PROGRESS_DIR" ]] || return 0
+    total="${_COLLECT_PROGRESS_TOTAL:-0}"
+    [[ "$total" -gt 0 ]] || return 0
+    lock="$_COLLECT_PROGRESS_DIR/lock"
+    (
+        if command -v flock >/dev/null 2>&1; then
+            flock 9
+        fi
+        done=$(cat "$_COLLECT_PROGRESS_DIR/done" 2>/dev/null || echo 0)
+        done=$((done + 1))
+        printf '%s\n' "$done" > "$_COLLECT_PROGRESS_DIR/done"
+        [[ -n "$label" ]] && printf '%s\n' "$label" > "$_COLLECT_PROGRESS_DIR/label"
+        pct=$((done * 100 / total))
+        last_pct=$(cat "$_COLLECT_PROGRESS_DIR/last_pct" 2>/dev/null || echo -1)
+        # консоль: sticky \r; в лог — каждый ≥5% или последний файл
+        if [[ -t 1 ]]; then
+            printf '\r[INFO] extract: %d%% (%d/%d) %s' "$pct" "$done" "$total" "$label"
+            [[ "$done" -ge "$total" ]] && printf '\n'
+        fi
+        if [[ "$pct" -ge $((last_pct + 5)) || "$done" -ge "$total" ]]; then
+            printf '%s\n' "$pct" > "$_COLLECT_PROGRESS_DIR/last_pct"
+            _log_line "INFO" "extract: ${pct}% (${done}/${total}) ${label}"
+            if [[ ! -t 1 ]]; then
+                info "extract: ${pct}% (${done}/${total}) ${label}"
+            fi
+        fi
+    ) 9>"$lock" 2>/dev/null || true
+}
+
+_collect_progress_finish() {
+    local done total
+    [[ -n "${_COLLECT_PROGRESS_DIR:-}" && -d "$_COLLECT_PROGRESS_DIR" ]] || return 0
+    done=$(cat "$_COLLECT_PROGRESS_DIR/done" 2>/dev/null || echo 0)
+    total="${_COLLECT_PROGRESS_TOTAL:-0}"
+    if [[ -t 1 ]]; then
+        printf '\r[INFO] extract: 100%% (%s/%s) done\n' "$done" "$total"
+    fi
+    log_debug "extract progress finished: ${done}/${total}"
+    rm -rf -- "$_COLLECT_PROGRESS_DIR" 2>/dev/null
+    _COLLECT_PROGRESS_DIR=""
+    _COLLECT_PROGRESS_TOTAL=0
+}
+
 # Runs _log_extract_one_file() over every candidate in one already-
 # discovered source directory, then re-chunks the result into $dest_dir.
 # Empty from_epoch/to_epoch means no time filter at all (offline with no
@@ -5138,18 +5372,22 @@ _log_extract_one_file() {
 # when a directory's files simply have nothing in range, not an error.
 _log_extract_dir_by_range() {
     local src_dir="$1" dest_dir="$2" from_epoch="$3" to_epoch="$4"
-    local work_dir f processed=0 seen=0 chunk_count
+    local work_dir f processed=0 seen=0 chunk_count base
 
     work_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_logdir.XXXXXX") || return 1
 
     while IFS= read -r -d '' f; do
         _collector_should_stop && { rm -rf -- "$work_dir"; return 130; }
         seen=$((seen + 1))
+        base=$(basename -- "$f")
+        # tick сразу — инженер видит активность даже на долгом skip/extract
         if [[ -n "$from_epoch" || -n "$to_epoch" ]]; then
             if ! _log_should_process_for_range "$f" "${from_epoch:-0}" "${to_epoch:-9999999999}"; then
+                _collect_progress_tick "skip:$base"
                 continue
             fi
         fi
+        _collect_progress_tick "$base"
         if _log_extract_one_file "$f" "$from_epoch" "$to_epoch" "$work_dir"; then
             processed=$((processed + 1))
             log_debug "kept: $f"
@@ -5171,6 +5409,17 @@ _log_extract_dir_by_range() {
     [[ "$chunk_count" -gt 0 ]]
 }
 
+# Считает кандидатов по всем ALL_LOG_DIRS (для % прогресса).
+_log_count_all_candidates() {
+    local logdir n=0 f
+    for logdir in "${ALL_LOG_DIRS[@]}"; do
+        while IFS= read -r -d '' f; do
+            n=$((n + 1))
+        done < <(_log_candidate_files_for_dir "$logdir")
+    done
+    echo "$n"
+}
+
 # Runs _log_extract_dir_by_range() for every directory in the global
 # ALL_LOG_DIRS, one background job per directory on the same resource-
 # aware collector job pool the rest of the offline path already uses
@@ -5182,7 +5431,7 @@ _log_extract_dir_by_range() {
 # instead of a silently empty folder.
 _log_extract_all_dirs_by_range() {
     local work_root="$1" from_epoch="$2" to_epoch="$3"
-    local logdir dest_name max_jobs result_dir rf idx=0 ctx="plain"
+    local logdir dest_name max_jobs result_dir rf idx=0 ctx="plain" total=0
     local -a labels=()
 
     [[ -n "$from_epoch" || -n "$to_epoch" ]] && ctx="period"
@@ -5190,10 +5439,19 @@ _log_extract_all_dirs_by_range() {
     result_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_logscan.XXXXXX") || return 1
     COLLECTOR_JOB_PIDS=()
 
+    total=$(_log_count_all_candidates)
+    _collect_progress_init "$total" || true
+
     for logdir in "${ALL_LOG_DIRS[@]}"; do
-        _collector_should_stop && { _collector_kill_jobs; rm -rf -- "$result_dir"; return 130; }
+        _collector_should_stop && {
+            _collector_kill_jobs
+            _collect_progress_finish
+            rm -rf -- "$result_dir"
+            return 130
+        }
         if ! _collector_wait_slot "$max_jobs"; then
             _collector_kill_jobs
+            _collect_progress_finish
             rm -rf -- "$result_dir"
             return 130
         fi
@@ -5210,6 +5468,7 @@ _log_extract_all_dirs_by_range() {
         COLLECTOR_JOB_PIDS+=($!)
     done
     _collector_wait_all_jobs
+    _collect_progress_finish
 
     idx=0
     for dest_name in "${labels[@]}"; do
@@ -5521,6 +5780,77 @@ _run_selftest_simple() {
     else
         _selftest_bad "_log_coarse_definitely_outside drops far day (01.06 vs 01.01)"
     fi
+
+    # hour-level zgrep pattern для короткого окна
+    local hp
+    hp=$(_log_hour_grep_pattern "$(date -d '2026-08-04 10:00:00' '+%s')" "$(date -d '2026-08-04 11:00:00' '+%s')")
+    if [[ "$hp" == *"04.08.2026 10:"* && "$hp" == *"2026-08-04 10:"* ]]; then
+        _selftest_ok "_log_hour_grep_pattern includes SoftSwitch hour stamps"
+    else
+        _selftest_bad "_log_hour_grep_pattern includes SoftSwitch hour stamps (got: $hp)"
+    fi
+
+    # live plain covers → skip rotated .N.gz на коротком окне
+    local rd live_from live_to
+    rd=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    printf '04.08.2026 10:30:00 keep\n' > "$rd/sipdump.txt"
+    touch -d '2026-08-04 11:00:00' "$rd/sipdump.txt"
+    # «старый» архив рядом (содержимое не важно — skip до чтения)
+    printf '03.08.2026 10:00:00 old\n' | gzip -c > "$rd/sipdump.txt.1.gz" 2>/dev/null || true
+    live_from=$(date -d '2026-08-04 10:00:00' '+%s')
+    live_to=$(date -d '2026-08-04 11:00:00' '+%s')
+    if [[ -f "$rd/sipdump.txt.1.gz" ]] \
+        && _log_skip_rotated_archive_if_plain_covers "$rd/sipdump.txt.1.gz" "$live_from" "$live_to"; then
+        _selftest_ok "_log_skip_rotated_archive_if_plain_covers skips .1.gz when live covers 1h"
+    else
+        _selftest_bad "_log_skip_rotated_archive_if_plain_covers skips .1.gz when live covers 1h"
+    fi
+    rm -rf -- "$rd" 2>/dev/null
+
+    # soft-sorted: first≤last, mid вне порядка → soft (seek, не full-scan).
+    # Нужны три зоны ≫ SEEK_PROBE_BYTES, иначе near_end=size-probe попадает не в хвост.
+    local softf soft_mode soft_sz _i
+    softf=$(mktemp "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    {
+        printf '04.08.2026 10:00:00 first\n'
+        for _i in $(seq 1 2000); do printf '04.08.2026 10:00:01 zone1-%05d %s\n' "$_i" "$(printf 'x%.0s' {1..40})"; done
+        printf '04.08.2026 09:00:00 mid-wobble\n'
+        for _i in $(seq 1 2000); do printf '04.08.2026 09:00:01 zone2-%05d %s\n' "$_i" "$(printf 'x%.0s' {1..40})"; done
+        printf '04.08.2026 12:00:00 last\n'
+        for _i in $(seq 1 2000); do printf '04.08.2026 12:00:01 zone3-%05d %s\n' "$_i" "$(printf 'x%.0s' {1..40})"; done
+    } > "$softf"
+    soft_sz=$(_file_size_bytes "$softf")
+    soft_mode=$(_logs_sort_mode "$softf" "$soft_sz")
+    if [[ "$soft_mode" == "soft" ]]; then
+        _selftest_ok "_logs_sort_mode soft when first<=last but mid wobbles"
+    else
+        _selftest_bad "_logs_sort_mode soft when first<=last but mid wobbles (got: $soft_mode sz=$soft_sz)"
+    fi
+    rm -f -- "$softf" 2>/dev/null
+
+    # stream extract с early-stop: после to строки не читаем бесконечно
+    local gzfile gwork
+    gwork=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    gzfile="$gwork/tarificationlog.txt.1.gz"
+    {
+        printf '04.08.2026 09:00:00 before\n'
+        printf '04.08.2026 10:30:00 inrange\n'
+        printf '04.08.2026 12:00:00 after\n'
+        # хвост далеко после to — early-stop не должен его тащить в group
+        local _i
+        for _i in $(seq 1 50); do
+            printf '04.08.2026 18:00:00 filler-%s\n' "$_i"
+        done
+    } | gzip -c > "$gzfile"
+    if _log_extract_one_file "$gzfile" "$live_from" "$live_to" "$gwork" \
+        && grep -q 'inrange' "$gwork"/groups/*.log 2>/dev/null \
+        && ! grep -q 'filler-' "$gwork"/groups/*.log 2>/dev/null \
+        && ! grep -q 'before' "$gwork"/groups/*.log 2>/dev/null; then
+        _selftest_ok "_log_extract_one_file stream archive keeps only [from,to]"
+    else
+        _selftest_bad "_log_extract_one_file stream archive keeps only [from,to]"
+    fi
+    rm -rf -- "$gwork" 2>/dev/null
 
     # discover_log_dirs_for_selected должен заполнять LOG_DIR_OWNER в ТЕКУЩЕМ
     # shell: вызов через $(...) / < <(discover...) теряет assoc-массив в subshell
