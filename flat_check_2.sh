@@ -50,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.10.1"
+SCRIPT_VERSION="3.10.2"
 
 set -uo pipefail
 
@@ -4586,6 +4586,25 @@ _psl_strip_archive_ext() {
     echo "$name"
 }
 
+# Снимает суффикс logrotate после .log/.txt/.csv.
+# Маска на практике: name.(log|txt|csv).<что угодно> —
+#   sipdump.txt.1 | sipdump.txt.-20260731 | sipdump.txt.2026-07-31 | error.log.3
+# Редко без точки: name.txt-20260731 / name.log_2026-07-31.
+# Без этого sipdump.txt.-20260731 схлопывался в «sipdump.txt.» и отваливался
+# от фильтра типов / группы live sipdump.txt (баг на РЕД ОС и др.).
+_psl_strip_logrotate_suffix() {
+    local name="$1"
+    if [[ "$name" =~ ^(.+)\.(log|txt|csv)\..+ ]]; then
+        printf '%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        return 0
+    fi
+    if [[ "$name" =~ ^(.+)\.(log|txt|csv)[-_][0-9]{4} ]]; then
+        printf '%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        return 0
+    fi
+    printf '%s\n' "$name"
+}
+
 # Читает список кандидатов (по одному пути на строку) из stdin, отбрасывает
 # любой архивный файл, у которого есть живой обычный «близнец» с идентичным
 # именем (та же директория, то же имя после удаления архивного расширения) —
@@ -4618,13 +4637,15 @@ _psl_dedupe_archive_copies() {
 }
 
 # Вычисляет «тип лога», к которому относится ротированный/архивный файл, так что
-# access.log / access.log.1 / access.log.2.gz / access.2026-07-22.log все
-# группируются вместе, а error.log остаётся отдельно. Убирает (по порядку): архивное
-# расширение, конечный числовой или датированный суффикс ротации, а также
-# числовой/датированный сегмент, встроенный прямо перед конечным ".log".
+# access.log / access.log.1 / access.log.2.gz / access.2026-07-22.log /
+# sipdump.txt.-20260731 все группируются вместе, а error.log остаётся отдельно.
+# Убирает (по порядку): архивное расширение, суффикс logrotate после .log|.txt|.csv,
+# ведущую дату в имени (FCS daily), прочие числовые/датированные хвосты.
 _psl_log_group_key() {
     local key
     key=$(_psl_strip_archive_ext "$(basename -- "$1")")
+    # SoftSwitch / logrotate: name.txt.<что угодно> → name.txt (до ведущей даты FCS)
+    key=$(_psl_strip_logrotate_suffix "$key")
     # Ведущая дата в самом начале имени файла — ежедневная ротация вида
     # YYYY_MM_DD_service_log.log / YYYY-MM-DD-service.log (например у
     # fcs-swau/fcs-contact и других продуктов линейки FCS): без этого
@@ -4639,6 +4660,8 @@ _psl_log_group_key() {
     key=$(printf '%s' "$key" | sed -E \
         -e 's/[-.][0-9]{4}-[0-9]{2}-[0-9]{2}(\.log)$/\1/' \
         -e 's/\.[0-9]+(\.log)$/\1/')
+    # хвост вроде «sipdump.txt.» после неудачного peel даты
+    key="${key%.}"
     printf '%s' "$key"
 }
 
@@ -5092,18 +5115,17 @@ _log_archive_zgrep_day_hit() {
     _log_archive_zgrep_hit "$@"
 }
 
-# Живой plain для ротации stem.N.gz → dir/stem (sipdump.txt.1.gz → sipdump.txt).
+# Живой plain для архивной ротации → dir/stem
+# (sipdump.txt.1.gz / sipdump.txt.-20260731.gz → sipdump.txt).
 _log_live_plain_for_rotated_archive() {
     local file="$1" dir base identity live
     dir=$(dirname -- "$file")
     base=$(basename -- "$file")
     identity=$(_psl_strip_archive_ext "$base")
     [[ "$identity" == "$base" ]] && return 1
-    # убрать конечный .N ротации (logrotate)
-    if [[ "$identity" =~ ^(.*)\.[0-9]+$ ]]; then
-        live="$dir/${BASH_REMATCH[1]}"
-        [[ -f "$live" ]] && { echo "$live"; return 0; }
-    fi
+    live=$(_psl_strip_logrotate_suffix "$identity")
+    [[ "$live" != "$identity" ]] || return 1
+    [[ -f "$dir/$live" ]] && { echo "$dir/$live"; return 0; }
     return 1
 }
 
@@ -5786,16 +5808,22 @@ _run_selftest_simple() {
     if [[ "$(_log_type_stem 'sipdump.txt.2.gz')" == "sipdump" \
        && "$(_log_type_stem 'mgcpclient_3.txt')" == "mgcpclient" \
        && "$(_log_type_stem 'error.log')" == "error" \
-       && "$(_log_type_stem 'tarificationlog.txt.7.gz')" == "tarificationlog" ]]; then
+       && "$(_log_type_stem 'tarificationlog.txt.7.gz')" == "tarificationlog" \
+       && "$(_log_type_stem 'sipdump.txt.-20260731')" == "sipdump" \
+       && "$(_log_type_stem 'sipdump.txt.-20260731.gz')" == "sipdump" \
+       && "$(_log_type_stem 'sipdump.txt.-2026-07-31')" == "sipdump" \
+       && "$(_psl_log_group_key 'sipdump.txt.-20260731')" == "sipdump.txt" ]]; then
         _selftest_ok "_log_type_stem collapses rotations/archives and mgcpclient shards"
     else
-        _selftest_bad "_log_type_stem collapses rotations/archives and mgcpclient shards (got: sipdump='$(_log_type_stem 'sipdump.txt.2.gz')' mgcp='$(_log_type_stem 'mgcpclient_3.txt')')"
+        _selftest_bad "_log_type_stem collapses rotations/archives and mgcpclient shards (got: sipdump='$(_log_type_stem 'sipdump.txt.2.gz')' dated='$(_log_type_stem 'sipdump.txt.-20260731')' group='$(_psl_log_group_key 'sipdump.txt.-20260731')')"
     fi
 
-    # Фильтр типов: оставляем только выбранные стемы службы; ротации того же стема тоже.
+    # Фильтр типов: оставляем только выбранные стемы службы; ротации того же стема тоже
+    # (в т.ч. logrotate date: sipdump.txt.-YYYYMMDD на РЕД ОС и др.).
     local ttdir saved_filter="${LOG_TYPE_FILTER:-0}"
     ttdir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
-    touch "$ttdir/sipdump.txt" "$ttdir/sipdump.txt.2.gz" "$ttdir/error.log" "$ttdir/abonentsclass.txt"
+    touch "$ttdir/sipdump.txt" "$ttdir/sipdump.txt.2.gz" "$ttdir/sipdump.txt.-20260731" \
+        "$ttdir/error.log" "$ttdir/abonentsclass.txt"
     LOG_TYPE_FILTER=1
     LOG_DIR_OWNER["$ttdir"]="fss-server"
     SELECTED_LOG_TYPES["fss-server"]="sipdump error"
@@ -5807,10 +5835,20 @@ _run_selftest_simple() {
             tt_drop=$((tt_drop + 1))
         fi
     done
-    if [[ "$tt_keep" -eq 3 && "$tt_drop" -eq 1 ]]; then
+    if [[ "$tt_keep" -eq 4 && "$tt_drop" -eq 1 ]]; then
         _selftest_ok "_log_file_matches_type_filter keeps selected stems (+rotations)"
     else
         _selftest_bad "_log_file_matches_type_filter keeps selected stems (+rotations) (keep=$tt_keep drop=$tt_drop)"
+    fi
+    # find + type-filter: dated logrotate (РЕД ОС: sipdump.txt.-YYYYMMDD) не теряется
+    local found_dated=0
+    while IFS= read -r -d '' f; do
+        [[ "$(basename -- "$f")" == "sipdump.txt.-20260731" ]] && found_dated=1
+    done < <(find_log_files_in_dir "$ttdir")
+    if [[ "$found_dated" -eq 1 ]]; then
+        _selftest_ok "find_log_files_in_dir finds sipdump.txt.-YYYYMMDD rotation"
+    else
+        _selftest_bad "find_log_files_in_dir finds sipdump.txt.-YYYYMMDD rotation"
     fi
     LOG_TYPE_FILTER="$saved_filter"
     unset "LOG_DIR_OWNER[$ttdir]" "SELECTED_LOG_TYPES[fss-server]"
