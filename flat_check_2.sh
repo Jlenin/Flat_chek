@@ -50,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.10.4"
+SCRIPT_VERSION="3.10.5"
 
 set -uo pipefail
 
@@ -183,7 +183,8 @@ LOG_PLAIN_COVERS_ROTATED_MAX_SEC=$((24 * 3600))
 # После zgrep-miss не гонять 12-point full-decompress (dated → skip;
 # undated без инструмента → один extract). 0 = старое поведение (12-point).
 LOG_ARCHIVE_SKIP_PROBE_ON_ZGREP_MISS=1
-# Stream-extract архива: early-stop после to (+ grace), как у sorted plain
+# Stream-extract архива: early-stop после to (+ grace), как у sorted plain.
+# Soft-стемы (sipdump/…) всегда без early-stop — см. _log_archive_stream_sorted().
 LOG_ARCHIVE_STREAM_SORTED=1
 # Допуск (сек) после to перед early-stop — мелкий reorder потоков SoftSwitch
 LOG_ARCHIVE_EARLY_STOP_GRACE_SEC=300
@@ -3682,27 +3683,29 @@ time_to_epoch() {
 # Ожидает опциональную awk-переменную ref_midnight (epoch полуночи дня,
 # к которому относится файл — задаётся через -v вызывающим кодом на основе
 # _LOG_REF_MIDNIGHT_EPOCH, см. _infer_file_midnight_epoch()).
+# Важно: метка только с НАЧАЛА строки. Иначе в sipdump тело SIP (Date/SDP/…)
+# даёт ложный epoch → early-stop обрезает файл до реальных строк диапазона.
 _AWK_LINE_EPOCH='
 function line_epoch(line, ts, n, p) {
-    if (match(line, /[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+    if (match(line, /^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
         ts = substr(line, RSTART, RLENGTH)
         gsub(/[-T:]/, " ", ts)
         n = split(ts, p, " ")
         if (n >= 6) return mktime(p[1] " " p[2] " " p[3] " " p[4] " " p[5] " " p[6])
     }
-    if (match(line, /[0-9]{2}\.[0-9]{2}\.[0-9]{4}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+    if (match(line, /^[0-9]{2}\.[0-9]{2}\.[0-9]{4}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
         ts = substr(line, RSTART, RLENGTH)
         gsub(/[T]/, " ", ts)
         n = split(ts, p, /[. :]/)
         if (n >= 6) return mktime(p[3] " " p[2] " " p[1] " " p[4] " " p[5] " " p[6])
     }
-    if (match(line, /[0-9]{2}\.[0-9]{2}\.[0-9]{4}[ T][0-9]{2}:[0-9]{2}/)) {
+    if (match(line, /^[0-9]{2}\.[0-9]{2}\.[0-9]{4}[ T][0-9]{2}:[0-9]{2}/)) {
         ts = substr(line, RSTART, RLENGTH)
         gsub(/[T]/, " ", ts)
         n = split(ts, p, /[. :]/)
         if (n >= 5) return mktime(p[3] " " p[2] " " p[1] " " p[4] " " p[5] " 0")
     }
-    if (match(line, /[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}/)) {
+    if (match(line, /^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}/)) {
         ts = substr(line, RSTART, RLENGTH)
         gsub(/[-T:]/, " ", ts)
         n = split(ts, p, " ")
@@ -5043,7 +5046,23 @@ _log_range_span_sec() {
     echo "$span"
 }
 
-# Паттерн дат DD.MM.YYYY|YYYY-MM-DD на каждый день [from-margin .. to+margin], ≤ LOG_ZGREP_MAX_DAYS.
+# Экранирование литерала для ERE (zgrep -E): точки в DD.MM.YYYY и т.п.
+_log_ere_quote() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//./\\.}"
+    s="${s//[/\\[}"
+    s="${s//]/\\)}"
+    s="${s//+/\\+}"
+    s="${s//\*/\\*}"
+    s="${s//\?/\\?}"
+    s="${s//|/\\|}"
+    s="${s//\{/\\{}"
+    printf '%s' "$s"
+}
+
+# Паттерн дат ^DD.MM.YYYY|^YYYY-MM-DD на каждый день [from-margin .. to+margin], ≤ LOG_ZGREP_MAX_DAYS.
+# Якорь ^ — чтобы sipdump не ловил дату внутри тела SIP.
 _log_day_grep_pattern() {
     local from_epoch="$1" to_epoch="$2"
     local margin="${LOG_RANGE_DAY_MARGIN_SEC:-86400}"
@@ -5057,8 +5076,10 @@ _log_day_grep_pattern() {
     while [[ "$cur" -le "$end" && "$n" -lt "$maxd" ]]; do
         d1=$(date -d "@$cur" "+%d.%m.%Y" 2>/dev/null) || break
         d2=$(date -d "@$cur" "+%Y-%m-%d" 2>/dev/null) || break
+        d1=$(_log_ere_quote "$d1")
+        d2=$(_log_ere_quote "$d2")
         [[ -n "$pat" ]] && pat="${pat}|"
-        pat="${pat}${d1}|${d2}"
+        pat="${pat}^${d1}|^${d2}"
         n=$((n + 1))
         cur=$((cur + 86400))
     done
@@ -5066,11 +5087,11 @@ _log_day_grep_pattern() {
     printf '%s' "$pat"
 }
 
-# Паттерн часов SoftSwitch: «DD.MM.YYYY HH:» | «YYYY-MM-DD HH:» (±1h), ≤ LOG_ZGREP_MAX_HOURS.
+# Паттерн часов SoftSwitch: «^DD.MM.YYYY HH:» | «^YYYY-MM-DD HH:» (±1h), ≤ LOG_ZGREP_MAX_HOURS.
 _log_hour_grep_pattern() {
     local from_epoch="$1" to_epoch="$2"
     local maxh="${LOG_ZGREP_MAX_HOURS:-48}"
-    local cur end pat d1 d2 hh n=0
+    local cur end pat d1 d2 n=0
     cur=$(( (from_epoch / 3600) * 3600 - 3600 ))
     end=$(( (to_epoch / 3600) * 3600 + 3600 ))
     [[ "$cur" -lt 0 ]] && cur=0
@@ -5078,8 +5099,10 @@ _log_hour_grep_pattern() {
     while [[ "$cur" -le "$end" && "$n" -lt "$maxh" ]]; do
         d1=$(date -d "@$cur" "+%d.%m.%Y %H:" 2>/dev/null) || break
         d2=$(date -d "@$cur" "+%Y-%m-%d %H:" 2>/dev/null) || break
+        d1=$(_log_ere_quote "$d1")
+        d2=$(_log_ere_quote "$d2")
         [[ -n "$pat" ]] && pat="${pat}|"
-        pat="${pat}${d1}|${d2}"
+        pat="${pat}^${d1}|^${d2}"
         n=$((n + 1))
         cur=$((cur + 3600))
     done
@@ -5295,6 +5318,28 @@ _log_archive_should_process() {
     return 1
 }
 
+# SoftSwitch multi-writer стемы: mid «плавает» — early-stop на архиве опасен.
+_log_stem_is_soft_sorted() {
+    local stem
+    stem=$(_log_type_stem "$1")
+    case "$stem" in
+        sipdump|clustermonitorlog|clustermonitor|sipsigthr_log|sippbx|sipsigthr)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# 1/0 — включать ли early-stop при stream-extract архива.
+_log_archive_stream_sorted() {
+    local file="$1"
+    if _log_stem_is_soft_sorted "$file"; then
+        echo 0
+        return
+    fi
+    echo "${LOG_ARCHIVE_STREAM_SORTED:-1}"
+}
+
 # Стоит ли открывать файл для offline-диапазона (дешёвые проверки → zgrep → …).
 _log_should_process_for_range() {
     local file="$1" from_epoch="$2" to_epoch="$3"
@@ -5313,7 +5358,11 @@ _log_should_process_for_range() {
     fi
 
     # plain: прежняя mtime/ctime эвристика
-    _log_file_in_range "$file" "$from_epoch" "$to_epoch"
+    if _log_file_in_range "$file" "$from_epoch" "$to_epoch"; then
+        return 0
+    fi
+    log_debug "discarded (plain birth/mtime span outside range): $file"
+    return 1
 }
 
 # Extracts (or, with no time range, plain-copies) one file into its log-
@@ -5328,7 +5377,8 @@ _log_should_process_for_range() {
 # Если задан только from (режим «за последние Nd»), to по умолчанию —
 # сейчас: иначе пустой to раньше доходил до date -d "" → полночь сегодня
 # и обрезал хвост текущего дня.
-# Один decompress|awk в group_file. sorted/grace — из TUNABLES.
+# Один decompress|awk в group_file. sorted/grace — из TUNABLES;
+# soft-стемы (sipdump) — без early-stop.
 # return 0 если хоть что-то дописалось.
 _log_stream_extract_to_group() {
     local file="$1" from_epoch="$2" to_epoch="$3" group_file="$4"
@@ -5336,7 +5386,7 @@ _log_stream_extract_to_group() {
 
     [[ -f "$group_file" ]] && before_sz=$(_file_size_bytes "$group_file")
     _LOG_REF_MIDNIGHT_EPOCH=$(_infer_file_midnight_epoch "$file")
-    sorted="${LOG_ARCHIVE_STREAM_SORTED:-1}"
+    sorted=$(_log_archive_stream_sorted "$file")
     grace="${LOG_ARCHIVE_EARLY_STOP_GRACE_SEC:-300}"
     _log_stream_decompress "$file" 2>/dev/null \
         | tr -d '\0' \
@@ -5999,13 +6049,13 @@ _run_selftest_simple() {
         _selftest_bad "_log_coarse_definitely_outside drops far day (01.06 vs 01.01)"
     fi
 
-    # hour-level zgrep pattern для короткого окна
+    # hour-level zgrep pattern для короткого окна (^ + экранированные точки)
     local hp
     hp=$(_log_hour_grep_pattern "$(date -d '2026-08-04 10:00:00' '+%s')" "$(date -d '2026-08-04 11:00:00' '+%s')")
-    if [[ "$hp" == *"04.08.2026 10:"* && "$hp" == *"2026-08-04 10:"* ]]; then
-        _selftest_ok "_log_hour_grep_pattern includes SoftSwitch hour stamps"
+    if [[ "$hp" == *'^04\.08\.2026 10:'* && "$hp" == *'^2026-08-04 10:'* ]]; then
+        _selftest_ok "_log_hour_grep_pattern includes anchored SoftSwitch hour stamps"
     else
-        _selftest_bad "_log_hour_grep_pattern includes SoftSwitch hour stamps (got: $hp)"
+        _selftest_bad "_log_hour_grep_pattern includes anchored SoftSwitch hour stamps (got: $hp)"
     fi
 
     # live plain covers → skip rotated .N.gz на коротком окне
@@ -6069,6 +6119,47 @@ _run_selftest_simple() {
         _selftest_bad "_log_extract_one_file stream archive keeps only [from,to]"
     fi
     rm -rf -- "$gwork" 2>/dev/null
+
+    # sipdump: дата внутри тела SIP не должна early-stop'ить extract до реальных строк
+    local sipgz sipwork sip_from sip_to
+    sipwork=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    sipgz="$sipwork/sipdump.txt-20260806.gz"
+    {
+        printf '05.08.2026 14:00:00 | INFO | before-range\n'
+        printf 'Via: SIP/2.0/UDP 10.0.0.1;branch=z9hG4bK; ts=05.08.2026 16:10:00 embedded\n'
+        printf '05.08.2026 15:30:00 | INFO | keep-me-in-range\n'
+        printf '05.08.2026 17:00:00 | INFO | after-range\n'
+    } | gzip -c > "$sipgz"
+    sip_from=$(date -d '2026-08-05 15:00:00' '+%s')
+    sip_to=$(date -d '2026-08-05 16:00:00' '+%s')
+    if [[ "$(_log_archive_stream_sorted "$sipgz")" == "0" ]] \
+        && _log_extract_one_file "$sipgz" "$sip_from" "$sip_to" "$sipwork" \
+        && grep -q 'keep-me-in-range' "$sipwork"/groups/*.log 2>/dev/null \
+        && ! grep -q 'embedded' "$sipwork"/groups/*.log 2>/dev/null \
+        && ! grep -q 'after-range' "$sipwork"/groups/*.log 2>/dev/null; then
+        _selftest_ok "_log_extract_one_file sipdump ignores mid-line SIP timestamps"
+    else
+        _selftest_bad "_log_extract_one_file sipdump ignores mid-line SIP timestamps"
+    fi
+    # zgrep hour: hit только по ^строке, не по телу SIP
+    if _log_archive_zgrep_hit "$sipgz" "$sip_from" "$sip_to"; then
+        _selftest_ok "_log_archive_zgrep_hit finds line-leading sipdump hour stamp"
+    else
+        _selftest_bad "_log_archive_zgrep_hit finds line-leading sipdump hour stamp"
+    fi
+    local sipbody
+    sipbody="$sipwork/sipdump-body-only.txt.gz"
+    {
+        printf '05.08.2026 14:00:00 | INFO | only-afternoon\n'
+        printf 'Via: SIP/2.0/UDP; ts=05.08.2026 16:10:00 embedded-only\n'
+        printf '05.08.2026 14:45:00 | INFO | still-afternoon\n'
+    } | gzip -c > "$sipbody"
+    if ! _log_archive_zgrep_hit "$sipbody" "$(date -d '2026-08-05 16:00:00' '+%s')" "$(date -d '2026-08-05 16:30:00' '+%s')"; then
+        _selftest_ok "_log_archive_zgrep_hit misses sipdump body-only hour stamp"
+    else
+        _selftest_bad "_log_archive_zgrep_hit misses sipdump body-only hour stamp"
+    fi
+    rm -rf -- "$sipwork" 2>/dev/null
 
     # inbox → groups: порядок склейки по idx (как обход кандидатов)
     local ibox merged_txt
