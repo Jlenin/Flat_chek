@@ -30,7 +30,7 @@
 # Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log рядом со скриптом
 #   (перезаписывается). Сборщик логов — в flat_check_2.sh.
 
-SCRIPT_VERSION="3.8.0"
+SCRIPT_VERSION="3.8.1"
 
 set -uo pipefail
 
@@ -307,9 +307,12 @@ init_logging() {
         return 1
     fi
     _log_line "INFO" "=== ${SCRIPT_NAME}.sh v${SCRIPT_VERSION} — сессия начата ==="
+    # Версия на экран в human-режиме (при --json/--push только в session-log)
+    if [[ "${OUTPUT_JSON:-0}" -ne 1 && "${DO_PUSH:-0}" -ne 1 ]]; then
+        info "${SCRIPT_NAME}.sh v${SCRIPT_VERSION}"
+    fi
     if [[ "${PKG_CATALOG_SOURCE:-internal}" == "external" ]]; then
         _log_line "INFO" "package catalog: external (${PKG_CATALOG_PATH})"
-        # не в stdout при --json/--push (агент ждёт чистый JSON)
         if [[ "${OUTPUT_JSON:-0}" -ne 1 && "${DO_PUSH:-0}" -ne 1 ]]; then
             info "package catalog: external (${PKG_CATALOG_PATH})"
         fi
@@ -1971,7 +1974,7 @@ check_infrastructure_pkg() {
 
 check_infrastructure() {
     echo ""
-    echo "=== Infrastructure ==="
+    echo "=== Depends ==="
 
     local has_any=0
     local dep_list=()
@@ -1983,25 +1986,17 @@ check_infrastructure() {
     done
 
     if [[ $has_any -eq 0 ]]; then
-        print_info "No unmet infrastructure dependencies"
+        print_info "No dependencies registered by installed packages"
         return
     fi
 
     IFS=$'\n' dep_list=($(sort <<<"${dep_list[*]}")); unset IFS
 
-    local shown=0
     for dep in "${dep_list[@]}"; do
         local req_by="${ALL_DEPENDS[$dep]:-}"
         local dep_ver=""
         local svc_status=""
         local dep_found=0
-
-        # Не дублируем продукт Infrastructure / удовлетворённые deps:
-        # подробности — в секции пакета; здесь только дыры + кто зависит.
-        if _infra_dep_satisfied "$dep"; then
-            continue
-        fi
-        shown=$((shown + 1))
 
         # Разделяемые библиотеки: проверяем наличие файла в lib-путях (RHEL/ReOS 7.3 использует /usr/lib64/)
         if [[ "$dep" == *.so.* ]]; then
@@ -2143,9 +2138,6 @@ check_infrastructure() {
                 ;;
         esac
     done
-    if [[ "$shown" -eq 0 ]]; then
-        print_info "No unmet infrastructure dependencies"
-    fi
 }
 
 # Проверить репозитории
@@ -2774,12 +2766,7 @@ _json_collect_infra() {
     # важно: не ${!ALL_DEPENDS[@]+...} — при значениях с "-" bash считает это
     # косвенным раскрытием имён переменных (fps-server -> «недопустимое имя»)
     for dep in "${!ALL_DEPENDS[@]}"; do
-        # Схема JSON та же; не дублируем удовлетворённые deps, у которых есть PKG
-        # (подробности — в products[].Infrastructure). Дыры — всегда, с required_by.
-        if _infra_dep_satisfied "$dep"; then
-            continue
-        fi
-        status="missing"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
+        status="unknown"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
         if command -v systemctl >/dev/null 2>&1; then
             if systemctl is-active --quiet "$dep" 2>/dev/null; then
                 status="active"
@@ -3048,15 +3035,14 @@ _run_selftest_simple() {
     else
         _selftest_bad "_json_collect_infra tolerates hyphen keys (got: $infra_json)"
     fi
-    # nginx обычно удовлетворён на CI → не должен попасть в unmet-only массив как дубль продукта
-    if declare -F _infra_dep_satisfied >/dev/null && _infra_dep_satisfied nginx; then
-        if [[ "$infra_json" != *'"service_name":"nginx"'* ]]; then
-            _selftest_ok "_json_collect_infra omits satisfied PKG deps"
+    if declare -F check_infrastructure >/dev/null; then
+        local dep_hdr
+        dep_hdr=$(check_infrastructure 2>/dev/null | head -n 2 | tr '\n' ' ')
+        if [[ "$dep_hdr" == *"=== Depends ==="* ]]; then
+            _selftest_ok "check_infrastructure section is Depends"
         else
-            _selftest_bad "_json_collect_infra omits satisfied PKG deps"
+            _selftest_bad "check_infrastructure section is Depends (got: $dep_hdr)"
         fi
-    else
-        _selftest_ok "_json_collect_infra omits satisfied PKG deps (skip: nginx unmet here)"
     fi
 
     if [[ "${PKG_CATALOG_SOURCE:-}" == "external" || "${PKG_CATALOG_SOURCE:-}" == "internal" ]]; then

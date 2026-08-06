@@ -4,8 +4,8 @@
 
 | Скрипт | Назначение | Версия |
 |--------|------------|--------|
-| `flat_check.sh` | health check | 3.8.0 |
-| `flat_check_2.sh` | тот же health check + сбор логов | 3.11.0 |
+| `flat_check.sh` | health check | 3.8.1 |
+| `flat_check_2.sh` | тот же health check + сбор логов | 3.11.1 |
 | `flat_check.packages.conf` | каталог пакетов (рядом со скриптом) | — |
 
 Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
@@ -43,7 +43,7 @@ chmod +x flat_check.sh flat_check_2.sh
 ./flat_check_2.sh -h
 
 ./flat_check.sh
-./flat_check.sh -v    # flat_check 3.8.0
+./flat_check.sh -v    # flat_check 3.8.1
 ```
 
 ---
@@ -63,8 +63,8 @@ _pkg_set "my-pkg" "Product Name" "legacy-name" "8080" "/api/health" "nginx,postg
 _pkg_set "other-pkg" "Product Name" "old-name"
 ```
 
-Продукт **Infrastructure** (в конце списка): `nginx`, `postgresql`, `mariadb` — полная проверка как у пакетов.  
-Авто-раздел `=== Infrastructure ===` показывает только **неудовлетворённые** зависимости и кто от них зависит (без дубля с продуктом).
+Продукт **Infrastructure** (в конце списка продуктов): `nginx`, `postgresql`, `mariadb` — в каталоге как обычные PKG (проверка без `/opt/flat`).  
+Раздел **`=== Depends ===`** — зависимости установленных пакетов (libs, nginx как dep, postgresql, …) в прежнем формате `[OK]/[FAIL]`.
 
 ---
 
@@ -226,7 +226,8 @@ Health: `systemctl`, `dpkg`/`rpm`, `ss`/`netstat`, `curl`, `openssl`, при н�
 _pkg_set "my-pkg" "Product Name" "old-name" "8080" "/api/health" "nginx,postgresql"
 ```
 
-Infra-пакет (nginx и т.п.): `_pkg_set "nginx" "Infrastructure"`.
+Infra-пакет в каталоге продуктов: `_pkg_set "nginx" "Infrastructure"`.  
+Зависимости (`=== Depends ===`) собираются из `PKG_DEPS` + Depends пакетного менеджера.
 
 ---
 
