@@ -375,7 +375,11 @@ _json_collect_system() {
 
 _json_collect_infra() {
     local out="[" first=1 dep status ver port req
-    for dep in ${!ALL_DEPENDS[@]+"${!ALL_DEPENDS[@]}"}; do
+    # важно: не ${!ALL_DEPENDS[@]+...} — hyphen keys (fps-server)
+    for dep in "${!ALL_DEPENDS[@]}"; do
+        if declare -F _infra_dep_satisfied >/dev/null 2>&1 && _infra_dep_satisfied "$dep"; then
+            continue
+        fi
         status="unknown"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
         if command -v systemctl >/dev/null 2>&1; then
             if systemctl is-active --quiet "$dep" 2>/dev/null; then
@@ -433,7 +437,11 @@ build_health_json() {
     system_json=$(_json_collect_system)
     certs_json=$(cat "${_JSON_TMP}/certificates.json" 2>/dev/null || echo '[]')
 
-    products_list=("AutoCallServer" "BSS" "Click to Call" "Contact Center" "Device Manager" "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS" "LDAP" "SBC" "Portal" "flat-file")
+    if [[ -n "${FLAT_PRODUCTS_ORDER+x}" && ${#FLAT_PRODUCTS_ORDER[@]} -gt 0 ]]; then
+        products_list=("${FLAT_PRODUCTS_ORDER[@]}")
+    else
+        products_list=("AutoCallServer" "BSS" "Click to Call" "Contact Center" "Device Manager" "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS" "LDAP" "SBC" "Portal" "flat-file" "FVSC" "Infrastructure")
+    fi
     if [[ -n "$FILTER_PRODUCT" ]]; then
         products_list=("$FILTER_PRODUCT")
     fi
@@ -473,7 +481,11 @@ build_health_json() {
         fi
         for pkg in ${product_pkgs[@]+"${product_pkgs[@]}"}; do
             local pj
+            # $() - subshell: INSTALLED++ внутри _json_collect_pkg не доходит сюда
             pj=$(_json_collect_pkg "$pkg") || continue
+            if [[ "$pj" == *'"status":"installed"'* ]]; then
+                INSTALLED=$((INSTALLED + 1))
+            fi
             # регистрация deps для infra
             local d
             for d in $(echo "${PKG_DEPS[$pkg]:-}" | tr ',' ' '); do

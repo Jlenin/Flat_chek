@@ -30,7 +30,7 @@
 # Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log рядом со скриптом
 #   (перезаписывается). Сборщик логов — в flat_check_2.sh.
 
-SCRIPT_VERSION="3.7.1"
+SCRIPT_VERSION="3.8.0"
 
 set -uo pipefail
 
@@ -90,12 +90,12 @@ RESOURCE_WAIT_MAX=120
 _CPU_PREV_IDLE=""
 _CPU_PREV_TOTAL=""
 
-# Ассоциативные массивы метаданных
-# Формат: PKG_PORTS["имя"]="порт1,порт2"
-# Формат: PKG_API["имя"]="/health/endpoint"
-# Формат: PKG_LEGACY["имя"]="старое_имя1,старое_имя2"
-# Формат: PKG_PRODUCT["имя"]="Имя продукта"
-# Формат: PKG_DEPS["имя"]="nginx,mariadb"
+# --- 1. Метаданные продуктов PKG_* (каталог) ---------------------------------
+# Каталог: flat_check.packages.conf рядом со скриптом (предпочтительно).
+# Нет файла → встроенный fallback (_pkg_catalog_builtin). Скрипт не падает.
+# Формат строки каталога: _pkg_set NAME PRODUCT [LEGACY] [PORTS] [API] [DEPS]
+# Пустые PORTS/API/DEPS не задаём. PKG_DEPS — только непустые (для «кто зависит»
+# в авто-разделе Infrastructure при неудовлетворённой зависимости).
 
 declare -A PKG_PORTS
 declare -A PKG_API
@@ -103,559 +103,176 @@ declare -A PKG_LEGACY
 declare -A PKG_PRODUCT
 declare -A PKG_DEPS
 
-# Собрать все уникальные зависимости по установленным пакетам
 # ALL_DEPENDS["имя_зависимости"]="pkg1,pkg2"
 declare -A ALL_DEPENDS
 
-# --- 1. Метаданные продуктов PKG_* ----------------------------------------------
-PKG_PRODUCT["acs-frontend"]="AutoCallServer"
-PKG_LEGACY["acs-frontend"]=""
-PKG_PORTS["acs-frontend"]=""
-PKG_API["acs-frontend"]=""
-PKG_DEPS["acs-frontend"]="nginx"
-
-PKG_PRODUCT["acs-media"]="AutoCallServer"
-PKG_LEGACY["acs-media"]="acs-media"
-PKG_PORTS["acs-media"]="5060,10000-20000"
-PKG_API["acs-media"]=""
-PKG_DEPS["acs-media"]=""
-
-PKG_PRODUCT["acs-tools"]="AutoCallServer"
-PKG_LEGACY["acs-tools"]="acs-tools"
-PKG_PORTS["acs-tools"]=""
-PKG_API["acs-tools"]=""
-PKG_DEPS["acs-tools"]=""
-
-PKG_PRODUCT["acs-server"]="AutoCallServer"
-PKG_LEGACY["acs-server"]="acs-web"
-PKG_PORTS["acs-server"]="8080"
-PKG_API["acs-server"]=""
-PKG_DEPS["acs-server"]=""
-
-# ========== Продукт: BSS ==========
-PKG_PRODUCT["fcs-bssimp"]="BSS"
-PKG_LEGACY["fcs-bssimp"]="bssimp"
-PKG_PORTS["fcs-bssimp"]=""
-PKG_API["fcs-bssimp"]=""
-PKG_DEPS["fcs-bssimp"]=""
-
-PKG_PRODUCT["fcs-bssexp"]="BSS"
-PKG_LEGACY["fcs-bssexp"]="bssexpa"
-PKG_PORTS["fcs-bssexp"]=""
-PKG_API["fcs-bssexp"]=""
-PKG_DEPS["fcs-bssexp"]=""
-
-# ========== Продукт: Click to Call ==========
-PKG_PRODUCT["c2c-backend"]="Click to Call"
-PKG_LEGACY["c2c-backend"]=""
-PKG_PORTS["c2c-backend"]="8080"
-PKG_API["c2c-backend"]="/api/health"
-PKG_DEPS["c2c-backend"]=""
-
-PKG_PRODUCT["c2c-frontend"]="Click to Call"
-PKG_LEGACY["c2c-frontend"]=""
-PKG_PORTS["c2c-frontend"]=""
-PKG_API["c2c-frontend"]=""
-PKG_DEPS["c2c-frontend"]="nginx"
-
-# ========== Продукт: Contact Center ==========
-PKG_PRODUCT["fcs-span"]="Contact Center"
-PKG_LEGACY["fcs-span"]=""
-PKG_PORTS["fcs-span"]=""
-PKG_API["fcs-span"]=""
-PKG_DEPS["fcs-span"]=""
-
-PKG_PRODUCT["fcs-chat"]="Contact Center"
-PKG_LEGACY["fcs-chat"]="fcs-chat-server"
-PKG_PORTS["fcs-chat"]=""
-PKG_API["fcs-chat"]=""
-PKG_DEPS["fcs-chat"]=""
-
-PKG_PRODUCT["fcs-contact"]="Contact Center"
-PKG_LEGACY["fcs-contact"]="fcs-flexconnect"
-PKG_PORTS["fcs-contact"]=""
-PKG_API["fcs-contact"]=""
-PKG_DEPS["fcs-contact"]=""
-
-PKG_PRODUCT["fcs-contact-db"]="Contact Center"
-PKG_LEGACY["fcs-contact-db"]=""
-PKG_PORTS["fcs-contact-db"]=""
-PKG_API["fcs-contact-db"]=""
-PKG_DEPS["fcs-contact-db"]="mariadb"
-
-PKG_PRODUCT["fcs-contact-db-pg"]="Contact Center"
-PKG_LEGACY["fcs-contact-db-pg"]=""
-PKG_PORTS["fcs-contact-db-pg"]=""
-PKG_API["fcs-contact-db-pg"]=""
-PKG_DEPS["fcs-contact-db-pg"]="postgresql"
-
-PKG_PRODUCT["fcs-recognize"]="Contact Center"
-PKG_LEGACY["fcs-recognize"]="flat-contact-recognize"
-PKG_PORTS["fcs-recognize"]=""
-PKG_API["fcs-recognize"]=""
-PKG_DEPS["fcs-recognize"]=""
-
-PKG_PRODUCT["fcs-replication"]="Contact Center"
-PKG_LEGACY["fcs-replication"]="fcs-record-replication,flat-record-replication"
-PKG_PORTS["fcs-replication"]=""
-PKG_API["fcs-replication"]=""
-PKG_DEPS["fcs-replication"]=""
-
-PKG_PRODUCT["fcs-recordtask"]="Contact Center"
-PKG_LEGACY["fcs-recordtask"]="fcs-recproc,flat-record-taskservice"
-PKG_PORTS["fcs-recordtask"]=""
-PKG_API["fcs-recordtask"]=""
-PKG_DEPS["fcs-recordtask"]=""
-
-PKG_PRODUCT["fcs-screen"]="Contact Center"
-PKG_LEGACY["fcs-screen"]="fcs-screen-record,flat-screen-recording"
-PKG_PORTS["fcs-screen"]=""
-PKG_API["fcs-screen"]=""
-PKG_DEPS["fcs-screen"]=""
-
-PKG_PRODUCT["fcs-swau"]="Contact Center"
-PKG_LEGACY["fcs-swau"]="fcs-swau"
-PKG_PORTS["fcs-swau"]=""
-PKG_API["fcs-swau"]=""
-PKG_DEPS["fcs-swau"]=""
-
-PKG_PRODUCT["fcs-swau-db"]="Contact Center"
-PKG_LEGACY["fcs-swau-db"]=""
-PKG_PORTS["fcs-swau-db"]=""
-PKG_API["fcs-swau-db"]=""
-PKG_DEPS["fcs-swau-db"]="mariadb"
-
-PKG_PRODUCT["fcs-swau-db-pg"]="Contact Center"
-PKG_LEGACY["fcs-swau-db-pg"]=""
-PKG_PORTS["fcs-swau-db-pg"]=""
-PKG_API["fcs-swau-db-pg"]=""
-PKG_DEPS["fcs-swau-db-pg"]="postgresql"
-
-PKG_PRODUCT["fcs-swiam"]="Contact Center"
-PKG_LEGACY["fcs-swiam"]="fcs-swfo,fcs-alarm,flat-contact-alarm"
-PKG_PORTS["fcs-swiam"]=""
-PKG_API["fcs-swiam"]=""
-PKG_DEPS["fcs-swiam"]=""
-
-PKG_PRODUCT["fcs-swiam-db"]="Contact Center"
-PKG_LEGACY["fcs-swiam-db"]=""
-PKG_PORTS["fcs-swiam-db"]=""
-PKG_API["fcs-swiam-db"]=""
-PKG_DEPS["fcs-swiam-db"]="mariadb"
-
-PKG_PRODUCT["fcs-swiam-db-pg"]="Contact Center"
-PKG_LEGACY["fcs-swiam-db-pg"]=""
-PKG_PORTS["fcs-swiam-db-pg"]=""
-PKG_API["fcs-swiam-db-pg"]=""
-PKG_DEPS["fcs-swiam-db-pg"]="postgresql"
-
-PKG_PRODUCT["fcs-swicl"]="Contact Center"
-PKG_LEGACY["fcs-swicl"]=""
-PKG_PORTS["fcs-swicl"]=""
-PKG_API["fcs-swicl"]=""
-PKG_DEPS["fcs-swicl"]=""
-
-PKG_PRODUCT["fcs-swiib"]="Contact Center"
-PKG_LEGACY["fcs-swiib"]=""
-PKG_PORTS["fcs-swiib"]=""
-PKG_API["fcs-swiib"]=""
-PKG_DEPS["fcs-swiib"]=""
-
-PKG_PRODUCT["fcs-swikc"]="Contact Center"
-PKG_LEGACY["fcs-swikc"]="flat-contact-center"
-PKG_PORTS["fcs-swikc"]=""
-PKG_API["fcs-swikc"]=""
-PKG_DEPS["fcs-swikc"]=""
-
-PKG_PRODUCT["fcs-swikc-db"]="Contact Center"
-PKG_LEGACY["fcs-swikc-db"]=""
-PKG_PORTS["fcs-swikc-db"]=""
-PKG_API["fcs-swikc-db"]=""
-PKG_DEPS["fcs-swikc-db"]="mariadb"
-
-PKG_PRODUCT["fcs-swikc-db-pg"]="Contact Center"
-PKG_LEGACY["fcs-swikc-db-pg"]=""
-PKG_PORTS["fcs-swikc-db-pg"]=""
-PKG_API["fcs-swikc-db-pg"]=""
-PKG_DEPS["fcs-swikc-db-pg"]="postgresql"
-
-PKG_PRODUCT["fcs-swiop"]="Contact Center"
-PKG_LEGACY["fcs-swiop"]="flat-contact-operator-interface"
-PKG_PORTS["fcs-swiop"]=""
-PKG_API["fcs-swiop"]=""
-PKG_DEPS["fcs-swiop"]=""
-
-PKG_PRODUCT["fcs-swir"]="Contact Center"
-PKG_LEGACY["fcs-swir"]="flat-contact-recording"
-PKG_PORTS["fcs-swir"]=""
-PKG_API["fcs-swir"]=""
-PKG_DEPS["fcs-swir"]=""
-
-PKG_PRODUCT["fcs-swir-db"]="Contact Center"
-PKG_LEGACY["fcs-swir-db"]=""
-PKG_PORTS["fcs-swir-db"]=""
-PKG_API["fcs-swir-db"]=""
-PKG_DEPS["fcs-swir-db"]="mariadb"
-
-PKG_PRODUCT["fcs-swir-db-pg"]="Contact Center"
-PKG_LEGACY["fcs-swir-db-pg"]=""
-PKG_PORTS["fcs-swir-db-pg"]=""
-PKG_API["fcs-swir-db-pg"]=""
-PKG_DEPS["fcs-swir-db-pg"]="postgresql"
-
-PKG_PRODUCT["fcs-swui"]="Contact Center"
-PKG_LEGACY["fcs-swui"]="flat-constact-system-of-analytics"
-PKG_PORTS["fcs-swui"]=""
-PKG_API["fcs-swui"]=""
-PKG_DEPS["fcs-swui"]=""
-
-PKG_PRODUCT["fcs-swui-db"]="Contact Center"
-PKG_LEGACY["fcs-swui-db"]="data-base-system-analytics"
-PKG_PORTS["fcs-swui-db"]=""
-PKG_API["fcs-swui-db"]=""
-PKG_DEPS["fcs-swui-db"]="mariadb"
-
-PKG_PRODUCT["fcs-unigy"]="Contact Center"
-PKG_LEGACY["fcs-unigy"]="fcs-unigy-connector"
-PKG_PORTS["fcs-unigy"]=""
-PKG_API["fcs-unigy"]=""
-PKG_DEPS["fcs-unigy"]=""
-
-PKG_PRODUCT["frec-frontend"]="Contact Center"
-PKG_LEGACY["frec-frontend"]=""
-PKG_PORTS["frec-frontend"]=""
-PKG_API["frec-frontend"]=""
-PKG_DEPS["frec-frontend"]="nginx"
-
-PKG_PRODUCT["frec-backend"]="Contact Center"
-PKG_LEGACY["frec-backend"]="flat-recording-backend"
-PKG_PORTS["frec-backend"]=""
-PKG_API["frec-backend"]=""
-PKG_DEPS["frec-backend"]=""
-
-PKG_PRODUCT["fcs-record-export"]="Contact Center"
-PKG_LEGACY["fcs-record-export"]="flat-record-export-service"
-PKG_PORTS["fcs-record-export"]=""
-PKG_API["fcs-record-export"]=""
-PKG_DEPS["fcs-record-export"]=""
-
-PKG_PRODUCT["fcs-recognition"]="Contact Center"
-PKG_LEGACY["fcs-recognition"]="asr"
-PKG_PORTS["fcs-recognition"]=""
-PKG_API["fcs-recognition"]=""
-PKG_DEPS["fcs-recognition"]=""
-
-PKG_PRODUCT["asr-backend"]="Contact Center"
-PKG_LEGACY["asr-backend"]=""
-PKG_PORTS["asr-backend"]=""
-PKG_API["asr-backend"]=""
-PKG_DEPS["asr-backend"]=""
-
-PKG_PRODUCT["asr-analytics"]="Contact Center"
-PKG_LEGACY["asr-analytics"]=""
-PKG_PORTS["asr-analytics"]=""
-PKG_API["asr-analytics"]=""
-PKG_DEPS["asr-analytics"]=""
-
-# ========== Продукт: Device Manager ==========
-PKG_PRODUCT["fdm-server"]="Device Manager"
-PKG_LEGACY["fdm-server"]="fdm-server"
-PKG_PORTS["fdm-server"]=""
-PKG_API["fdm-server"]=""
-PKG_DEPS["fdm-server"]=""
-
-PKG_PRODUCT["fcc-frontend"]="Device Manager"
-PKG_LEGACY["fcc-frontend"]=""
-PKG_PORTS["fcc-frontend"]=""
-PKG_API["fcc-frontend"]=""
-PKG_DEPS["fcc-frontend"]="nginx"
-
-PKG_PRODUCT["fcc-backend"]="Device Manager"
-PKG_LEGACY["fcc-backend"]=""
-PKG_PORTS["fcc-backend"]=""
-PKG_API["fcc-backend"]=""
-PKG_DEPS["fcc-backend"]=""
-
-# ========== Продукт: Gateway ==========
-PKG_PRODUCT["fg-frontend"]="Gateway"
-PKG_LEGACY["fg-frontend"]=""
-PKG_PORTS["fg-frontend"]=""
-PKG_API["fg-frontend"]=""
-PKG_DEPS["fg-frontend"]="nginx"
-
-PKG_PRODUCT["fg-backend"]="Gateway"
-PKG_LEGACY["fg-backend"]=""
-PKG_PORTS["fg-backend"]=""
-PKG_API["fg-backend"]=""
-PKG_DEPS["fg-backend"]=""
-
-# ========== Продукт: Partner Server ==========
-PKG_PRODUCT["fps-backend"]="Partner Server"
-PKG_LEGACY["fps-backend"]="flatPartnerAuth"
-PKG_PORTS["fps-backend"]=""
-PKG_API["fps-backend"]=""
-PKG_DEPS["fps-backend"]=""
-
-PKG_PRODUCT["fps-profile"]="Partner Server"
-PKG_LEGACY["fps-profile"]="flatImageProcessor"
-PKG_PORTS["fps-profile"]=""
-PKG_API["fps-profile"]=""
-PKG_DEPS["fps-profile"]=""
-
-PKG_PRODUCT["fps-frontend"]="Partner Server"
-PKG_LEGACY["fps-frontend"]="flatPartnerFrontend"
-PKG_PORTS["fps-frontend"]=""
-PKG_API["fps-frontend"]=""
-PKG_DEPS["fps-frontend"]="nginx"
-
-PKG_PRODUCT["fps-license"]="Partner Server"
-PKG_LEGACY["fps-license"]="flatPartnerLicense"
-PKG_PORTS["fps-license"]=""
-PKG_API["fps-license"]=""
-PKG_DEPS["fps-license"]=""
-
-PKG_PRODUCT["fps-admin"]="Partner Server"
-PKG_LEGACY["fps-admin"]="flatPartnerLicenseAdmin"
-PKG_PORTS["fps-admin"]=""
-PKG_API["fps-admin"]=""
-PKG_DEPS["fps-admin"]=""
-
-PKG_PRODUCT["fps-agent"]="Partner Server"
-PKG_LEGACY["fps-agent"]="flatPartnerLicenseAgent"
-PKG_PORTS["fps-agent"]=""
-PKG_API["fps-agent"]=""
-PKG_DEPS["fps-agent"]=""
-
-PKG_PRODUCT["fps-server"]="Partner Server"
-PKG_LEGACY["fps-server"]="flatPartnerServer"
-PKG_PORTS["fps-server"]=""
-PKG_API["fps-server"]=""
-PKG_DEPS["fps-server"]=""
-
-PKG_PRODUCT["fps-push"]="Partner Server"
-PKG_LEGACY["fps-push"]="flatPushNotificationServer"
-PKG_PORTS["fps-push"]=""
-PKG_API["fps-push"]=""
-PKG_DEPS["fps-push"]=""
-
-PKG_PRODUCT["fps-control"]="Partner Server"
-PKG_LEGACY["fps-control"]="flatPartnerFLC"
-PKG_PORTS["fps-control"]=""
-PKG_API["fps-control"]=""
-PKG_DEPS["fps-control"]=""
-
-PKG_PRODUCT["fps-phonebook"]="Partner Server"
-PKG_LEGACY["fps-phonebook"]=""
-PKG_PORTS["fps-phonebook"]=""
-PKG_API["fps-phonebook"]=""
-PKG_DEPS["fps-phonebook"]=""
-
-# ========== Продукт: SoftSwitch ==========
-PKG_PRODUCT["fss-frontend"]="SoftSwitch"
-PKG_LEGACY["fss-frontend"]="softswitch-frontend"
-PKG_PORTS["fss-frontend"]=""
-PKG_API["fss-frontend"]=""
-PKG_DEPS["fss-frontend"]="nginx"
-
-PKG_PRODUCT["fss-backend"]="SoftSwitch"
-PKG_LEGACY["fss-backend"]="flatSoftSwitchBackend"
-PKG_PORTS["fss-backend"]="8082"
-PKG_API["fss-backend"]="/api/health"
-PKG_DEPS["fss-backend"]="postgresql"
-
-PKG_PRODUCT["fss-mediasrv"]="SoftSwitch"
-PKG_LEGACY["fss-mediasrv"]="mediasrv"
-PKG_PORTS["fss-mediasrv"]="5060,10000-20000"
-PKG_API["fss-mediasrv"]=""
-PKG_DEPS["fss-mediasrv"]=""
-
-PKG_PRODUCT["fss-srclient"]="SoftSwitch"
-PKG_LEGACY["fss-srclient"]="srclient"
-PKG_PORTS["fss-srclient"]=""
-PKG_API["fss-srclient"]=""
-PKG_DEPS["fss-srclient"]="fss-server"
-
-PKG_PRODUCT["fss-server"]="SoftSwitch"
-PKG_LEGACY["fss-server"]=""
-PKG_PORTS["fss-server"]="8080,8081"
-PKG_API["fss-server"]="/api/v1/health"
-PKG_DEPS["fss-server"]="nginx,postgresql"
-
-PKG_PRODUCT["fss-web"]="SoftSwitch"
-PKG_LEGACY["fss-web"]="fss-web"
-PKG_PORTS["fss-web"]=""
-PKG_API["fss-web"]=""
-PKG_DEPS["fss-web"]="nginx"
-
-PKG_PRODUCT["fss-csta"]="SoftSwitch"
-PKG_LEGACY["fss-csta"]="csta-rest-broker"
-PKG_PORTS["fss-csta"]=""
-PKG_API["fss-csta"]=""
-PKG_DEPS["fss-csta"]=""
-
-PKG_PRODUCT["fss-capagent"]="SoftSwitch"
-PKG_LEGACY["fss-capagent"]="flat-capagent"
-PKG_PORTS["fss-capagent"]=""
-PKG_API["fss-capagent"]=""
-PKG_DEPS["fss-capagent"]=""
-
-# ========== Продукт: Tarifficator ==========
-PKG_PRODUCT["ftr-frontend"]="Tarifficator"
-PKG_LEGACY["ftr-frontend"]="tarifficator-frontend"
-PKG_PORTS["ftr-frontend"]=""
-PKG_API["ftr-frontend"]=""
-PKG_DEPS["ftr-frontend"]="nginx"
-
-PKG_PRODUCT["ftr-server"]="Tarifficator"
-PKG_LEGACY["ftr-server"]=""
-PKG_PORTS["ftr-server"]=""
-PKG_API["ftr-server"]=""
-PKG_DEPS["ftr-server"]=""
-
-PKG_PRODUCT["ftr-backend"]="Tarifficator"
-PKG_LEGACY["ftr-backend"]=""
-PKG_PORTS["ftr-backend"]=""
-PKG_API["ftr-backend"]=""
-PKG_DEPS["ftr-backend"]=""
-
-PKG_PRODUCT["ftr-server-db"]="Tarifficator"
-PKG_LEGACY["ftr-server-db"]=""
-PKG_PORTS["ftr-server-db"]=""
-PKG_API["ftr-server-db"]=""
-PKG_DEPS["ftr-server-db"]="mariadb"
-
-PKG_PRODUCT["ftr-server-db-pg"]="Tarifficator"
-PKG_LEGACY["ftr-server-db-pg"]=""
-PKG_PORTS["ftr-server-db-pg"]=""
-PKG_API["ftr-server-db-pg"]=""
-PKG_DEPS["ftr-server-db-pg"]="postgresql"
-
-PKG_PRODUCT["ftr-web"]="Tarifficator"
-PKG_LEGACY["ftr-web"]=""
-PKG_PORTS["ftr-web"]=""
-PKG_API["ftr-web"]=""
-PKG_DEPS["ftr-web"]="nginx"
-
-# ========== Продукт: IVR ==========
-PKG_PRODUCT["ivr-frontend"]="IVR"
-PKG_LEGACY["ivr-frontend"]=""
-PKG_PORTS["ivr-frontend"]=""
-PKG_API["ivr-frontend"]=""
-PKG_DEPS["ivr-frontend"]="nginx"
-
-PKG_PRODUCT["ivr-backend"]="IVR"
-PKG_LEGACY["ivr-backend"]="flatIVRBuilder"
-PKG_PORTS["ivr-backend"]=""
-PKG_API["ivr-backend"]=""
-PKG_DEPS["ivr-backend"]=""
-
-# ========== Продукт: LC ==========
-PKG_PRODUCT["lc-frontend"]="LC"
-PKG_LEGACY["lc-frontend"]="lc-softswitch-frontend"
-PKG_PORTS["lc-frontend"]=""
-PKG_API["lc-frontend"]=""
-PKG_DEPS["lc-frontend"]="nginx"
-
-PKG_PRODUCT["lc-backend"]="LC"
-PKG_LEGACY["lc-backend"]="flatSoftSwitchLK"
-PKG_PORTS["lc-backend"]=""
-PKG_API["lc-backend"]=""
-PKG_DEPS["lc-backend"]=""
-
-# ========== Продукт: SMS ==========
-PKG_PRODUCT["flat-sms"]="SMS"
-PKG_LEGACY["flat-sms"]=""
-PKG_PORTS["flat-sms"]=""
-PKG_API["flat-sms"]=""
-PKG_DEPS["flat-sms"]=""
-
-PKG_PRODUCT["flat-smpp"]="SMS"
-PKG_LEGACY["flat-smpp"]=""
-PKG_PORTS["flat-smpp"]=""
-PKG_API["flat-smpp"]=""
-PKG_DEPS["flat-smpp"]=""
-
-# ========== Продукт: LDAP ==========
-PKG_PRODUCT["fbr-frontend"]="LDAP"
-PKG_LEGACY["fbr-frontend"]="fpbf-frontend"
-PKG_PORTS["fbr-frontend"]=""
-PKG_API["fbr-frontend"]=""
-PKG_DEPS["fbr-frontend"]="nginx"
-
-PKG_PRODUCT["fbr-backend"]="LDAP"
-PKG_LEGACY["fbr-backend"]="flatPartnerBroker,flat-broker"
-PKG_PORTS["fbr-backend"]=""
-PKG_API["fbr-backend"]=""
-PKG_DEPS["fbr-backend"]=""
-
-PKG_PRODUCT["flat-ldap"]="LDAP"
-PKG_LEGACY["flat-ldap"]="ldapSynchronizer"
-PKG_PORTS["flat-ldap"]=""
-PKG_API["flat-ldap"]=""
-PKG_DEPS["flat-ldap"]=""
-
-PKG_PRODUCT["flat-broker"]="LDAP"
-PKG_LEGACY["flat-broker"]=""
-PKG_PORTS["flat-broker"]=""
-PKG_API["flat-broker"]=""
-PKG_DEPS["flat-broker"]=""
-
-PKG_PRODUCT["flat-transfer-server"]="LDAP"
-PKG_LEGACY["flat-transfer-server"]=""
-PKG_PORTS["flat-transfer-server"]=""
-PKG_API["flat-transfer-server"]=""
-PKG_DEPS["flat-transfer-server"]=""
-
-# ========== Продукт: SBC ==========
-PKG_PRODUCT["sbc-backend"]="SBC"
-PKG_LEGACY["sbc-backend"]="flat.sbc.backend"
-PKG_PORTS["sbc-backend"]=""
-PKG_API["sbc-backend"]=""
-PKG_DEPS["sbc-backend"]=""
-
-PKG_PRODUCT["sbc-core"]="SBC"
-PKG_LEGACY["sbc-core"]="flat.sbc.core"
-PKG_PORTS["sbc-core"]=""
-PKG_API["sbc-core"]=""
-PKG_DEPS["sbc-core"]=""
-
-PKG_PRODUCT["sbc-frontend"]="SBC"
-PKG_LEGACY["sbc-frontend"]=""
-PKG_PORTS["sbc-frontend"]=""
-PKG_API["sbc-frontend"]=""
-PKG_DEPS["sbc-frontend"]="nginx"
-
-# ========== Продукт: Portal ==========
-PKG_PRODUCT["fpl-backend"]="Portal"
-PKG_LEGACY["fpl-backend"]=""
-PKG_PORTS["fpl-backend"]=""
-PKG_API["fpl-backend"]=""
-PKG_DEPS["fpl-backend"]=""
-
-PKG_PRODUCT["fpl-frontend"]="Portal"
-PKG_LEGACY["fpl-frontend"]=""
-PKG_PORTS["fpl-frontend"]=""
-PKG_API["fpl-frontend"]=""
-PKG_DEPS["fpl-frontend"]="nginx"
-
-PKG_PRODUCT["fpl2-frontend"]="Portal"
-PKG_LEGACY["fpl2-frontend"]=""
-PKG_PORTS["fpl2-frontend"]=""
-PKG_API["fpl2-frontend"]=""
-PKG_DEPS["fpl2-frontend"]="nginx"
-
-PKG_PRODUCT["fsft-frontend"]="Portal"
-PKG_LEGACY["fsft-frontend"]=""
-PKG_PORTS["fsft-frontend"]=""
-PKG_API["fsft-frontend"]=""
-PKG_DEPS["fsft-frontend"]="nginx"
-
-# ========== Продукт: flat-file ==========
-PKG_PRODUCT["flat-file"]="flat-file"
-PKG_LEGACY["flat-file"]="flatFileManager,fss-file"
-PKG_PORTS["flat-file"]="8083"
-PKG_API["flat-file"]="/api/health"
-PKG_DEPS["flat-file"]="nginx"
+# Порядок продуктов в human/JSON (Infrastructure — в конце)
+FLAT_PRODUCTS_ORDER=(
+    "AutoCallServer" "BSS" "Click to Call" "Contact Center" "Device Manager"
+    "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS"
+    "LDAP" "SBC" "Portal" "flat-file" "FVSC" "Infrastructure"
+)
+
+PKG_CATALOG_SOURCE="internal"
+PKG_CATALOG_PATH=""
+
+# NAME PRODUCT [LEGACY] [PORTS] [API] [DEPS] — пустой хвост можно опустить
+_pkg_set() {
+    local name="$1" product="$2"
+    local legacy="${3:-}" ports="${4:-}" api="${5:-}" deps="${6:-}"
+    [[ -n "$name" && -n "$product" ]] || return 1
+    PKG_PRODUCT["$name"]="$product"
+    PKG_LEGACY["$name"]="$legacy"
+    [[ -n "$ports" ]] && PKG_PORTS["$name"]="$ports"
+    [[ -n "$api" ]] && PKG_API["$name"]="$api"
+    [[ -n "$deps" ]] && PKG_DEPS["$name"]="$deps"
+    return 0
+}
+
+_pkg_catalog_builtin() {
+    # shellcheck disable=SC1091
+    source /dev/stdin <<'FLAT_PKG_CATALOG_EOF' || true
+# ========== AutoCallServer ==========
+_pkg_set "acs-frontend" "AutoCallServer" "" "" "" "nginx"
+_pkg_set "acs-media" "AutoCallServer" "acs-media" "5060,10000-20000"
+_pkg_set "acs-tools" "AutoCallServer" "acs-tools"
+_pkg_set "acs-server" "AutoCallServer" "acs-web" "8080"
+# ========== BSS ==========
+_pkg_set "fcs-bssimp" "BSS" "bssimp"
+_pkg_set "fcs-bssexp" "BSS" "bssexpa"
+# ========== Click to Call ==========
+_pkg_set "c2c-backend" "Click to Call" "" "8080" "/api/health"
+_pkg_set "c2c-frontend" "Click to Call" "" "" "" "nginx"
+# ========== Contact Center ==========
+_pkg_set "fcs-span" "Contact Center"
+_pkg_set "fcs-chat" "Contact Center" "fcs-chat-server"
+_pkg_set "fcs-contact" "Contact Center" "fcs-flexconnect"
+_pkg_set "fcs-contact-db" "Contact Center" "" "" "" "mariadb"
+_pkg_set "fcs-contact-db-pg" "Contact Center" "" "" "" "postgresql"
+_pkg_set "fcs-recognize" "Contact Center" "flat-contact-recognize"
+_pkg_set "fcs-replication" "Contact Center" "fcs-record-replication,flat-record-replication"
+_pkg_set "fcs-recordtask" "Contact Center" "fcs-recproc,flat-record-taskservice"
+_pkg_set "fcs-screen" "Contact Center" "fcs-screen-record,flat-screen-recording"
+_pkg_set "fcs-swau" "Contact Center" "fcs-swau"
+_pkg_set "fcs-swau-db" "Contact Center" "" "" "" "mariadb"
+_pkg_set "fcs-swau-db-pg" "Contact Center" "" "" "" "postgresql"
+_pkg_set "fcs-swiam" "Contact Center" "fcs-swfo,fcs-alarm,flat-contact-alarm"
+_pkg_set "fcs-swiam-db" "Contact Center" "" "" "" "mariadb"
+_pkg_set "fcs-swiam-db-pg" "Contact Center" "" "" "" "postgresql"
+_pkg_set "fcs-swicl" "Contact Center"
+_pkg_set "fcs-swiib" "Contact Center"
+_pkg_set "fcs-swikc" "Contact Center" "flat-contact-center"
+_pkg_set "fcs-swikc-db" "Contact Center" "" "" "" "mariadb"
+_pkg_set "fcs-swikc-db-pg" "Contact Center" "" "" "" "postgresql"
+_pkg_set "fcs-swiop" "Contact Center" "flat-contact-operator-interface"
+_pkg_set "fcs-swir" "Contact Center" "flat-contact-recording"
+_pkg_set "fcs-swir-db" "Contact Center" "" "" "" "mariadb"
+_pkg_set "fcs-swir-db-pg" "Contact Center" "" "" "" "postgresql"
+_pkg_set "fcs-swui" "Contact Center" "flat-constact-system-of-analytics"
+_pkg_set "fcs-swui-db" "Contact Center" "data-base-system-analytics" "" "" "mariadb"
+_pkg_set "fcs-unigy" "Contact Center" "fcs-unigy-connector"
+_pkg_set "frec-frontend" "Contact Center" "" "" "" "nginx"
+_pkg_set "frec-backend" "Contact Center" "flat-recording-backend"
+_pkg_set "fcs-record-export" "Contact Center" "flat-record-export-service"
+_pkg_set "fcs-recognition" "Contact Center" "asr"
+_pkg_set "asr-backend" "Contact Center"
+_pkg_set "asr-analytics" "Contact Center"
+# ========== Device Manager ==========
+_pkg_set "fdm-server" "Device Manager" "fdm-server"
+_pkg_set "fcc-frontend" "Device Manager" "" "" "" "nginx"
+_pkg_set "fcc-backend" "Device Manager"
+# ========== Gateway ==========
+_pkg_set "fg-frontend" "Gateway" "" "" "" "nginx"
+_pkg_set "fg-backend" "Gateway"
+# ========== Partner Server ==========
+_pkg_set "fps-backend" "Partner Server" "flatPartnerAuth"
+_pkg_set "fps-profile" "Partner Server" "flatImageProcessor"
+_pkg_set "fps-frontend" "Partner Server" "flatPartnerFrontend" "" "" "nginx"
+_pkg_set "fps-license" "Partner Server" "flatPartnerLicense"
+_pkg_set "fps-admin" "Partner Server" "flatPartnerLicenseAdmin"
+_pkg_set "fps-agent" "Partner Server" "flatPartnerLicenseAgent"
+_pkg_set "fps-server" "Partner Server" "flatPartnerServer"
+_pkg_set "fps-push" "Partner Server" "flatPushNotificationServer"
+_pkg_set "fps-control" "Partner Server" "flatPartnerFLC"
+_pkg_set "fps-phonebook" "Partner Server"
+# ========== SoftSwitch ==========
+_pkg_set "fss-frontend" "SoftSwitch" "softswitch-frontend" "" "" "nginx"
+_pkg_set "fss-backend" "SoftSwitch" "flatSoftSwitchBackend" "8082" "/api/health" "postgresql"
+_pkg_set "fss-mediasrv" "SoftSwitch" "mediasrv" "5060,10000-20000"
+_pkg_set "fss-srclient" "SoftSwitch" "srclient" "" "" "fss-server"
+_pkg_set "fss-server" "SoftSwitch" "" "8080,8081" "/api/v1/health" "nginx,postgresql"
+_pkg_set "fss-web" "SoftSwitch" "fss-web" "" "" "nginx"
+_pkg_set "fss-csta" "SoftSwitch" "csta-rest-broker"
+_pkg_set "fss-capagent" "SoftSwitch" "flat-capagent"
+# ========== Tarifficator ==========
+_pkg_set "ftr-frontend" "Tarifficator" "tarifficator-frontend" "" "" "nginx"
+_pkg_set "ftr-server" "Tarifficator"
+_pkg_set "ftr-backend" "Tarifficator"
+_pkg_set "ftr-server-db" "Tarifficator" "" "" "" "mariadb"
+_pkg_set "ftr-server-db-pg" "Tarifficator" "" "" "" "postgresql"
+_pkg_set "ftr-web" "Tarifficator" "" "" "" "nginx"
+# ========== IVR ==========
+_pkg_set "ivr-frontend" "IVR" "" "" "" "nginx"
+_pkg_set "ivr-backend" "IVR" "flatIVRBuilder"
+# ========== LC ==========
+_pkg_set "lc-frontend" "LC" "lc-softswitch-frontend" "" "" "nginx"
+_pkg_set "lc-backend" "LC" "flatSoftSwitchLK"
+# ========== SMS ==========
+_pkg_set "flat-sms" "SMS"
+_pkg_set "flat-smpp" "SMS"
+# ========== LDAP ==========
+_pkg_set "fbr-frontend" "LDAP" "fpbf-frontend" "" "" "nginx"
+_pkg_set "fbr-backend" "LDAP" "flatPartnerBroker,flat-broker"
+_pkg_set "flat-ldap" "LDAP" "ldapSynchronizer"
+_pkg_set "flat-broker" "LDAP"
+_pkg_set "flat-transfer-server" "LDAP"
+# ========== SBC ==========
+_pkg_set "sbc-backend" "SBC" "flat.sbc.backend"
+_pkg_set "sbc-core" "SBC" "flat.sbc.core"
+_pkg_set "sbc-frontend" "SBC" "" "" "" "nginx"
+# ========== Portal ==========
+_pkg_set "fpl-backend" "Portal"
+_pkg_set "fpl-frontend" "Portal" "" "" "" "nginx"
+_pkg_set "fpl2-frontend" "Portal" "" "" "" "nginx"
+_pkg_set "fsft-frontend" "Portal" "" "" "" "nginx"
+# ========== flat-file ==========
+_pkg_set "flat-file" "flat-file" "flatFileManager,fss-file" "8083" "/api/health" "nginx"
+# ========== Contact Center ==========
+_pkg_set "fc-frontend" "Contact Center" "" "" "" "nginx"
+_pkg_set "fc-backend" "Contact Center"
+# ========== Partner Server ==========
+_pkg_set "fpw-frontend" "Partner Server" "" "" "" "nginx"
+# ========== FVSC ==========
+_pkg_set "fvcs-backend" "FVSC"
+_pkg_set "fvcs-frontend" "FVSC" "" "" "" "nginx"
+_pkg_set "fvcs-live-asr" "FVSC"
+_pkg_set "fvcs-live-core" "FVSC"
+_pkg_set "fvcs-asr" "FVSC"
+_pkg_set "fvcs-record" "FVSC"
+# ========== Infrastructure ==========
+_pkg_set "nginx" "Infrastructure"
+_pkg_set "postgresql" "Infrastructure"
+_pkg_set "mariadb" "Infrastructure"
+FLAT_PKG_CATALOG_EOF
+}
+
+_load_pkg_catalog() {
+    local conf="${SCRIPT_DIR:-.}/flat_check.packages.conf"
+    unset PKG_PRODUCT PKG_LEGACY PKG_PORTS PKG_API PKG_DEPS 2>/dev/null || true
+    declare -gA PKG_PRODUCT PKG_LEGACY PKG_PORTS PKG_API PKG_DEPS
+    if [[ -f "$conf" && -r "$conf" ]]; then
+        # shellcheck disable=SC1090
+        source "$conf"
+        PKG_CATALOG_SOURCE="external"
+        PKG_CATALOG_PATH="$conf"
+    else
+        _pkg_catalog_builtin
+        PKG_CATALOG_SOURCE="internal"
+        PKG_CATALOG_PATH=""
+    fi
+}
+
+_load_pkg_catalog
 
 # --- 2. Хелперы вывода + логирование в файл --------------------------------------
 # (print_ok / print_warn / print_fail / print_info — используются при проверке состояния)
@@ -690,6 +307,18 @@ init_logging() {
         return 1
     fi
     _log_line "INFO" "=== ${SCRIPT_NAME}.sh v${SCRIPT_VERSION} — сессия начата ==="
+    if [[ "${PKG_CATALOG_SOURCE:-internal}" == "external" ]]; then
+        _log_line "INFO" "package catalog: external (${PKG_CATALOG_PATH})"
+        # не в stdout при --json/--push (агент ждёт чистый JSON)
+        if [[ "${OUTPUT_JSON:-0}" -ne 1 && "${DO_PUSH:-0}" -ne 1 ]]; then
+            info "package catalog: external (${PKG_CATALOG_PATH})"
+        fi
+    else
+        _log_line "INFO" "package catalog: internal (builtin)"
+        if [[ "${OUTPUT_JSON:-0}" -ne 1 && "${DO_PUSH:-0}" -ne 1 ]]; then
+            info "package catalog: internal (builtin)"
+        fi
+    fi
     return 0
 }
 
@@ -2120,6 +1749,10 @@ check_single_pkg() {
     fi
 
     ((INSTALLED++))
+    if _is_infrastructure_pkg "$pkg"; then
+        check_infrastructure_pkg "$pkg"
+        return 0
+    fi
     check_systemd_unit "$pkg"
     check_opt_directory "$pkg"
     check_log_directory "$pkg"
@@ -2252,6 +1885,90 @@ _infra_report_first_unit() {
     return 1
 }
 
+# Пакет из продукта Infrastructure (nginx/postgresql/…): не /opt/flat, а системный.
+_is_infrastructure_pkg() {
+    [[ "${PKG_PRODUCT[$1]:-}" == "Infrastructure" ]]
+}
+
+# Зависимость удовлетворена? (для дедупа авто-раздела Infrastructure)
+_infra_dep_satisfied() {
+    local dep="$1"
+    if [[ "$dep" == *.so.* ]]; then
+        is_lib_available "$dep" 2>/dev/null
+        return $?
+    fi
+    case "$dep" in
+        nginx)
+            command -v nginx &>/dev/null && return 0
+            is_dep_installed "$dep" 2>/dev/null && return 0
+            return 1
+            ;;
+        mariadb|mysql|mysql-server|mariadb-server)
+            command -v mysql &>/dev/null && return 0
+            is_dep_installed "mariadb" 2>/dev/null && return 0
+            is_dep_installed "mysql" 2>/dev/null && return 0
+            is_dep_installed "mariadb-server" 2>/dev/null && return 0
+            is_dep_installed "mysql-server" 2>/dev/null && return 0
+            return 1
+            ;;
+        postgresql|postgresql-*)
+            command -v psql &>/dev/null && return 0
+            is_dep_installed "$dep" 2>/dev/null && return 0
+            return 1
+            ;;
+        redis|redis-server)
+            is_dep_installed "redis" 2>/dev/null || is_dep_installed "redis-server" 2>/dev/null
+            return $?
+            ;;
+        *)
+            is_dep_installed "$dep" 2>/dev/null
+            return $?
+            ;;
+    esac
+}
+
+# Подробная проверка одного infra-пакета в секции продукта Infrastructure.
+check_infrastructure_pkg() {
+    local pkg="$1"
+    local ver="" active=""
+
+    if _infra_dep_satisfied "$pkg"; then
+        ver=$(get_dep_version "$pkg" 2>/dev/null || true)
+        case "$pkg" in
+            nginx)
+                if command -v nginx &>/dev/null; then
+                    print_ok "nginx: $(nginx -v 2>&1 | head -1)"
+                    if nginx -t &>/dev/null; then
+                        print_ok "nginx: config valid"
+                    else
+                        print_fail "nginx: config invalid"
+                    fi
+                else
+                    print_ok "nginx: installed${ver:+ ($ver)}"
+                fi
+                ;;
+            postgresql|mariadb)
+                print_ok "$pkg: ${ver:-installed}"
+                ;;
+            *)
+                print_ok "$pkg: ${ver:-installed}"
+                ;;
+        esac
+        if command -v systemctl &>/dev/null; then
+            active=$(systemctl is-active "$pkg" 2>/dev/null || systemctl is-active "${pkg}.service" 2>/dev/null || echo "")
+            if [[ "$active" == "active" ]]; then
+                print_ok "$pkg: service active"
+            elif [[ -n "$active" && "$active" != "unknown" ]]; then
+                print_info "$pkg: service $active"
+            fi
+        fi
+    else
+        print_fail "$pkg: not installed"
+    fi
+    check_ports "$pkg"
+    check_api_health "$pkg"
+}
+
 check_infrastructure() {
     echo ""
     echo "=== Infrastructure ==="
@@ -2266,17 +1983,25 @@ check_infrastructure() {
     done
 
     if [[ $has_any -eq 0 ]]; then
-        print_info "No dependencies registered by installed packages"
+        print_info "No unmet infrastructure dependencies"
         return
     fi
 
     IFS=$'\n' dep_list=($(sort <<<"${dep_list[*]}")); unset IFS
 
+    local shown=0
     for dep in "${dep_list[@]}"; do
         local req_by="${ALL_DEPENDS[$dep]:-}"
         local dep_ver=""
         local svc_status=""
         local dep_found=0
+
+        # Не дублируем продукт Infrastructure / удовлетворённые deps:
+        # подробности — в секции пакета; здесь только дыры + кто зависит.
+        if _infra_dep_satisfied "$dep"; then
+            continue
+        fi
+        shown=$((shown + 1))
 
         # Разделяемые библиотеки: проверяем наличие файла в lib-путях (RHEL/ReOS 7.3 использует /usr/lib64/)
         if [[ "$dep" == *.so.* ]]; then
@@ -2418,6 +2143,9 @@ check_infrastructure() {
                 ;;
         esac
     done
+    if [[ "$shown" -eq 0 ]]; then
+        print_info "No unmet infrastructure dependencies"
+    fi
 }
 
 # Проверить репозитории
@@ -2818,16 +2546,23 @@ _json_collect_pkg() {
         enabled=$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)
     fi
 
-    # directories
-    if [[ -d "$opt_path" ]]; then
-        opt_status="ok"
-        opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null || echo "")
-    fi
-    if [[ -d "$log_path" ]]; then
-        log_status="ok"
-        log_owner=$(stat -c '%U:%G' "$log_path" 2>/dev/null || echo "")
-    elif [[ "$status" == "installed" ]]; then
-        log_status="missing"
+    # directories (FLAT layout; Infrastructure — системные пакеты без /opt/flat)
+    if _is_infrastructure_pkg "$pkg"; then
+        opt_status="n/a"
+        log_status="n/a"
+        opt_path=""
+        log_path=""
+    else
+        if [[ -d "$opt_path" ]]; then
+            opt_status="ok"
+            opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null || echo "")
+        fi
+        if [[ -d "$log_path" ]]; then
+            log_status="ok"
+            log_owner=$(stat -c '%U:%G' "$log_path" 2>/dev/null || echo "")
+        elif [[ "$status" == "installed" ]]; then
+            log_status="missing"
+        fi
     fi
 
     deps_pm=$(get_pkg_depends "$pkg" 2>/dev/null || true)
@@ -3036,8 +2771,15 @@ _json_collect_system() {
 
 _json_collect_infra() {
     local out="[" first=1 dep status ver port req
-    for dep in ${!ALL_DEPENDS[@]+"${!ALL_DEPENDS[@]}"}; do
-        status="unknown"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
+    # важно: не ${!ALL_DEPENDS[@]+...} — при значениях с "-" bash считает это
+    # косвенным раскрытием имён переменных (fps-server -> «недопустимое имя»)
+    for dep in "${!ALL_DEPENDS[@]}"; do
+        # Схема JSON та же; не дублируем удовлетворённые deps, у которых есть PKG
+        # (подробности — в products[].Infrastructure). Дыры — всегда, с required_by.
+        if _infra_dep_satisfied "$dep"; then
+            continue
+        fi
+        status="missing"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
         if command -v systemctl >/dev/null 2>&1; then
             if systemctl is-active --quiet "$dep" 2>/dev/null; then
                 status="active"
@@ -3094,7 +2836,7 @@ build_health_json() {
     system_json=$(_json_collect_system)
     certs_json=$(cat "${_JSON_TMP}/certificates.json" 2>/dev/null || echo '[]')
 
-    products_list=("AutoCallServer" "BSS" "Click to Call" "Contact Center" "Device Manager" "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS" "LDAP" "SBC" "Portal" "flat-file")
+    products_list=("${FLAT_PRODUCTS_ORDER[@]}")
     if [[ -n "$FILTER_PRODUCT" ]]; then
         products_list=("$FILTER_PRODUCT")
     fi
@@ -3134,7 +2876,11 @@ build_health_json() {
         fi
         for pkg in ${product_pkgs[@]+"${product_pkgs[@]}"}; do
             local pj
+            # $() - subshell: INSTALLED++ внутри _json_collect_pkg не доходит сюда
             pj=$(_json_collect_pkg "$pkg") || continue
+            if [[ "$pj" == *"\"status\":\"installed\""* ]] || [[ "$pj" == *'"status":"installed"'* ]]; then
+                INSTALLED=$((INSTALLED + 1))
+            fi
             # регистрация deps для infra
             local d
             for d in $(echo "${PKG_DEPS[$pkg]:-}" | tr ',' ' '); do
@@ -3283,7 +3029,41 @@ _run_selftest_simple() {
     fi
     local pkg_count=0
     pkg_count=${#PKG_PRODUCT[@]}
-    [[ "$pkg_count" -gt 0 ]] && _selftest_ok "PKG_PRODUCT entries=$pkg_count" || _selftest_bad "PKG_PRODUCT empty"
+    [[ "$pkg_count" -ge 100 ]] && _selftest_ok "PKG_PRODUCT entries=$pkg_count" || _selftest_bad "PKG_PRODUCT entries=$pkg_count (want ≥100)"
+
+    if [[ "${PKG_PRODUCT[nginx]:-}" == "Infrastructure" && "${PKG_PRODUCT[fvcs-backend]:-}" == "FVSC" ]]; then
+        _selftest_ok "catalog has Infrastructure+FVSC"
+    else
+        _selftest_bad "catalog has Infrastructure+FVSC"
+    fi
+
+    # JSON: hyphen in ALL_DEPENDS key + unmet-only infra + INSTALLED вне subshell
+    unset ALL_DEPENDS; declare -A ALL_DEPENDS
+    ALL_DEPENDS["fps-server"]="fss-frontend"
+    ALL_DEPENDS["nginx"]="fss-server"
+    local infra_json
+    infra_json=$(_json_collect_infra 2>/dev/null || echo FAIL)
+    if [[ "$infra_json" == '['*']' && "$infra_json" != *FAIL* ]]; then
+        _selftest_ok "_json_collect_infra tolerates hyphen keys"
+    else
+        _selftest_bad "_json_collect_infra tolerates hyphen keys (got: $infra_json)"
+    fi
+    # nginx обычно удовлетворён на CI → не должен попасть в unmet-only массив как дубль продукта
+    if declare -F _infra_dep_satisfied >/dev/null && _infra_dep_satisfied nginx; then
+        if [[ "$infra_json" != *'"service_name":"nginx"'* ]]; then
+            _selftest_ok "_json_collect_infra omits satisfied PKG deps"
+        else
+            _selftest_bad "_json_collect_infra omits satisfied PKG deps"
+        fi
+    else
+        _selftest_ok "_json_collect_infra omits satisfied PKG deps (skip: nginx unmet here)"
+    fi
+
+    if [[ "${PKG_CATALOG_SOURCE:-}" == "external" || "${PKG_CATALOG_SOURCE:-}" == "internal" ]]; then
+        _selftest_ok "PKG_CATALOG_SOURCE=${PKG_CATALOG_SOURCE}"
+    else
+        _selftest_bad "PKG_CATALOG_SOURCE set"
+    fi
 }
 
 _run_selftest_extended() {
@@ -3293,7 +3073,7 @@ _run_selftest_extended() {
     detect_os
     check_system
     local products p
-    products=("AutoCallServer" "BSS" "Click to Call" "Contact Center" "Device Manager" "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS" "LDAP" "SBC" "Portal" "flat-file")
+    products=("${FLAT_PRODUCTS_ORDER[@]}")
     for p in "${products[@]}"; do
         run_product_checks "$p"
     done
@@ -3437,7 +3217,7 @@ main() {
 
     detect_os
     check_system
-    local products=("AutoCallServer" "BSS" "Click to Call" "Contact Center" "Device Manager" "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS" "LDAP" "SBC" "Portal" "flat-file")
+    local products=("${FLAT_PRODUCTS_ORDER[@]}")
     local p
     if [[ -n "$FILTER_PRODUCT" ]]; then
         products=("$FILTER_PRODUCT")

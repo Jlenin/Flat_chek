@@ -4,8 +4,9 @@
 
 | Скрипт | Назначение | Версия |
 |--------|------------|--------|
-| `flat_check.sh` | health check | 3.7.1 |
-| `flat_check_2.sh` | тот же health check + сбор логов | 3.10.5 |
+| `flat_check.sh` | health check | 3.8.0 |
+| `flat_check_2.sh` | тот же health check + сбор логов | 3.11.0 |
+| `flat_check.packages.conf` | каталог пакетов (рядом со скриптом) | — |
 
 Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
 Для полного сбора логов в `_2` обычно нужен root или sudo.
@@ -42,8 +43,28 @@ chmod +x flat_check.sh flat_check_2.sh
 ./flat_check_2.sh -h
 
 ./flat_check.sh
-./flat_check.sh -v    # flat_check 3.7.1
+./flat_check.sh -v    # flat_check 3.8.0
 ```
+
+---
+
+## Каталог пакетов
+
+`flat_check.packages.conf` лежит **рядом** со скриптом. При старте:
+
+- файл есть → `package catalog: external (/path/…/flat_check.packages.conf)`
+- файла нет → встроенный fallback, скрипт не падает: `package catalog: internal (builtin)`
+
+Формат строк:
+
+```bash
+_pkg_set "my-pkg" "Product Name" "legacy-name" "8080" "/api/health" "nginx,postgresql"
+# PORTS / API / DEPS можно опустить, если пустые
+_pkg_set "other-pkg" "Product Name" "old-name"
+```
+
+Продукт **Infrastructure** (в конце списка): `nginx`, `postgresql`, `mariadb` — полная проверка как у пакетов.  
+Авто-раздел `=== Infrastructure ===` показывает только **неудовлетворённые** зависимости и кто от них зависит (без дубля с продуктом).
 
 ---
 
@@ -199,15 +220,13 @@ Health: `systemctl`, `dpkg`/`rpm`, `ss`/`netstat`, `curl`, `openssl`, при н�
 
 ## Добавить пакет
 
-Правки вносятся в **оба** скрипта одинаково:
+Предпочтительно в `flat_check.packages.conf` (и в builtin-fallback обоих скриптов, если меняете каталог):
 
 ```bash
-PKG_PRODUCT["my-pkg"]="Product Name"
-PKG_LEGACY["my-pkg"]="old-name"          # или ""
-PKG_PORTS["my-pkg"]="8080"
-PKG_API["my-pkg"]="/api/health"
-PKG_DEPS["my-pkg"]="nginx,postgresql"
+_pkg_set "my-pkg" "Product Name" "old-name" "8080" "/api/health" "nginx,postgresql"
 ```
+
+Infra-пакет (nginx и т.п.): `_pkg_set "nginx" "Infrastructure"`.
 
 ---
 
@@ -215,7 +234,7 @@ PKG_DEPS["my-pkg"]="nginx,postgresql"
 
 | Блок | `flat_check.sh` | `flat_check_2.sh` |
 |------|-----------------|-------------------|
-| 0–5 | флаги, `PKG_*`, System, пакеты, infra | то же |
+| 0–5 | флаги, каталог/`PKG_*`, System, пакеты, infra | то же |
 | 6–10 | — | поиск и сбор логов |
 | 9 | resource-gate опроса пакетов | то же + воркеры сбора |
 | 11 | help / argv / main / selftest | мастер + log CLI + main |

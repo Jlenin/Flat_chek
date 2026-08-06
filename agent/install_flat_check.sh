@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SRC_CHECK="${SRC_CHECK:-$REPO_ROOT/flat_check.sh}"
+SRC_PKG_CATALOG="${SRC_PKG_CATALOG:-$REPO_ROOT/flat_check.packages.conf}"
 SRC_CONF="${SRC_CONF:-$SCRIPT_DIR/flat_check.conf.example}"
 
 INSTALL_BIN="${INSTALL_BIN:-/usr/local/bin/flat_check}"
@@ -193,6 +194,19 @@ if [[ $DRY_RUN -eq 1 ]]; then
     info "DRY: install -m 0755 $SRC_CHECK $INSTALL_BIN"
 else
     install -m 0755 "$SRC_CHECK" "$INSTALL_BIN"
+fi
+
+# Каталог пакетов рядом с бинарём (SCRIPT_DIR у flat_check = dirname INSTALL_BIN)
+pkg_dest="$(dirname -- "$INSTALL_BIN")/flat_check.packages.conf"
+if [[ -f "$SRC_PKG_CATALOG" ]]; then
+    info "2a) package catalog → $pkg_dest"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        info "DRY: install -m 0644 $SRC_PKG_CATALOG $pkg_dest"
+    else
+        install -m 0644 "$SRC_PKG_CATALOG" "$pkg_dest"
+    fi
+else
+    warn "нет $SRC_PKG_CATALOG — агент будет на встроенном каталоге (internal)"
 fi
 
 if [[ $WITH_LOGS -eq 1 ]]; then
