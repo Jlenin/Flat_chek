@@ -50,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.10.2"
+SCRIPT_VERSION="3.10.3"
 
 set -uo pipefail
 
@@ -3309,6 +3309,26 @@ _apply_mgcpclient_from_log_types() {
     _resolve_mgcpclient_option 1
 }
 
+# Кандидаты логов в каталоге (NUL): покрывает разные схемы logrotate на ОС.
+#   name.txt / name.log
+#   name.txt.1 / name.log.2.gz          (точка + номер/хвост)
+#   name.txt.-20260731[.gz]            (точка + «-дата»)
+#   name.txt-20260802[.gz]             (РЕД ОС и др.: дефис сразу после .txt/.log)
+#   name.txt_20260802 / name.log-…     (underscore-вариант)
+# Без *.txt-*/*.log-* файлы вида sipdump.txt-20260802.gz find не видел вообще
+# (оставался только live sipdump.txt → skip по диапазону).
+_find_app_log_paths() {
+    local src_dir="$1"
+    [[ -d "$src_dir" ]] || return 0
+    find -L "$src_dir" -maxdepth 2 -type f \( \
+        -name '*.log' -o -name '*.txt' -o -name '*.csv' \
+        -o -name '*.log.*' -o -name '*.txt.*' -o -name '*.csv.*' \
+        -o -name '*.log.gz' -o -name '*.txt.gz' -o -name '*.csv.gz' \
+        -o -name '*.log-*' -o -name '*.txt-*' -o -name '*.csv-*' \
+        -o -name '*.log_*' -o -name '*.txt_*' -o -name '*.csv_*' \
+    \) -print0 2>/dev/null
+}
+
 # find_log_files_in_dir учитывает INCLUDE_MGCPCLIENT: если не 1, пропускает файлы mgcpclient*
 # и LOG_TYPE_FILTER / SELECTED_LOG_TYPES (стемы на пакет).
 # Online: также пропускаем *.gz (tail -F не может следить за содержимым gzip)
@@ -3327,10 +3347,7 @@ find_log_files_in_dir() {
             continue
         fi
         printf '%s\0' "$f"
-    done < <(find -L "$src_dir" -maxdepth 2 -type f \( \
-        -name '*.log' -o -name '*.txt' -o -name '*.log.*' -o -name '*.txt.*' \
-        -o -name '*.log.gz' -o -name '*.txt.gz' \
-    \) -print0 2>/dev/null)
+    done < <(_find_app_log_paths "$src_dir")
 }
 
 # Истина, если в директории есть хоть один собираемый похожий-на-лог файл (включая .gz) — для поиска
@@ -3346,10 +3363,7 @@ _dir_has_any_log_files() {
             continue
         fi
         return 0
-    done < <(find -L "$d" -maxdepth 2 -type f \( \
-        -name '*.log' -o -name '*.txt' -o -name '*.log.*' -o -name '*.txt.*' \
-        -o -name '*.log.gz' -o -name '*.txt.gz' \
-    \) -print0 2>/dev/null)
+    done < <(_find_app_log_paths "$d")
     return 1
 }
 
@@ -5810,19 +5824,20 @@ _run_selftest_simple() {
        && "$(_log_type_stem 'error.log')" == "error" \
        && "$(_log_type_stem 'tarificationlog.txt.7.gz')" == "tarificationlog" \
        && "$(_log_type_stem 'sipdump.txt.-20260731')" == "sipdump" \
-       && "$(_log_type_stem 'sipdump.txt.-20260731.gz')" == "sipdump" \
-       && "$(_log_type_stem 'sipdump.txt.-2026-07-31')" == "sipdump" \
-       && "$(_psl_log_group_key 'sipdump.txt.-20260731')" == "sipdump.txt" ]]; then
+       && "$(_log_type_stem 'sipdump.txt-20260802.gz')" == "sipdump" \
+       && "$(_log_type_stem 'sipdump.txt-20260623')" == "sipdump" \
+       && "$(_psl_log_group_key 'sipdump.txt-20260802.gz')" == "sipdump.txt" ]]; then
         _selftest_ok "_log_type_stem collapses rotations/archives and mgcpclient shards"
     else
-        _selftest_bad "_log_type_stem collapses rotations/archives and mgcpclient shards (got: sipdump='$(_log_type_stem 'sipdump.txt.2.gz')' dated='$(_log_type_stem 'sipdump.txt.-20260731')' group='$(_psl_log_group_key 'sipdump.txt.-20260731')')"
+        _selftest_bad "_log_type_stem collapses rotations/archives and mgcpclient shards (got: dash='$(_log_type_stem 'sipdump.txt-20260802.gz')' group='$(_psl_log_group_key 'sipdump.txt-20260802.gz')')"
     fi
 
-    # Фильтр типов: оставляем только выбранные стемы службы; ротации того же стема тоже
-    # (в т.ч. logrotate date: sipdump.txt.-YYYYMMDD на РЕД ОС и др.).
+    # Фильтр типов + find: ротации того же стема, в т.ч. РЕД ОС sipdump.txt-YYYYMMDD.gz
+    # (дефис сразу после .txt, без лишней точки).
     local ttdir saved_filter="${LOG_TYPE_FILTER:-0}"
     ttdir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
-    touch "$ttdir/sipdump.txt" "$ttdir/sipdump.txt.2.gz" "$ttdir/sipdump.txt.-20260731" \
+    touch "$ttdir/sipdump.txt" "$ttdir/sipdump.txt.2.gz" \
+        "$ttdir/sipdump.txt-20260802.gz" "$ttdir/sipdump.txt-20260623" \
         "$ttdir/error.log" "$ttdir/abonentsclass.txt"
     LOG_TYPE_FILTER=1
     LOG_DIR_OWNER["$ttdir"]="fss-server"
@@ -5835,20 +5850,24 @@ _run_selftest_simple() {
             tt_drop=$((tt_drop + 1))
         fi
     done
-    if [[ "$tt_keep" -eq 4 && "$tt_drop" -eq 1 ]]; then
+    if [[ "$tt_keep" -eq 5 && "$tt_drop" -eq 1 ]]; then
         _selftest_ok "_log_file_matches_type_filter keeps selected stems (+rotations)"
     else
         _selftest_bad "_log_file_matches_type_filter keeps selected stems (+rotations) (keep=$tt_keep drop=$tt_drop)"
     fi
-    # find + type-filter: dated logrotate (РЕД ОС: sipdump.txt.-YYYYMMDD) не теряется
-    local found_dated=0
+    local found_dash=0 found_plain_rot=0 saved_sub="${LOG_SUBMODE:-online}"
+    LOG_SUBMODE="offline"
     while IFS= read -r -d '' f; do
-        [[ "$(basename -- "$f")" == "sipdump.txt.-20260731" ]] && found_dated=1
+        case "$(basename -- "$f")" in
+            sipdump.txt-20260802.gz) found_dash=1 ;;
+            sipdump.txt-20260623) found_plain_rot=1 ;;
+        esac
     done < <(find_log_files_in_dir "$ttdir")
-    if [[ "$found_dated" -eq 1 ]]; then
-        _selftest_ok "find_log_files_in_dir finds sipdump.txt.-YYYYMMDD rotation"
+    LOG_SUBMODE="$saved_sub"
+    if [[ "$found_dash" -eq 1 && "$found_plain_rot" -eq 1 ]]; then
+        _selftest_ok "find_log_files_in_dir finds sipdump.txt-YYYYMMDD(.gz) (RedOS-style)"
     else
-        _selftest_bad "find_log_files_in_dir finds sipdump.txt.-YYYYMMDD rotation"
+        _selftest_bad "find_log_files_in_dir finds sipdump.txt-YYYYMMDD(.gz) (RedOS-style) (dash=$found_dash plain=$found_plain_rot)"
     fi
     LOG_TYPE_FILTER="$saved_filter"
     unset "LOG_DIR_OWNER[$ttdir]" "SELECTED_LOG_TYPES[fss-server]"
