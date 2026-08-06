@@ -155,7 +155,8 @@ Cron по умолчанию вызывает `--push` без `--json`, чтоб
 
 При установке `install_flat_check.sh` копирует `flat_check.packages.conf` рядом с бинарём
 (`dirname(INSTALL_BIN)/flat_check.packages.conf`). Если файла нет — скрипт использует
-встроенный каталог. Схема JSON v2 не менялась: `products`, `infrastructure`, `summary`, …
+встроенный каталог. Human-раздел зависимостей называется `=== Depends ===`; в JSON ключ
+по-прежнему `infrastructure` (схема v2 не менялась).
 
 ---
 
