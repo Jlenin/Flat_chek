@@ -5,7 +5,7 @@
 | Скрипт | Назначение | Версия |
 |--------|------------|--------|
 | `flat_check.sh` | health check | 3.7.1 |
-| `flat_check_2.sh` | тот же health check + сбор логов | 3.10.4 |
+| `flat_check_2.sh` | тот же health check + сбор логов | 3.10.5 |
 
 Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
 Для полного сбора логов в `_2` обычно нужен root или sudo.
@@ -150,7 +150,7 @@ chmod +x flat_check.sh flat_check_2.sh
 | ≥ 1MB, sorted | bisect + параллельный scan окна (early-stop) |
 | ≥ 1MB, soft-sorted | bisect с широким backoff, scan окна без early-stop |
 | ≥ 1MB, unsorted | параллельный scan всего файла |
-| `.gz` / архивы | coarse day → hour/day `zgrep -m1` → один stream-extract (early-stop); `.N.gz` пропускается, если live plain покрывает короткое окно |
+| `.gz` / архивы | coarse day → hour/day `zgrep -m1` (`^` якорь) → stream-extract; soft-стемы (`sipdump`…) без early-stop; `.N.gz` пропускается, если live plain покрывает короткое окно |
 
 В начале `flat_check_2.sh` блок **TUNABLES** (лимиты CPU/MEM хоста, seek/backoff, zgrep, early-stop) — можно править перед запуском. Host-wide CPU/MEM **80%** оставлен намеренно (Zabbix): скрипт берёт доступное до потолка (offline — пул по **файлам**; check — пакеты параллельно; online — tails + тот же gate на пост-работу). Offline прогресс: одна sticky-строка `extract: N% (i/total) file`.
 
