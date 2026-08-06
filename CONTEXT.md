@@ -4,7 +4,7 @@
 Обновлять при смене версии, JSON-контракта, установщика или паритета скриптов.
 
 **Обновлено:** 2026-08-06  
-**Версия:** `flat_check.sh` 3.7.1 / `flat_check_2.sh` 3.10.4
+**Версия:** `flat_check.sh` 3.8.0 / `flat_check_2.sh` 3.11.0
 
 ---
 
@@ -14,6 +14,7 @@
 |------|------|
 | `flat_check.sh` | health (+ JSON/push CLI) |
 | `flat_check_2.sh` | тот же health/JSON **1к1** + сбор логов |
+| `flat_check.packages.conf` | каталог пакетов рядом со скриптом (optional; иначе builtin) |
 | `agent/` | установка push-агента на ноду (conf, cron, install, док) |
 | `README.md` | пользовательская дока по check / check_2 |
 | `agent/README.md` | дока по агенту и установщику |
@@ -37,6 +38,7 @@
 10. **3.10.2 (`_2`):** logrotate `name.txt.<anything>` схлопывается в тот же stem/group, что и live.
 11. **3.10.3 (`_2`):** find видит РЕД ОС-стиль `name.txt-YYYYMMDD[.gz]` (`*.txt-*` / `*.log-*`), не только `name.txt.*`.
 12. **3.10.4 (`_2`):** широкая матрица `_logrotate_name_matrix` (40+ имён) в selftest — stem/group/find/type-filter.
+13. **3.8.0 / 3.11.0:** каталог `flat_check.packages.conf`; продукт Infrastructure; авто-infra только unmet deps; FVSC/fc-*/fpw-frontend; фикс JSON `ALL_DEPENDS` hyphen + `summary.installed` subshell.
 
 ---
 
@@ -44,7 +46,7 @@
 
 Совпадают в обоих `.sh`:
 
-- `PKG_*`, System/packages/infra, resource-gate
+- каталог/`PKG_*` (через `_pkg_set` + conf), System/packages/infra, resource-gate
 - блок JSON/push = `agent/json_report.inc.sh`
 
 Только в `_2`: `-log`, wizard `-i`, seek/chunk, tcpdump и т.п.  
