@@ -377,9 +377,6 @@ _json_collect_infra() {
     local out="[" first=1 dep status ver port req
     # важно: не ${!ALL_DEPENDS[@]+...} — hyphen keys (fps-server)
     for dep in "${!ALL_DEPENDS[@]}"; do
-        if declare -F _infra_dep_satisfied >/dev/null 2>&1 && _infra_dep_satisfied "$dep"; then
-            continue
-        fi
         status="unknown"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
         if command -v systemctl >/dev/null 2>&1; then
             if systemctl is-active --quiet "$dep" 2>/dev/null; then
