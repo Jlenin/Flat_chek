@@ -4,7 +4,7 @@
 Обновлять при смене версии, JSON-контракта, установщика или паритета скриптов.
 
 **Обновлено:** 2026-08-06  
-**Версия:** `flat_check.sh` 3.7.1 / `flat_check_2.sh` 3.10.2
+**Версия:** `flat_check.sh` 3.7.1 / `flat_check_2.sh` 3.10.4
 
 ---
 
@@ -34,7 +34,9 @@
 7. **3.9.0 (`_2`):** `-t` контекст (last-N vs to после `-f`); `from<=to`; отсев архивов (day±1 + zgrep/12-probe); stream-extract `.gz` без temp; `n` в pick = отмена сбора.
 8. **3.10.0 (`_2`):** ускорение offline — hour-zgrep для коротких окон, skip `.N.gz` если live plain покрывает диапазон, без 12-point после zgrep-miss, stream early-stop, soft-sorted seek для plain; TUNABLES-блок в начале; прогресс `%` в консоли. Host CPU/MEM 80% не трогаем (Zabbix).
 9. **3.10.1 (`_2`):** offline пул по **файлам** (не по каталогам) под host-gate; inner chunk≤1 при нескольких file-workers; sticky progress `\r`+`CSI K`; check уже на том же пуле.
-10. **3.10.2 (`_2`):** logrotate `name.txt.<anything>` (в т.ч. `sipdump.txt.-YYYYMMDD` на РЕД ОС) схлопывается в тот же stem/group, что и live `sipdump.txt`.
+10. **3.10.2 (`_2`):** logrotate `name.txt.<anything>` схлопывается в тот же stem/group, что и live.
+11. **3.10.3 (`_2`):** find видит РЕД ОС-стиль `name.txt-YYYYMMDD[.gz]` (`*.txt-*` / `*.log-*`), не только `name.txt.*`.
+12. **3.10.4 (`_2`):** широкая матрица `_logrotate_name_matrix` (40+ имён) в selftest — stem/group/find/type-filter.
 
 ---
 

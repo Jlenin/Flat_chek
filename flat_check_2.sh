@@ -50,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.10.2"
+SCRIPT_VERSION="3.10.4"
 
 set -uo pipefail
 
@@ -3309,6 +3309,71 @@ _apply_mgcpclient_from_log_types() {
     _resolve_mgcpclient_option 1
 }
 
+# Кандидаты логов в каталоге (NUL): широкий набор схем logrotate (Debian/РЕД ОС/…).
+# Маска на диске ≈ name.(log|txt|csv)[.-_]* плюс архив .gz/.bz2/.xz.
+# Полная матрица имён → stem/group: _logrotate_name_matrix() + selftest.
+# Без *.txt-*/*.log-* РЕД ОС sipdump.txt-20260802.gz find не видел (оставался live).
+_find_app_log_paths() {
+    local src_dir="$1"
+    [[ -d "$src_dir" ]] || return 0
+    find -L "$src_dir" -maxdepth 2 -type f \( \
+        -name '*.log' -o -name '*.txt' -o -name '*.csv' \
+        -o -name '*.log.*' -o -name '*.txt.*' -o -name '*.csv.*' \
+        -o -name '*.log.gz' -o -name '*.txt.gz' -o -name '*.csv.gz' \
+        -o -name '*.log.bz2' -o -name '*.txt.bz2' -o -name '*.csv.bz2' \
+        -o -name '*.log.xz' -o -name '*.txt.xz' -o -name '*.csv.xz' \
+        -o -name '*.log-*' -o -name '*.txt-*' -o -name '*.csv-*' \
+        -o -name '*.log_*' -o -name '*.txt_*' -o -name '*.csv_*' \
+    \) -print0 2>/dev/null
+}
+
+# Матрица ротаций: filename<TAB>expected_stem<TAB>expected_group
+# Держать широкой — чтобы смена logrotate на любой ОС/службе ловилась selftest'ом.
+_logrotate_name_matrix() {
+    cat <<'EOF'
+sipdump.txt	sipdump	sipdump.txt
+sipdump.txt.1	sipdump	sipdump.txt
+sipdump.txt.2.gz	sipdump	sipdump.txt
+sipdump.txt.1.bz2	sipdump	sipdump.txt
+sipdump.txt.1.xz	sipdump	sipdump.txt
+sipdump.txt.-20260731	sipdump	sipdump.txt
+sipdump.txt.-20260731.gz	sipdump	sipdump.txt
+sipdump.txt.-2026-07-31	sipdump	sipdump.txt
+sipdump.txt.-2026-07-31.gz	sipdump	sipdump.txt
+sipdump.txt-20260802	sipdump	sipdump.txt
+sipdump.txt-20260802.gz	sipdump	sipdump.txt
+sipdump.txt-20260623	sipdump	sipdump.txt
+sipdump.txt_20260802	sipdump	sipdump.txt
+sipdump.txt_20260802.gz	sipdump	sipdump.txt
+sipdump.txt.20260802	sipdump	sipdump.txt
+sipdump.txt.20260802.gz	sipdump	sipdump.txt
+sipdump.txt.2026-08-02	sipdump	sipdump.txt
+sipdump.txt.2026-08-02.gz	sipdump	sipdump.txt
+sipdump.txt.2026_08_02.gz	sipdump	sipdump.txt
+error.log	error	error.log
+error.log.3	error	error.log
+error.log.3.gz	error	error.log
+error.log-20260802.gz	error	error.log
+error.log_20260802	error	error.log
+sipsigthr_log.txt-20260804.gz	sipsigthr_log	sipsigthr_log.txt
+sippbx.txt.1.gz	sippbx	sippbx.txt
+tarificationlog.txt.7.gz	tarificationlog	tarificationlog.txt
+abonentsclass.txt.1.gz	abonentsclass	abonentsclass.txt
+mgcpclient_10.txt	mgcpclient	mgcpclient_10.txt
+mgcpclient_10.txt-20260803.gz	mgcpclient	mgcpclient_10.txt
+mgcpclient_3.txt	mgcpclient	mgcpclient_3.txt
+access.2026-07-22.log	access	access.log
+access.log.1	access	access.log
+access.log.2.gz	access	access.log
+2026_07_24_swau_log.log	swau_log	swau_log.log
+2026-07-25_swau_log.log	swau_log	swau_log.log
+app.csv	app	app.csv
+app.csv.1	app	app.csv
+app.csv-20260801.gz	app	app.csv
+app.csv_20260801	app	app.csv
+EOF
+}
+
 # find_log_files_in_dir учитывает INCLUDE_MGCPCLIENT: если не 1, пропускает файлы mgcpclient*
 # и LOG_TYPE_FILTER / SELECTED_LOG_TYPES (стемы на пакет).
 # Online: также пропускаем *.gz (tail -F не может следить за содержимым gzip)
@@ -3327,10 +3392,7 @@ find_log_files_in_dir() {
             continue
         fi
         printf '%s\0' "$f"
-    done < <(find -L "$src_dir" -maxdepth 2 -type f \( \
-        -name '*.log' -o -name '*.txt' -o -name '*.log.*' -o -name '*.txt.*' \
-        -o -name '*.log.gz' -o -name '*.txt.gz' \
-    \) -print0 2>/dev/null)
+    done < <(_find_app_log_paths "$src_dir")
 }
 
 # Истина, если в директории есть хоть один собираемый похожий-на-лог файл (включая .gz) — для поиска
@@ -3346,10 +3408,7 @@ _dir_has_any_log_files() {
             continue
         fi
         return 0
-    done < <(find -L "$d" -maxdepth 2 -type f \( \
-        -name '*.log' -o -name '*.txt' -o -name '*.log.*' -o -name '*.txt.*' \
-        -o -name '*.log.gz' -o -name '*.txt.gz' \
-    \) -print0 2>/dev/null)
+    done < <(_find_app_log_paths "$d")
     return 1
 }
 
@@ -5805,54 +5864,66 @@ _run_selftest_simple() {
         _selftest_bad "_psl_log_group_key merges YYYY_MM_DD-prefixed daily files"
     fi
 
-    if [[ "$(_log_type_stem 'sipdump.txt.2.gz')" == "sipdump" \
-       && "$(_log_type_stem 'mgcpclient_3.txt')" == "mgcpclient" \
-       && "$(_log_type_stem 'error.log')" == "error" \
-       && "$(_log_type_stem 'tarificationlog.txt.7.gz')" == "tarificationlog" \
-       && "$(_log_type_stem 'sipdump.txt.-20260731')" == "sipdump" \
-       && "$(_log_type_stem 'sipdump.txt.-20260731.gz')" == "sipdump" \
-       && "$(_log_type_stem 'sipdump.txt.-2026-07-31')" == "sipdump" \
-       && "$(_psl_log_group_key 'sipdump.txt.-20260731')" == "sipdump.txt" ]]; then
-        _selftest_ok "_log_type_stem collapses rotations/archives and mgcpclient shards"
-    else
-        _selftest_bad "_log_type_stem collapses rotations/archives and mgcpclient shards (got: sipdump='$(_log_type_stem 'sipdump.txt.2.gz')' dated='$(_log_type_stem 'sipdump.txt.-20260731')' group='$(_psl_log_group_key 'sipdump.txt.-20260731')')"
-    fi
-
-    # Фильтр типов: оставляем только выбранные стемы службы; ротации того же стема тоже
-    # (в т.ч. logrotate date: sipdump.txt.-YYYYMMDD на РЕД ОС и др.).
-    local ttdir saved_filter="${LOG_TYPE_FILTER:-0}"
-    ttdir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
-    touch "$ttdir/sipdump.txt" "$ttdir/sipdump.txt.2.gz" "$ttdir/sipdump.txt.-20260731" \
-        "$ttdir/error.log" "$ttdir/abonentsclass.txt"
-    LOG_TYPE_FILTER=1
-    LOG_DIR_OWNER["$ttdir"]="fss-server"
-    SELECTED_LOG_TYPES["fss-server"]="sipdump error"
-    local tt_keep=0 tt_drop=0 f
-    for f in "$ttdir"/*; do
-        if _log_file_matches_type_filter "$f" "$ttdir"; then
-            tt_keep=$((tt_keep + 1))
-        else
-            tt_drop=$((tt_drop + 1))
+    # Широкая матрица logrotate-имён (Debian/РЕД ОС/dated/numbered/csv/mgcp/…).
+    # Каждый ряд: find видит файл; stem/group схлопываются к live-типу.
+    local mx_dir mx_file mx_stem mx_group mx_got_stem mx_got_group
+    local mx_stem_fail=0 mx_find_miss=0 mx_rows=0 mx_filt_keep=0 mx_filt_drop=0
+    local saved_filter="${LOG_TYPE_FILTER:-0}" saved_sub="${LOG_SUBMODE:-online}"
+    mx_dir=$(mktemp -d "${TMPDIR:-/tmp}/flat_st.XXXXXX") || return 1
+    while IFS=$'\t' read -r mx_file mx_stem mx_group; do
+        [[ -z "$mx_file" || "$mx_file" == \#* ]] && continue
+        mx_rows=$((mx_rows + 1))
+        : > "$mx_dir/$mx_file" 2>/dev/null || touch "$mx_dir/$mx_file"
+        mx_got_stem=$(_log_type_stem "$mx_file")
+        mx_got_group=$(_psl_log_group_key "$mx_file")
+        if [[ "$mx_got_stem" != "$mx_stem" || "$mx_got_group" != "$mx_group" ]]; then
+            mx_stem_fail=$((mx_stem_fail + 1))
+            log_debug "matrix stem/group fail: $mx_file got ${mx_got_stem}|${mx_got_group} want ${mx_stem}|${mx_group}"
         fi
-    done
-    if [[ "$tt_keep" -eq 4 && "$tt_drop" -eq 1 ]]; then
-        _selftest_ok "_log_file_matches_type_filter keeps selected stems (+rotations)"
+    done < <(_logrotate_name_matrix)
+    if [[ "$mx_stem_fail" -eq 0 && "$mx_rows" -ge 30 ]]; then
+        _selftest_ok "_logrotate_name_matrix stem/group ($mx_rows names)"
     else
-        _selftest_bad "_log_file_matches_type_filter keeps selected stems (+rotations) (keep=$tt_keep drop=$tt_drop)"
+        _selftest_bad "_logrotate_name_matrix stem/group (fail=$mx_stem_fail rows=$mx_rows)"
     fi
-    # find + type-filter: dated logrotate (РЕД ОС: sipdump.txt.-YYYYMMDD) не теряется
-    local found_dated=0
-    while IFS= read -r -d '' f; do
-        [[ "$(basename -- "$f")" == "sipdump.txt.-20260731" ]] && found_dated=1
-    done < <(find_log_files_in_dir "$ttdir")
-    if [[ "$found_dated" -eq 1 ]]; then
-        _selftest_ok "find_log_files_in_dir finds sipdump.txt.-YYYYMMDD rotation"
+    while IFS=$'\t' read -r mx_file _ _; do
+        [[ -z "$mx_file" || "$mx_file" == \#* ]] && continue
+        if ! _find_app_log_paths "$mx_dir" | tr '\0' '\n' | grep -Fxq "$mx_dir/$mx_file"; then
+            mx_find_miss=$((mx_find_miss + 1))
+            log_debug "matrix find miss: $mx_file"
+        fi
+    done < <(_logrotate_name_matrix)
+    if [[ "$mx_find_miss" -eq 0 ]]; then
+        _selftest_ok "_find_app_log_paths covers logrotate name matrix"
     else
-        _selftest_bad "find_log_files_in_dir finds sipdump.txt.-YYYYMMDD rotation"
+        _selftest_bad "_find_app_log_paths covers logrotate name matrix (miss=$mx_find_miss)"
+    fi
+    # type-filter по всей матрице: sipdump|error — keep; остальные стемы — drop
+    LOG_TYPE_FILTER=1
+    LOG_SUBMODE="offline"
+    LOG_DIR_OWNER["$mx_dir"]="fss-server"
+    SELECTED_LOG_TYPES["fss-server"]="sipdump error"
+    while IFS=$'\t' read -r mx_file _ _; do
+        [[ -z "$mx_file" || "$mx_file" == \#* ]] && continue
+        if _log_file_matches_type_filter "$mx_dir/$mx_file" "$mx_dir"; then
+            mx_filt_keep=$((mx_filt_keep + 1))
+        else
+            mx_filt_drop=$((mx_filt_drop + 1))
+        fi
+    done < <(_logrotate_name_matrix)
+    local mx_listed=0
+    while IFS= read -r -d '' mx_file; do
+        mx_listed=$((mx_listed + 1))
+    done < <(find_log_files_in_dir "$mx_dir")
+    if [[ "$mx_filt_keep" -ge 20 && "$mx_filt_drop" -ge 5 && "$mx_listed" -eq "$mx_filt_keep" ]]; then
+        _selftest_ok "type-filter+find on matrix (keep=$mx_filt_keep drop=$mx_filt_drop listed=$mx_listed)"
+    else
+        _selftest_bad "type-filter+find on matrix (keep=$mx_filt_keep drop=$mx_filt_drop listed=$mx_listed)"
     fi
     LOG_TYPE_FILTER="$saved_filter"
-    unset "LOG_DIR_OWNER[$ttdir]" "SELECTED_LOG_TYPES[fss-server]"
-    rm -rf -- "$ttdir" 2>/dev/null
+    LOG_SUBMODE="$saved_sub"
+    unset "LOG_DIR_OWNER[$mx_dir]" "SELECTED_LOG_TYPES[fss-server]"
+    rm -rf -- "$mx_dir" 2>/dev/null
 
     # mgcpclient спрашивается/подключается только при наличии fss-server в выборе,
     # а не при любом пакете SoftSwitch (fss-frontend/backend/…).
