@@ -50,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.11.4"
+SCRIPT_VERSION="3.11.5"
 
 set -uo pipefail
 
@@ -384,7 +384,9 @@ _pkg_set "fvcs-record" "FVSC"
 # ========== Infrastructure ==========
 _pkg_set "nginx" "Infrastructure"
 _pkg_set "postgresql" "Infrastructure"
-_pkg_set "mariadb" "Infrastructure"
+# Debian/Ubuntu/Astra не поставляют пакет с именем "mariadb" — только mariadb-server;
+# без legacy is_pkg_installed_tiny() всегда возвращал "не установлен" даже при наличии сервера.
+_pkg_set "mariadb" "Infrastructure" "mariadb-server,mysql-server"
 FLAT_PKG_CATALOG_EOF
 }
 
@@ -8197,6 +8199,12 @@ _json_collect_system() {
     # эту логику здесь, а переиспользуем уже проверенный замер.
     cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
     [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
+    if [[ "$cpu_pct" -eq 0 ]]; then
+        # Один замер за 0.5s-окно может честно попасть на затишье между
+        # всплесками — берём соседнее окно ещё раз, прежде чем поверить в 0%.
+        cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
+        [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
+    fi
 
     if [[ -r /proc/meminfo ]]; then
         mem_total=$(awk '/MemTotal:/{printf "%d",$2/1024}' /proc/meminfo)
@@ -8390,11 +8398,12 @@ build_health_json() {
             if [[ "$pj" == *"\"status\":\"installed\""* ]] || [[ "$pj" == *'"status":"installed"'* ]]; then
                 INSTALLED=$((INSTALLED + 1))
             fi
-            # регистрация deps для infra
-            local d
-            for d in $(echo "${PKG_DEPS[$pkg]:-}" | tr ',' ' '); do
-                [[ -n "$d" ]] && register_dep "$d" "$pkg" 2>/dev/null || true
-            done
+            # Регистрация deps для infra: и meta (PKG_DEPS), и реальные PM-deps —
+            # как в текстовом пути (_register_pkg_deps/check_single_pkg), иначе
+            # "infrastructure" в JSON видит только явно прописанные в каталоге
+            # зависимости и пропускает всё, что реально тянет пакетный менеджер
+            # (libc6, libssl3, redis, sudo, …), которые есть в "=== Depends ===".
+            _register_pkg_deps "$pkg" 2>/dev/null || true
             [[ $first_pkg -eq 1 ]] || packages_json+=","
             first_pkg=0
             packages_json+="$pj"

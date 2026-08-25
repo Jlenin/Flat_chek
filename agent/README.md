@@ -22,6 +22,8 @@
 | Файл | Назначение |
 |------|------------|
 | `install_flat_check.sh` | установка: бинарь, conf, cron, пробный прогон |
+| `reinstall_flat_check.sh` | переустановка (обёртка над install; конфиг — по `-y`/`-n`, умолчание: сохранить) |
+| `uninstall_flat_check.sh` | удаление бинаря/cron/каталога пакетов; конфиг — по `-y`/`-n`, умолчание: удалить |
 | `flat_check.conf.example` | шаблон `/etc/flat/flat_check.conf` |
 | `cron.example` | шаблон `/etc/cron.d/flat-check` |
 | `service_names.md` | допустимые `SERVICE_NAME` |
@@ -98,6 +100,25 @@ sudo ./agent/install_flat_check.sh ... --with-logs
 | `--host-ip IP` | зафиксировать IP в conf |
 
 Если conf уже есть, параметры `--push-*` / `--host-*` / `--service-name` **не меняют** его — нужен `--force-conf` либо правка файла вручную.
+
+---
+
+## Переустановка / удаление
+
+```bash
+# переустановка: бинарь/cron/каталог пакетов обновляются всегда;
+# конфиг — по умолчанию (без -y/-n) СОХРАНЯЕТСЯ как есть
+sudo ./agent/reinstall_flat_check.sh
+sudo ./agent/reinstall_flat_check.sh -y                    # сбросить конфиг на шаблон
+sudo ./agent/reinstall_flat_check.sh -n --push-token NEW    # сохранить конфиг, обновить токен
+
+# удаление: конфиг — по умолчанию (без -y/-n) УДАЛЯЕТСЯ вместе с остальным
+sudo ./agent/uninstall_flat_check.sh
+sudo ./agent/uninstall_flat_check.sh -n                     # оставить /etc/flat как есть
+sudo ./agent/uninstall_flat_check.sh -y                     # удалить конфиг без вопроса
+```
+
+`reinstall_flat_check.sh` — тонкая обёртка над `install_flat_check.sh` (принимает те же `--bin`/`--conf-dir`/`--push-*`/…, см. его `-h`); `-y` эквивалентен `--force-conf`. `uninstall_flat_check.sh` не трогает `LOG_DIR` (логи push). Без tty и без `-y`/`-n` оба применяют своё умолчание молча, не дожидаясь ввода.
 
 ---
 
