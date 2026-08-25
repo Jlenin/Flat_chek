@@ -30,7 +30,7 @@
 # Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log рядом со скриптом
 #   (перезаписывается). Сборщик логов — в flat_check_2.sh.
 
-SCRIPT_VERSION="3.8.2"
+SCRIPT_VERSION="3.8.3"
 
 set -uo pipefail
 
@@ -551,7 +551,7 @@ _sys_pkg_pids() {
 _sys_cpu_via_procstat() {
     declare -F _get_cpu_usage_percent >/dev/null 2>&1 || return 1
     _get_cpu_usage_percent >/dev/null   # инициализируем окно дельты
-    sleep 0.25
+    sleep 0.5
     local pct
     pct=$(_get_cpu_usage_percent)
     [[ "$pct" =~ ^[0-9]+$ ]] || return 1
@@ -2683,8 +2683,11 @@ _json_collect_pkg() {
 _json_collect_system() {
     local cpu_pct=0 mem_total=0 mem_used=0 mem_avail=0
     local up_sec=0
-    cpu_pct=$(_get_cpu_usage_percent 2>/dev/null || echo 0)
-    [[ "$cpu_pct" == "0" ]] && { sleep 0.2; cpu_pct=$(_get_cpu_usage_percent 2>/dev/null || echo 0); }
+    # _sys_cpu_via_procstat() сама делает init-вызов без $(...) (иначе дельта
+    # /proc/stat теряется вместе с субшеллом, и результат всегда 0) — не дублируем
+    # эту логику здесь, а переиспользуем уже проверенный замер.
+    cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
+    [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
 
     if [[ -r /proc/meminfo ]]; then
         mem_total=$(awk '/MemTotal:/{printf "%d",$2/1024}' /proc/meminfo)
