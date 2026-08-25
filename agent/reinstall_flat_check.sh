@@ -79,4 +79,7 @@ else
     info "существующий конфиг сохраняется (без --force-conf)"
 fi
 
-exec "$INSTALLER" "${pass_args[@]}"
+# bash "$INSTALLER" вместо exec "$INSTALLER": не требует бита +x на самом
+# install_flat_check.sh (например, после скачивания ZIP с GitHub — GitHub
+# не всегда сохраняет исполняемый бит — или на /home, смонтированном noexec).
+exec bash "$INSTALLER" "${pass_args[@]}"
