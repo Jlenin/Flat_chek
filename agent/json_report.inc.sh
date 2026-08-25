@@ -300,6 +300,12 @@ _json_collect_system() {
     # эту логику здесь, а переиспользуем уже проверенный замер.
     cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
     [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
+    if [[ "$cpu_pct" -eq 0 ]]; then
+        # Один замер за 0.5s-окно может честно попасть на затишье между
+        # всплесками — берём соседнее окно ещё раз, прежде чем поверить в 0%.
+        cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
+        [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
+    fi
 
     if [[ -r /proc/meminfo ]]; then
         mem_total=$(awk '/MemTotal:/{printf "%d",$2/1024}' /proc/meminfo)
@@ -435,7 +441,13 @@ build_health_json() {
     detect_os >/dev/null 2>&1 || detect_os
 
     ERRORS=0; WARNINGS=0; INSTALLED=0; NOT_INSTALLED=0
-    unset ALL_DEPENDS; declare -A ALL_DEPENDS
+    # -g обязателен: без него `declare -A` внутри функции создаёт ЛОКАЛЬНУЮ
+    # переменную, а глобальный ALL_DEPENDS (объявлен -A в разделе 0) остаётся
+    # unset после return — тогда register_dep() увидит его как обычный
+    # индексированный массив и попытается вычислить "$dep" арифметически
+    # (bash: arr[идентификатор] без -A трактуется как арифметика), что на
+    # дефисных именах вида "fss-frontend" падает под set -u: "fss: unbound variable".
+    declare -gA ALL_DEPENDS=()
 
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     system_json=$(_json_collect_system)
@@ -490,11 +502,12 @@ build_health_json() {
             if [[ "$pj" == *'"status":"installed"'* ]]; then
                 INSTALLED=$((INSTALLED + 1))
             fi
-            # регистрация deps для infra
-            local d
-            for d in $(echo "${PKG_DEPS[$pkg]:-}" | tr ',' ' '); do
-                [[ -n "$d" ]] && register_dep "$d" "$pkg" 2>/dev/null || true
-            done
+            # Регистрация deps для infra: и meta (PKG_DEPS), и реальные PM-deps —
+            # как в текстовом пути (_register_pkg_deps/check_single_pkg), иначе
+            # "infrastructure" в JSON видит только явно прописанные в каталоге
+            # зависимости и пропускает всё, что реально тянет пакетный менеджер
+            # (libc6, libssl3, redis, sudo, …), которые есть в "=== Depends ===".
+            _register_pkg_deps "$pkg" 2>/dev/null || true
             [[ $first_pkg -eq 1 ]] || packages_json+=","
             first_pkg=0
             packages_json+="$pj"

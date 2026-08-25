@@ -50,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.11.3"
+SCRIPT_VERSION="3.11.5"
 
 set -uo pipefail
 
@@ -73,6 +73,7 @@ C_R='\033[0;31m'
 C_G='\033[0;32m'
 C_Y='\033[1;33m'
 C_B='\033[0;34m'
+C_C='\033[0;36m'
 C_N='\033[0m'
 
 ERRORS=0
@@ -81,6 +82,9 @@ INSTALLED=0
 NOT_INSTALLED=0
 VERBOSE=0
 SHOW_REPO=0
+# --debug: дублировать log_debug() на экран (обычно только в LOG_FILE) —
+# для диагностики без доступа к файлу сессионного лога
+DEBUG_MODE=0
 
 # Флаги режима сборщика логов
 MODE_LOG=0
@@ -380,7 +384,9 @@ _pkg_set "fvcs-record" "FVSC"
 # ========== Infrastructure ==========
 _pkg_set "nginx" "Infrastructure"
 _pkg_set "postgresql" "Infrastructure"
-_pkg_set "mariadb" "Infrastructure"
+# Debian/Ubuntu/Astra не поставляют пакет с именем "mariadb" — только mariadb-server;
+# без legacy is_pkg_installed_tiny() всегда возвращал "не установлен" даже при наличии сервера.
+_pkg_set "mariadb" "Infrastructure" "mariadb-server,mysql-server"
 FLAT_PKG_CATALOG_EOF
 }
 
@@ -417,11 +423,12 @@ _log_line() {
     { printf '%s [%-5s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG_FILE"; } 2>/dev/null
 }
 
-# Технические подробности только в файл лога (что найдено/отклонено при
-# поиске логов, снимки CPU/MEM и т.п.) — не выводятся на экран, чтобы не
-# перегружать интерактивный вывод и терминал пользователя.
+# Технические подробности обычно только в файл лога (что найдено/отклонено
+# при поиске логов, снимки CPU/MEM и т.п.) — не выводятся на экран, чтобы не
+# перегружать интерактивный вывод. С --debug — дублируются и на экран (stderr).
 log_debug() {
     _log_line "DEBUG" "$1"
+    [[ "${DEBUG_MODE:-0}" -eq 1 ]] && echo -e "${C_C}[DEBUG]${C_N} $1" >&2
 }
 
 # Инициализирует LOG_FILE в $dir/${SCRIPT_NAME}.log (перезаписывается на
@@ -1514,6 +1521,7 @@ register_dep() {
     [[ "$dep" == "package" ]] && return
     [[ "$dep" == "Package" ]] && return
 
+    log_debug "register_dep: dep='$dep' pkg='$pkg'"
     local existing="${ALL_DEPENDS[$dep]:-}"
     if [[ -n "$existing" ]]; then
         if [[ ",${existing}," != *",$pkg,"* ]]; then
@@ -6086,7 +6094,11 @@ _run_selftest_simple() {
     else
         _selftest_bad "catalog has Infrastructure+FVSC+fc-frontend"
     fi
-    unset ALL_DEPENDS; declare -A ALL_DEPENDS
+    # -g обязателен: этот код выполняется напрямую (не в субшелле $()), поэтому
+    # без -g "declare -A" создал бы ЛОКАЛЬНУЮ тень для _run_selftest_simple, а
+    # глобальный ALL_DEPENDS остался бы unset и после возврата ломал бы
+    # register_dep() в последующем VERBOSE-проходе по пакетам (см. build_health_json выше).
+    declare -gA ALL_DEPENDS=()
     ALL_DEPENDS["fps-server"]="demo"
     local infra_json
     infra_json=$(_json_collect_infra 2>/dev/null || echo FAIL)
@@ -8187,6 +8199,12 @@ _json_collect_system() {
     # эту логику здесь, а переиспользуем уже проверенный замер.
     cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
     [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
+    if [[ "$cpu_pct" -eq 0 ]]; then
+        # Один замер за 0.5s-окно может честно попасть на затишье между
+        # всплесками — берём соседнее окно ещё раз, прежде чем поверить в 0%.
+        cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
+        [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
+    fi
 
     if [[ -r /proc/meminfo ]]; then
         mem_total=$(awk '/MemTotal:/{printf "%d",$2/1024}' /proc/meminfo)
@@ -8323,7 +8341,13 @@ build_health_json() {
     detect_os >/dev/null 2>&1 || detect_os
 
     ERRORS=0; WARNINGS=0; INSTALLED=0; NOT_INSTALLED=0
-    unset ALL_DEPENDS; declare -A ALL_DEPENDS
+    # -g обязателен: без него `declare -A` внутри функции создаёт ЛОКАЛЬНУЮ
+    # переменную, а глобальный ALL_DEPENDS (объявлен -A в разделе 0) остаётся
+    # unset после return — тогда register_dep() увидит его как обычный
+    # индексированный массив и попытается вычислить "$dep" арифметически
+    # (bash: arr[идентификатор] без -A трактуется как арифметика), что на
+    # дефисных именах вида "fss-frontend" падает под set -u: "fss: unbound variable".
+    declare -gA ALL_DEPENDS=()
 
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     system_json=$(_json_collect_system)
@@ -8374,11 +8398,12 @@ build_health_json() {
             if [[ "$pj" == *"\"status\":\"installed\""* ]] || [[ "$pj" == *'"status":"installed"'* ]]; then
                 INSTALLED=$((INSTALLED + 1))
             fi
-            # регистрация deps для infra
-            local d
-            for d in $(echo "${PKG_DEPS[$pkg]:-}" | tr ',' ' '); do
-                [[ -n "$d" ]] && register_dep "$d" "$pkg" 2>/dev/null || true
-            done
+            # Регистрация deps для infra: и meta (PKG_DEPS), и реальные PM-deps —
+            # как в текстовом пути (_register_pkg_deps/check_single_pkg), иначе
+            # "infrastructure" в JSON видит только явно прописанные в каталоге
+            # зависимости и пропускает всё, что реально тянет пакетный менеджер
+            # (libc6, libssl3, redis, sudo, …), которые есть в "=== Depends ===".
+            _register_pkg_deps "$pkg" 2>/dev/null || true
             [[ $first_pkg -eq 1 ]] || packages_json+=","
             first_pkg=0
             packages_json+="$pj"
@@ -8495,6 +8520,7 @@ Modes:
   --dev                   Extended self-test (VERBOSE health all packages + seek/chunk)
   --selftest simple|extended
                           Self-test: simple = functions launch; extended = same as --dev
+  --debug                 Mirror DEBUG-level session log lines to the screen (stderr)
   -log                    Log collector mode
     -on, --online         Real-time capture (tail -F + optional tcpdump)
     -off, --offline       Copy/extract existing logs
@@ -8623,6 +8649,7 @@ flat_check_2.sh — проверка FLAT/FCS + сборщик логов
   --dev                   Расширенный самотест (VERBOSE health по всем пакетам + seek/chunk)
   --selftest simple|extended
                           Самотест: simple = запуск функций; extended = как --dev
+  --debug                 Дублировать DEBUG-строки сессионного лога на экран (stderr)
   -log                    Режим сборщика логов
     -on, --online         Сбор в реальном времени (tail -F + опц. tcpdump)
     -off, --offline       Копирование/извлечение готовых логов
@@ -8741,6 +8768,10 @@ parse_args() {
             --dev)
                 SELFTEST_MODE="extended"
                 MODE_DEV=1
+                shift
+                ;;
+            --debug)
+                DEBUG_MODE=1
                 shift
                 ;;
             --selftest)
