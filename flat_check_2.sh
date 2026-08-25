@@ -50,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.11.1"
+SCRIPT_VERSION="3.11.2"
 
 set -uo pipefail
 
@@ -7898,6 +7898,7 @@ run_interactive_wizard() {
 : "${PUSH_CONNECT_TIMEOUT:=5}"
 : "${PUSH_MAX_TIME:=30}"
 : "${PUSH_RETRIES:=2}"
+: "${PUSH_INSECURE:=0}"
 : "${SHOW_REPOS_JSON:=0}"
 
 _json_load_config() {
@@ -7925,6 +7926,9 @@ _json_load_config() {
                 PRODUCT) [[ -z "${PRODUCT:-}" ]] && PRODUCT="$val" ;;
                 PUSH_CONNECT_TIMEOUT|PUSH_MAX_TIME|PUSH_RETRIES)
                     [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
+                    ;;
+                PUSH_INSECURE)
+                    [[ "$val" =~ ^[01]$ ]] && PUSH_INSECURE="$val"
                     ;;
                 COLLECTOR_JOBS|JOBS)
                     if [[ "$val" =~ ^[0-9]+$ && "${COLLECTOR_JOBS:-0}" -eq 0 ]]; then
@@ -8403,10 +8407,13 @@ build_health_json() {
 }
 
 # Отправка JSON на все URL из PUSH_URLS (http/https).
+# PUSH_INSECURE=1 — не проверять TLS-сертификат (curl -k), для https с self-signed.
 push_health_json() {
     local body="$1"
     local urls=() tokens=() url token i rc=0 http_code
     local auth_hdr="${PUSH_AUTH_HEADER:-Authorization: Bearer}"
+    local curl_insecure=()
+    [[ "${PUSH_INSECURE:-0}" == "1" ]] && curl_insecure=(-k)
 
     _json_ensure_identity
     [[ -n "$PUSH_URLS" ]] || { warn "push: PUSH_URLS пуст — некуда отправлять"; return 1; }
@@ -8436,6 +8443,7 @@ push_health_json() {
         while [[ $attempt -le ${PUSH_RETRIES:-2} ]]; do
             attempt=$((attempt + 1))
             http_code=$(curl -sS -o /tmp/flat_push_body.$$ -w '%{http_code}' \
+                "${curl_insecure[@]}" \
                 --connect-timeout "${PUSH_CONNECT_TIMEOUT:-5}" \
                 --max-time "${PUSH_MAX_TIME:-30}" \
                 -X POST "$url" \

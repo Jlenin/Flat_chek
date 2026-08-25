@@ -27,5 +27,10 @@ PUSH_CONNECT_TIMEOUT=5
 PUSH_MAX_TIME=30
 PUSH_RETRIES=2
 
+# 1 = не проверять TLS-сертификат при https push (curl -k).
+# Нужно, если у приёмника (Partner) самоподписанный сертификат — иначе
+# push будет падать с "FAIL (last http=000)" при видимо верном URL.
+# PUSH_INSECURE=1
+
 # Параллельные воркеры проверки пакетов (как --jobs)
 # JOBS=4
