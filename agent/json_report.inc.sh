@@ -435,7 +435,13 @@ build_health_json() {
     detect_os >/dev/null 2>&1 || detect_os
 
     ERRORS=0; WARNINGS=0; INSTALLED=0; NOT_INSTALLED=0
-    unset ALL_DEPENDS; declare -A ALL_DEPENDS
+    # -g обязателен: без него `declare -A` внутри функции создаёт ЛОКАЛЬНУЮ
+    # переменную, а глобальный ALL_DEPENDS (объявлен -A в разделе 0) остаётся
+    # unset после return — тогда register_dep() увидит его как обычный
+    # индексированный массив и попытается вычислить "$dep" арифметически
+    # (bash: arr[идентификатор] без -A трактуется как арифметика), что на
+    # дефисных именах вида "fss-frontend" падает под set -u: "fss: unbound variable".
+    declare -gA ALL_DEPENDS=()
 
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     system_json=$(_json_collect_system)

@@ -50,7 +50,7 @@
 #   с шаблоном YYYY.MM.DD_HH-MM_*  внутри выходной директории сборщика.
 # Никогда не использовать голый rm -rf на произвольных путях из CLI-ввода.
 
-SCRIPT_VERSION="3.11.3"
+SCRIPT_VERSION="3.11.4"
 
 set -uo pipefail
 
@@ -73,6 +73,7 @@ C_R='\033[0;31m'
 C_G='\033[0;32m'
 C_Y='\033[1;33m'
 C_B='\033[0;34m'
+C_C='\033[0;36m'
 C_N='\033[0m'
 
 ERRORS=0
@@ -81,6 +82,9 @@ INSTALLED=0
 NOT_INSTALLED=0
 VERBOSE=0
 SHOW_REPO=0
+# --debug: дублировать log_debug() на экран (обычно только в LOG_FILE) —
+# для диагностики без доступа к файлу сессионного лога
+DEBUG_MODE=0
 
 # Флаги режима сборщика логов
 MODE_LOG=0
@@ -417,11 +421,12 @@ _log_line() {
     { printf '%s [%-5s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG_FILE"; } 2>/dev/null
 }
 
-# Технические подробности только в файл лога (что найдено/отклонено при
-# поиске логов, снимки CPU/MEM и т.п.) — не выводятся на экран, чтобы не
-# перегружать интерактивный вывод и терминал пользователя.
+# Технические подробности обычно только в файл лога (что найдено/отклонено
+# при поиске логов, снимки CPU/MEM и т.п.) — не выводятся на экран, чтобы не
+# перегружать интерактивный вывод. С --debug — дублируются и на экран (stderr).
 log_debug() {
     _log_line "DEBUG" "$1"
+    [[ "${DEBUG_MODE:-0}" -eq 1 ]] && echo -e "${C_C}[DEBUG]${C_N} $1" >&2
 }
 
 # Инициализирует LOG_FILE в $dir/${SCRIPT_NAME}.log (перезаписывается на
@@ -1514,6 +1519,7 @@ register_dep() {
     [[ "$dep" == "package" ]] && return
     [[ "$dep" == "Package" ]] && return
 
+    log_debug "register_dep: dep='$dep' pkg='$pkg'"
     local existing="${ALL_DEPENDS[$dep]:-}"
     if [[ -n "$existing" ]]; then
         if [[ ",${existing}," != *",$pkg,"* ]]; then
@@ -6086,7 +6092,11 @@ _run_selftest_simple() {
     else
         _selftest_bad "catalog has Infrastructure+FVSC+fc-frontend"
     fi
-    unset ALL_DEPENDS; declare -A ALL_DEPENDS
+    # -g обязателен: этот код выполняется напрямую (не в субшелле $()), поэтому
+    # без -g "declare -A" создал бы ЛОКАЛЬНУЮ тень для _run_selftest_simple, а
+    # глобальный ALL_DEPENDS остался бы unset и после возврата ломал бы
+    # register_dep() в последующем VERBOSE-проходе по пакетам (см. build_health_json выше).
+    declare -gA ALL_DEPENDS=()
     ALL_DEPENDS["fps-server"]="demo"
     local infra_json
     infra_json=$(_json_collect_infra 2>/dev/null || echo FAIL)
@@ -8323,7 +8333,13 @@ build_health_json() {
     detect_os >/dev/null 2>&1 || detect_os
 
     ERRORS=0; WARNINGS=0; INSTALLED=0; NOT_INSTALLED=0
-    unset ALL_DEPENDS; declare -A ALL_DEPENDS
+    # -g обязателен: без него `declare -A` внутри функции создаёт ЛОКАЛЬНУЮ
+    # переменную, а глобальный ALL_DEPENDS (объявлен -A в разделе 0) остаётся
+    # unset после return — тогда register_dep() увидит его как обычный
+    # индексированный массив и попытается вычислить "$dep" арифметически
+    # (bash: arr[идентификатор] без -A трактуется как арифметика), что на
+    # дефисных именах вида "fss-frontend" падает под set -u: "fss: unbound variable".
+    declare -gA ALL_DEPENDS=()
 
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     system_json=$(_json_collect_system)
@@ -8495,6 +8511,7 @@ Modes:
   --dev                   Extended self-test (VERBOSE health all packages + seek/chunk)
   --selftest simple|extended
                           Self-test: simple = functions launch; extended = same as --dev
+  --debug                 Mirror DEBUG-level session log lines to the screen (stderr)
   -log                    Log collector mode
     -on, --online         Real-time capture (tail -F + optional tcpdump)
     -off, --offline       Copy/extract existing logs
@@ -8623,6 +8640,7 @@ flat_check_2.sh — проверка FLAT/FCS + сборщик логов
   --dev                   Расширенный самотест (VERBOSE health по всем пакетам + seek/chunk)
   --selftest simple|extended
                           Самотест: simple = запуск функций; extended = как --dev
+  --debug                 Дублировать DEBUG-строки сессионного лога на экран (stderr)
   -log                    Режим сборщика логов
     -on, --online         Сбор в реальном времени (tail -F + опц. tcpdump)
     -off, --offline       Копирование/извлечение готовых логов
@@ -8741,6 +8759,10 @@ parse_args() {
             --dev)
                 SELFTEST_MODE="extended"
                 MODE_DEV=1
+                shift
+                ;;
+            --debug)
+                DEBUG_MODE=1
                 shift
                 ;;
             --selftest)
