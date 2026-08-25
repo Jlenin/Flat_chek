@@ -3,8 +3,8 @@
 Внутренний контекст репозитория **Flat_chek** (`github.com/Jlenin/Flat_chek`).  
 Обновлять при смене версии, JSON-контракта, установщика или паритета скриптов.
 
-**Обновлено:** 2026-08-06  
-**Версия:** `flat_check.sh` 3.8.1 / `flat_check_2.sh` 3.11.1
+**Обновлено:** 2026-08-25  
+**Версия:** `flat_check.sh` 3.8.2 / `flat_check_2.sh` 3.11.2
 
 ---
 
@@ -39,6 +39,7 @@
 11. **3.10.3 (`_2`):** find видит РЕД ОС-стиль `name.txt-YYYYMMDD[.gz]` (`*.txt-*` / `*.log-*`), не только `name.txt.*`.
 12. **3.10.4 (`_2`):** широкая матрица `_logrotate_name_matrix` (40+ имён) в selftest — stem/group/find/type-filter.
 13. **3.8.0 / 3.11.0:** каталог `flat_check.packages.conf`; продукт Infrastructure (PKG); раздел зависимостей переименован в `=== Depends ===` (полный список, как раньше); FVSC/fc-*/fpw-frontend; фикс JSON `ALL_DEPENDS` hyphen + `summary.installed` subshell.
+14. **3.8.2 / 3.11.2:** `PUSH_INSECURE=1` (conf/env, `install_flat_check.sh --push-insecure`) — curl `-k` для push на https с self-signed сертификатом (иначе `push: FAIL (last http=000)` при рабочем URL).
 
 ---
 

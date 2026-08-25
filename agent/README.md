@@ -121,6 +121,7 @@ SERVICE_NAME="fss-backend"
 | `HOST_IP` | нет | иначе определяется автоматически |
 | `PACKAGES` / `PRODUCT` | нет | сузить набор проверок |
 | `PUSH_CONNECT_TIMEOUT` / `PUSH_MAX_TIME` / `PUSH_RETRIES` | нет | таймауты curl |
+| `PUSH_INSECURE` | нет | `1` = не проверять TLS-сертификат приёмника (`curl -k`); нужно при self-signed на https, иначе push падает с `FAIL (last http=000)` |
 
 Приоритет значений: **CLI → переменные окружения → conf → автоопределение**.
 
@@ -200,7 +201,7 @@ tail -f /var/log/flat/flat_check_push.log
 | `PUSH_URLS пуст` | conf / env |
 | `curl не найден` | пакет `curl` |
 | `http=401/403` | токен, `PUSH_AUTH_HEADER` |
-| `http=000` | DNS, firewall, TLS |
+| `http=000` | DNS, firewall, TLS; если приёмник на self-signed https — `PUSH_INSECURE=1` |
 | `service_name: unknown` | `SERVICE_NAME` в conf или `--service-name` |
 
 ---

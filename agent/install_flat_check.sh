@@ -26,6 +26,7 @@ CRON_FILE="${CRON_FILE:-/etc/cron.d/flat-check}"
 
 PUSH_URLS="${PUSH_URLS:-}"
 PUSH_TOKEN="${PUSH_TOKEN:-}"
+PUSH_INSECURE="${PUSH_INSECURE:-}"
 HOST_ID="${HOST_ID:-}"
 HOST_IP="${HOST_IP:-}"
 SERVICE_NAME="${SERVICE_NAME:-}"
@@ -68,6 +69,7 @@ Usage:
 Параметры ноды (пишутся в conf при создании/перезаписи):
   --push-url URL          PUSH_URLS (несколько — через запятую)
   --push-token TOKEN      PUSH_TOKEN
+  --push-insecure         PUSH_INSECURE=1 (не проверять TLS-сертификат приёмника, curl -k)
   --host-id ID            HOST_ID (default: hostname -s)
   --host-ip IP            HOST_IP
   --service-name NAME     SERVICE_NAME (fss-backend, fps-backend, …)
@@ -105,6 +107,7 @@ while [[ $# -gt 0 ]]; do
         --no-test) RUN_TEST=0; shift ;;
         --push-url) need_arg "$1" "${2:-}"; PUSH_URLS="$2"; shift 2 ;;
         --push-token) need_arg "$1" "${2:-}"; PUSH_TOKEN="$2"; shift 2 ;;
+        --push-insecure) PUSH_INSECURE=1; shift ;;
         --host-id) need_arg "$1" "${2:-}"; HOST_ID="$2"; shift 2 ;;
         --host-ip) need_arg "$1" "${2:-}"; HOST_IP="$2"; shift 2 ;;
         --service-name) need_arg "$1" "${2:-}"; SERVICE_NAME="$2"; shift 2 ;;
@@ -223,7 +226,7 @@ fi
 
 if [[ -f "$CONF_FILE" && $FORCE_CONF -eq 0 ]]; then
     info "3) $CONF_FILE уже есть — оставляем как есть"
-    if [[ -n "$PUSH_URLS$PUSH_TOKEN$HOST_IP$SERVICE_NAME" ]]; then
+    if [[ -n "$PUSH_URLS$PUSH_TOKEN$PUSH_INSECURE$HOST_IP$SERVICE_NAME" ]]; then
         warn "флаги --push-* / --host-* / --service-name не применены (есть conf; нужен --force-conf)"
     fi
 else
@@ -234,6 +237,7 @@ else
         cp "$SRC_CONF" "$CONF_FILE"
         [[ -n "$PUSH_URLS" ]] && _conf_set "$CONF_FILE" PUSH_URLS "$PUSH_URLS"
         [[ -n "$PUSH_TOKEN" ]] && _conf_set "$CONF_FILE" PUSH_TOKEN "$PUSH_TOKEN"
+        [[ -n "$PUSH_INSECURE" ]] && _conf_set "$CONF_FILE" PUSH_INSECURE "$PUSH_INSECURE"
         _conf_set "$CONF_FILE" HOST_ID "$HOST_ID"
         if [[ -n "$HOST_IP" ]]; then
             _conf_set "$CONF_FILE" HOST_IP "$HOST_IP"
