@@ -19,6 +19,15 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install_flat_check.sh"
 
+# Само-починка бита +x на всём тулките — см. тот же блок в install_flat_check.sh.
+chmod +x \
+    "$SCRIPT_DIR/install_flat_check.sh" \
+    "$SCRIPT_DIR/reinstall_flat_check.sh" \
+    "$SCRIPT_DIR/uninstall_flat_check.sh" \
+    "$SCRIPT_DIR/../flat_check.sh" \
+    "$SCRIPT_DIR/../flat_check_2.sh" \
+    2>/dev/null || true
+
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "[INFO] $*"; }
 

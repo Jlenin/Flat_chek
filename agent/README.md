@@ -40,7 +40,7 @@
 Из корня репозитория (**нужен sudo** для установки в `/usr/local` и `/etc`):
 
 ```bash
-chmod +x agent/install_flat_check.sh flat_check.sh
+chmod +x agent/install_flat_check.sh
 
 sudo ./agent/install_flat_check.sh \
   --push-url 'https://partner.example.local/api/v1/health/ingest' \
@@ -48,6 +48,13 @@ sudo ./agent/install_flat_check.sh \
   --host-id ss-n1 \
   --service-name fss-backend
 ```
+
+`chmod +x` нужен вручную только один раз, на самом `install_flat_check.sh`
+(если скачали архивом с GitHub — «Download ZIP» не всегда сохраняет
+исполняемый бит). Дальше он сам чинит бит `+x` себе, `reinstall_flat_check.sh`,
+`uninstall_flat_check.sh` и `flat_check.sh`/`flat_check_2.sh` — их отдельно
+делать исполняемыми не нужно. Не хочется даже этого одного `chmod` —
+запустите через `bash agent/install_flat_check.sh ...`, результат тот же.
 
 Без root — только в свой префикс:
 
@@ -119,6 +126,11 @@ sudo ./agent/uninstall_flat_check.sh -y                     # удалить к�
 ```
 
 `reinstall_flat_check.sh` — тонкая обёртка над `install_flat_check.sh` (принимает те же `--bin`/`--conf-dir`/`--push-*`/…, см. его `-h`); `-y` эквивалентен `--force-conf`. `uninstall_flat_check.sh` не трогает `LOG_DIR` (логи push). Без tty и без `-y`/`-n` оба применяют своё умолчание молча, не дожидаясь ввода.
+
+Отдельный `chmod +x` для `reinstall_flat_check.sh`/`uninstall_flat_check.sh`
+не нужен — оба, как и `install_flat_check.sh`, чинят бит `+x` себе и соседям
+при каждом запуске, так что достаточно один раз сделать исполняемым любой
+из трёх (см. «Установка» выше).
 
 ---
 
@@ -222,7 +234,7 @@ tail -f /var/log/flat/flat_check_push.log
 | `PUSH_URLS пуст` | conf / env |
 | `curl не найден` | пакет `curl` |
 | `http=401/403` | токен, `PUSH_AUTH_HEADER` |
-| `http=000` | DNS, firewall, TLS; если приёмник на self-signed https — `PUSH_INSECURE=1` |
+| `http=000` | DNS, firewall, TLS; если приёмник на self-signed https — `PUSH_INSECURE=1`. Точную причину curl (connection refused / timed out / …) смотрите в `flat_check_push.log` или `--push --debug` — строка `push: curl → URL: ...` |
 | `service_name: unknown` | `SERVICE_NAME` в conf или `--service-name` |
 
 ---

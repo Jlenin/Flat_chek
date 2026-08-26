@@ -14,6 +14,20 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Само-починка бита +x на всём тулките (install/reinstall/uninstall + сами
+# flat_check*.sh): архив с GitHub ("Download ZIP") не всегда сохраняет
+# исполняемый бит, из-за чего reinstall_flat_check.sh/uninstall_flat_check.sh
+# потом не запускались без ручного chmod. Этот, самый первый скрипт, всё ещё
+# нужно один раз сделать исполняемым руками (или запустить как
+# `bash install_flat_check.sh`) — дальше он чинит и себя, и соседей сам.
+chmod +x \
+    "$SCRIPT_DIR/install_flat_check.sh" \
+    "$SCRIPT_DIR/reinstall_flat_check.sh" \
+    "$SCRIPT_DIR/uninstall_flat_check.sh" \
+    "$REPO_ROOT/flat_check.sh" \
+    "$REPO_ROOT/flat_check_2.sh" \
+    2>/dev/null || true
+
 SRC_CHECK="${SRC_CHECK:-$REPO_ROOT/flat_check.sh}"
 SRC_PKG_CATALOG="${SRC_PKG_CATALOG:-$REPO_ROOT/flat_check.packages.conf}"
 SRC_CONF="${SRC_CONF:-$SCRIPT_DIR/flat_check.conf.example}"

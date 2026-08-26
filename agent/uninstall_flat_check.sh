@@ -10,6 +10,17 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Само-починка бита +x на всём тулките — см. тот же блок в install_flat_check.sh.
+chmod +x \
+    "$SCRIPT_DIR/install_flat_check.sh" \
+    "$SCRIPT_DIR/reinstall_flat_check.sh" \
+    "$SCRIPT_DIR/uninstall_flat_check.sh" \
+    "$SCRIPT_DIR/../flat_check.sh" \
+    "$SCRIPT_DIR/../flat_check_2.sh" \
+    2>/dev/null || true
+
 INSTALL_BIN="${INSTALL_BIN:-/usr/local/bin/flat_check}"
 CONF_DIR="${CONF_DIR:-/etc/flat}"
 CRON_FILE="${CRON_FILE:-/etc/cron.d/flat-check}"
