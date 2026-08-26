@@ -30,7 +30,7 @@
 # Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log рядом со скриптом
 #   (перезаписывается). Сборщик логов — в flat_check_2.sh.
 
-SCRIPT_VERSION="3.8.5"
+SCRIPT_VERSION="3.8.6"
 
 set -uo pipefail
 
@@ -2965,7 +2965,7 @@ push_health_json() {
         [[ -n "${tokens[$i]:-}" ]] && token="${tokens[$i]}"
         i=$((i + 1))
 
-        local attempt=0 ok=0
+        local attempt=0 ok=0 curl_errfile="/tmp/flat_push_err.$$"
         while [[ $attempt -le ${PUSH_RETRIES:-2} ]]; do
             attempt=$((attempt + 1))
             http_code=$(curl -sS -o /tmp/flat_push_body.$$ -w '%{http_code}' \
@@ -2977,8 +2977,12 @@ push_health_json() {
                 -H "X-Flat-Host-Id: ${HOST_ID}" \
                 -H "X-Flat-Service-Name: ${SERVICE_NAME}" \
                 ${token:+-H "$auth_hdr $token"} \
-                --data-binary "$body" 2>/dev/null) || true
+                --data-binary "$body" 2>"$curl_errfile") || true
             [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code="000"
+            # http=000 сам по себе не говорит, ПОЧЕМУ (DNS/refused/timeout/TLS) —
+            # curl обычно пишет это в stderr, раньше просто выбрасывался в /dev/null.
+            [[ -s "$curl_errfile" ]] && log_debug "push: curl → $url: $(tr '\n' ' ' < "$curl_errfile" 2>/dev/null)"
+            rm -f "$curl_errfile" 2>/dev/null
             if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
                 info "push: OK $http_code → $url"
                 ok=1

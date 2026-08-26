@@ -234,7 +234,7 @@ tail -f /var/log/flat/flat_check_push.log
 | `PUSH_URLS пуст` | conf / env |
 | `curl не найден` | пакет `curl` |
 | `http=401/403` | токен, `PUSH_AUTH_HEADER` |
-| `http=000` | DNS, firewall, TLS; если приёмник на self-signed https — `PUSH_INSECURE=1` |
+| `http=000` | DNS, firewall, TLS; если приёмник на self-signed https — `PUSH_INSECURE=1`. Точную причину curl (connection refused / timed out / …) смотрите в `flat_check_push.log` или `--push --debug` — строка `push: curl → URL: ...` |
 | `service_name: unknown` | `SERVICE_NAME` в conf или `--service-name` |
 
 ---
