@@ -4,8 +4,8 @@
 
 | Скрипт | Назначение | Версия |
 |--------|------------|--------|
-| `flat_check.sh` | health check | 3.8.7 |
-| `flat_check_2.sh` | тот же health check + сбор логов | 3.11.7 |
+| `flat_check.sh` | health check | 3.8.8 |
+| `flat_check_2.sh` | тот же health check + сбор логов | 3.11.8 |
 | `flat_check.packages.conf` | каталог пакетов (рядом со скриптом) | — |
 
 Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
@@ -43,7 +43,7 @@ chmod +x flat_check.sh flat_check_2.sh
 ./flat_check_2.sh -h
 
 ./flat_check.sh
-./flat_check.sh -v    # flat_check 3.8.7
+./flat_check.sh -v    # flat_check 3.8.8
 ```
 
 ---
@@ -204,6 +204,8 @@ _pkg_set "other-pkg" "Product Name" "old-name"
 Обязательно: `bash`, coreutils, `awk` (gawk), `grep`.
 
 Health: `systemctl`, `dpkg`/`rpm`, `ss`/`netstat`, `curl`, `openssl`, при необходимости `psql` / `top` / `free` / `df`.
+
+`--json` в интерактивном терминале печатается с отступами через `jq` (если есть) или `python3 -m json.tool`; при пайпе/редиректе (cron, `| jq`, `> file`) — как раньше, компактно одной строкой. Ни `jq`, ни `python3` не обязательны — без них просто компактный вывод везде.
 
 Сбор логов (`_2`): `tail`, `gzip` или `pigz`; опционально `tcpdump`, `zcat`.
 

@@ -30,7 +30,7 @@
 # Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log рядом со скриптом
 #   (перезаписывается). Сборщик логов — в flat_check_2.sh.
 
-SCRIPT_VERSION="3.8.7"
+SCRIPT_VERSION="3.8.8"
 
 set -uo pipefail
 
@@ -3039,17 +3039,33 @@ push_health_json() {
     return "$rc"
 }
 
+# Печать JSON: с отступами (jq, иначе python3 -m json.tool), если stdout —
+# интерактивный терминал (глазами читать одну гигантскую строку неудобно);
+# компактно в одну строку иначе (пайп/файл/cron — не ломаем автоматизацию,
+# которая ждёт ровно одну строку JSON). Нет ни jq, ни python3 — как раньше.
+_json_print() {
+    local body="$1"
+    if [[ -t 1 ]]; then
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$body" | jq . 2>/dev/null && return 0
+        elif command -v python3 >/dev/null 2>&1; then
+            printf '%s' "$body" | python3 -m json.tool 2>/dev/null && return 0
+        fi
+    fi
+    printf '%s\n' "$body"
+}
+
 run_health_json() {
     local body
     [[ -n "$CONFIG_FILE" ]] && _json_load_config "$CONFIG_FILE"
     body=$(build_health_json) || { fail "не удалось собрать JSON"; return 1; }
     if [[ "$DO_PUSH" -eq 1 ]]; then
         # при --push JSON тоже можно показать через --json; иначе только push
-        [[ "$OUTPUT_JSON" -eq 1 ]] && printf '%s\n' "$body"
+        [[ "$OUTPUT_JSON" -eq 1 ]] && _json_print "$body"
         push_health_json "$body"
         return $?
     fi
-    printf '%s\n' "$body"
+    _json_print "$body"
 }
 
 # --- 11. Selftest / справка / argv / main ---------------------------------------
