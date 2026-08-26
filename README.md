@@ -4,8 +4,8 @@
 
 | Скрипт | Назначение | Версия |
 |--------|------------|--------|
-| `flat_check.sh` | health check | 3.8.9 |
-| `flat_check_2.sh` | тот же health check + сбор логов | 3.11.9 |
+| `flat_check.sh` | health check | 3.8.10 |
+| `flat_check_2.sh` | тот же health check + сбор логов | 3.11.10 |
 | `flat_check.packages.conf` | каталог пакетов (рядом со скриптом) | — |
 
 Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
@@ -43,7 +43,7 @@ chmod +x flat_check.sh flat_check_2.sh
 ./flat_check_2.sh -h
 
 ./flat_check.sh
-./flat_check.sh -v    # flat_check 3.8.9
+./flat_check.sh -v    # flat_check 3.8.10
 ```
 
 ---
