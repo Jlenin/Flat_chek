@@ -194,9 +194,13 @@ _json_collect_pkg() {
     deps_pm=$(get_pkg_depends "$pkg" 2>/dev/null || true)
 
     # process
-    if command -v pgrep >/dev/null 2>&1; then
-        pids=$(pgrep -d',' -f "/opt/flat/$pkg|/usr/lib.*/$pkg|$pkg" 2>/dev/null | head -c 200 || true)
-    fi
+    # _sys_pkg_pids() (не голый pgrep по имени пакета) — иначе пакеты вроде
+    # fss-capagent, которые запускают сторонний бинарь другим именем (heplify,
+    # без "fss-capagent" где-либо в argv), всегда виделись бы как "not running",
+    # хотя systemd честно показывает unit активным. _sys_pkg_pids добавляет
+    # запасной путь через `systemctl show -p MainPID`, который от имени
+    # процесса не зависит.
+    pids=$(_sys_pkg_pids "$pkg" 2>/dev/null | paste -sd',' - 2>/dev/null)
     if [[ -n "$pids" ]]; then
         proc_status="running"
         ps_lines=$(ps -o pid=,args= -p "${pids//,/ }" 2>/dev/null | head -5 | sed 's/"/\\"/g' || true)

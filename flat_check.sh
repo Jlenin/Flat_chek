@@ -30,7 +30,7 @@
 # Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log рядом со скриптом
 #   (перезаписывается). Сборщик логов — в flat_check_2.sh.
 
-SCRIPT_VERSION="3.8.8"
+SCRIPT_VERSION="3.8.9"
 
 set -uo pipefail
 
@@ -1484,11 +1484,12 @@ check_log_directory() {
         return 0
     fi
 
-    # Проблема с путём по умолчанию — проверить, активен ли процесс
+    # Проблема с путём по умолчанию — проверить, активен ли процесс.
+    # _sys_pkg_pids() — не голый pgrep по имени пакета, иначе пакеты вроде
+    # fss-capagent (сторонний бинарь heplify, без "fss-capagent" в argv)
+    # всегда считались бы неактивными, хотя systemd видит unit активным.
     local is_active=0
-    if pgrep -x "$pkg" &>/dev/null || pgrep -f "$pkg" &>/dev/null; then
-        is_active=1
-    fi
+    [[ -n "$(_sys_pkg_pids "$pkg" 2>/dev/null)" ]] && is_active=1
 
     if [[ "$log_status" == "stale" ]]; then
         if [[ $is_active -eq 0 ]]; then
@@ -1590,10 +1591,11 @@ check_configs() {
 check_process() {
     local pkg="$1"
     local pids
-    pids=$(pgrep -d ',' -x "$pkg" 2>/dev/null || true)
-    if [[ -z "$pids" ]]; then
-        pids=$(pgrep -d ',' -f "$pkg" 2>/dev/null || true)
-    fi
+    # _sys_pkg_pids() — не голый pgrep по имени пакета, иначе пакеты вроде
+    # fss-capagent (запускают сторонний бинарь heplify, без "fss-capagent"
+    # где-либо в argv) никогда не находились бы, хотя systemd видит unit
+    # активным; у _sys_pkg_pids есть запасной путь через MainPID юнита.
+    pids=$(_sys_pkg_pids "$pkg" 2>/dev/null | paste -sd',' - 2>/dev/null)
 
     if [[ -n "$pids" ]]; then
         print_ok "process: running (PIDs: $pids)"
@@ -2591,9 +2593,13 @@ _json_collect_pkg() {
     deps_pm=$(get_pkg_depends "$pkg" 2>/dev/null || true)
 
     # process
-    if command -v pgrep >/dev/null 2>&1; then
-        pids=$(pgrep -d',' -f "/opt/flat/$pkg|/usr/lib.*/$pkg|$pkg" 2>/dev/null | head -c 200 || true)
-    fi
+    # _sys_pkg_pids() (не голый pgrep по имени пакета) — иначе пакеты вроде
+    # fss-capagent, которые запускают сторонний бинарь другим именем (heplify,
+    # без "fss-capagent" где-либо в argv), всегда виделись бы как "not running",
+    # хотя systemd честно показывает unit активным. _sys_pkg_pids добавляет
+    # запасной путь через `systemctl show -p MainPID`, который от имени
+    # процесса не зависит.
+    pids=$(_sys_pkg_pids "$pkg" 2>/dev/null | paste -sd',' - 2>/dev/null)
     if [[ -n "$pids" ]]; then
         proc_status="running"
         ps_lines=$(ps -o pid=,args= -p "${pids//,/ }" 2>/dev/null | head -5 | sed 's/"/\\"/g' || true)
