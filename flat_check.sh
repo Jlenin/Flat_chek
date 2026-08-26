@@ -30,7 +30,7 @@
 # Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log рядом со скриптом
 #   (перезаписывается). Сборщик логов — в flat_check_2.sh.
 
-SCRIPT_VERSION="3.8.6"
+SCRIPT_VERSION="3.8.7"
 
 set -uo pipefail
 
@@ -2411,6 +2411,26 @@ _collector_wait_all_jobs() {
 : "${PUSH_INSECURE:=0}"
 : "${SHOW_REPOS_JSON:=0}"
 
+# Значение из "KEY=..." строки конфига: снимает окружающие кавычки и то, что
+# после них (инлайн-комментарий) — например,
+# SERVICE_NAME="fss-backend"    # см. service_names.md
+# наивный ${val%\"} снимает кавычку только если она в самом конце строки, а
+# ".*" в regex вызова уже захватил весь хвост вместе с комментарием, так что
+# без этой функции в SERVICE_NAME утекало 'fss-backend"    # см. ...'.
+_conf_strip_value() {
+    local raw="$1" val
+    if [[ "$raw" =~ ^[[:space:]]*\"(.*)$ ]]; then
+        val="${BASH_REMATCH[1]%%\"*}"
+    elif [[ "$raw" =~ ^[[:space:]]*\'(.*)$ ]]; then
+        val="${BASH_REMATCH[1]%%\'*}"
+    else
+        val="${raw%%#*}"
+        val="${val%"${val##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+    fi
+    printf '%s' "$val"
+}
+
 _json_load_config() {
     # Conf заполняет только пустые переменные: CLI и env имеют приоритет.
     local f="$1" line key val
@@ -2420,9 +2440,7 @@ _json_load_config() {
         [[ -z "${line//[[:space:]]/}" ]] && continue
         if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
             key="${BASH_REMATCH[1]}"
-            val="${BASH_REMATCH[2]}"
-            val="${val%\"}"; val="${val#\"}"
-            val="${val%\'}"; val="${val#\'}"
+            val="$(_conf_strip_value "${BASH_REMATCH[2]}")"
             case "$key" in
                 HOST_ID) [[ -z "${HOST_ID}" ]] && HOST_ID="$val" ;;
                 HOST_IP) [[ -z "${HOST_IP}" ]] && HOST_IP="$val" ;;
@@ -2788,7 +2806,21 @@ _json_collect_infra() {
     # важно: не ${!ALL_DEPENDS[@]+...} — при значениях с "-" bash считает это
     # косвенным раскрытием имён переменных (fps-server -> «недопустимое имя»)
     for dep in "${!ALL_DEPENDS[@]}"; do
-        status="unknown"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
+        status="not_installed"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
+        # Статус пакета/библиотеки — тот же источник истины, что и текстовый
+        # === Depends === (is_dep_installed/is_lib_available). Раньше здесь
+        # смотрели только на systemctl, поэтому все обычные пакеты и
+        # библиотеки (libc6, sudo, nodejs, …) всегда получали "unknown",
+        # даже будучи установленными — только реальные systemd-юниты (nginx,
+        # redis, …) когда-либо получали осмысленный статус.
+        if [[ "$dep" == *.so.* ]]; then
+            is_lib_available "$dep" 2>/dev/null && status="installed"
+        else
+            is_dep_installed "$dep" 2>/dev/null && status="installed"
+            ver=$(get_dep_version "$dep" 2>/dev/null || true)
+        fi
+        # Если это ещё и systemd-служба (nginx/mariadb/postgresql/redis/…) —
+        # уточняем состояние поверх "installed": активна она или нет.
         if command -v systemctl >/dev/null 2>&1; then
             if systemctl is-active --quiet "$dep" 2>/dev/null; then
                 status="active"
@@ -2796,7 +2828,6 @@ _json_collect_infra() {
                 status=$(systemctl is-active "$dep" 2>/dev/null || echo inactive)
             fi
         fi
-        ver=$(get_dep_version "$dep" 2>/dev/null || true)
         [[ $first -eq 1 ]] || out+=","
         first=0
         out+=$(printf '{"service_name":"%s","status":"%s","version":"%s","port_open":"%s","required_by":"%s"}' \
@@ -2968,6 +2999,17 @@ push_health_json() {
         local attempt=0 ok=0 curl_errfile="/tmp/flat_push_err.$$"
         while [[ $attempt -le ${PUSH_RETRIES:-2} ]]; do
             attempt=$((attempt + 1))
+            # Логируем реальную вызываемую команду (токен маскируем), а не
+            # реконструкцию "по мотивам" — чтобы можно было взять и повторить
+            # руками (curl -v ...) без гадания, какие флаги реально ушли.
+            local curl_display="curl -sS -o <body> -w '%{http_code}'"
+            [[ ${#curl_insecure[@]} -gt 0 ]] && curl_display+=" ${curl_insecure[*]}"
+            curl_display+=" --connect-timeout ${PUSH_CONNECT_TIMEOUT:-5} --max-time ${PUSH_MAX_TIME:-30}"
+            curl_display+=" -X POST '$url' -H 'Content-Type: application/json'"
+            curl_display+=" -H 'X-Flat-Host-Id: ${HOST_ID}' -H 'X-Flat-Service-Name: ${SERVICE_NAME}'"
+            [[ -n "$token" ]] && curl_display+=" -H '${auth_hdr} ***'"
+            curl_display+=" --data-binary <json>"
+            log_debug "push: attempt $attempt → run: $curl_display"
             http_code=$(curl -sS -o /tmp/flat_push_body.$$ -w '%{http_code}' \
                 "${curl_insecure[@]}" \
                 --connect-timeout "${PUSH_CONNECT_TIMEOUT:-5}" \
@@ -2981,7 +3023,7 @@ push_health_json() {
             [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code="000"
             # http=000 сам по себе не говорит, ПОЧЕМУ (DNS/refused/timeout/TLS) —
             # curl обычно пишет это в stderr, раньше просто выбрасывался в /dev/null.
-            [[ -s "$curl_errfile" ]] && log_debug "push: curl → $url: $(tr '\n' ' ' < "$curl_errfile" 2>/dev/null)"
+            [[ -s "$curl_errfile" ]] && log_debug "push: attempt $attempt → curl said: $(tr '\n' ' ' < "$curl_errfile" 2>/dev/null)"
             rm -f "$curl_errfile" 2>/dev/null
             if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
                 info "push: OK $http_code → $url"
