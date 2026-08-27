@@ -49,30 +49,32 @@ parse_args "$@"
 
 # --- Опциональные слои — по уже разобранным флагам, ДО диспетчера.
 #
-# ЛЮБОЙ --selftest (simple тоже, не только extended) обязан подключать
-# lib/agent: self-test — это проверка целостности всей ПОСТАВКИ, а не только
-# режима, с которым его запустили — lib/core/11_selftest.sh проверяет
-# build_health_json/push_health_json/_json_collect_infra даже на уровне
-# "simple" (см. историю: эти проверки унаследованы от flat_check.sh, где всё
-# было одним файлом и agent-функции существовали всегда).
+# ЛЮБОЙ --selftest (simple тоже, не только extended) и --dev подключают ОБА
+# опциональных слоя: self-test — это проверка целостности всей ПОСТАВКИ, а не
+# только режима, с которым его запустили. lib/core/11_selftest.sh проверяет
+# agent-функции (build_health_json/push_health_json/_json_collect_infra) уже
+# на уровне "simple", а extended дополнительно гоняет проверки lib/logging
+# (парсеры времени, resource-gate, seek+chunk extract) — см. историю: обе
+# ветки унаследованы из версий, где всё было одним файлом и эти функции
+# существовали всегда.
 #
-# lib/logging НЕ подключаем на --selftest simple/extended сейчас: текущий
-# lib/core/11_selftest.sh портирован из flat_check.sh (health-only, без
-# сборщика логов) и не проверяет ничего из lib/logging. Когда в фазе 3
-# появится lib/logging, self-test extended нужно будет обогатить проверками
-# из flat_check_2.sh (parse_time_point/parse_duration/_collector_wait_slot/
-# seek+chunk) — тогда же этот флаг здесь надо будет добавить и для extended.
+# -i (мастер) тоже подключает оба слоя заранее: сам мастер решает уже ПОСЛЕ
+# старта, в какой режим идти (health / -log / selftest) — если бы agent/
+# logging подключались по флагам ДО входа в мастер, третий пункт меню
+# мастера (самотест) остался бы без build_health_json, а второй (сбор логов)
+# — без lib/logging.
 NEED_LOGGING=0
 NEED_AGENT=0
 [[ $MODE_LOG -eq 1 || $MODE_INTERACTIVE -eq 1 ]] && NEED_LOGGING=1
-[[ $OUTPUT_JSON -eq 1 || $DO_PUSH -eq 1 || -n "${CONFIG_FILE:-}" ]] && NEED_AGENT=1
+[[ -n "${SELFTEST_MODE:-}" || $MODE_DEV -eq 1 ]] && NEED_LOGGING=1
+[[ $OUTPUT_JSON -eq 1 || $DO_PUSH -eq 1 || -n "${CONFIG_FILE:-}" || $MODE_INTERACTIVE -eq 1 ]] && NEED_AGENT=1
 [[ -n "${SELFTEST_MODE:-}" || $MODE_DEV -eq 1 ]] && NEED_AGENT=1
 
 if [[ $NEED_LOGGING -eq 1 ]]; then
     if [[ -d "$LIB_DIR/logging" ]]; then
         for f in "$LIB_DIR"/logging/*.sh; do source "$f"; done
     else
-        echo "[FAIL] запрошен режим сборщика логов (-i/-log/--dev), но lib/logging ещё не реализован в этой сборке" >&2
+        echo "[FAIL] запрошен режим сборщика логов/мастера/самотеста (-i/-log/--dev/--selftest), но lib/logging отсутствует в этой сборке" >&2
         exit 1
     fi
 fi
@@ -80,7 +82,7 @@ if [[ $NEED_AGENT -eq 1 ]]; then
     if [[ -d "$LIB_DIR/agent" ]]; then
         for f in "$LIB_DIR"/agent/*.sh; do source "$f"; done
     else
-        echo "[FAIL] запрошен JSON/push agent (--json/--push/--config/--dev), но lib/agent ещё не реализован в этой сборке" >&2
+        echo "[FAIL] запрошен JSON/push agent/мастер/самотест (--json/--push/--config/--dev/--selftest/-i), но lib/agent отсутствует в этой сборке" >&2
         exit 1
     fi
 fi
