@@ -1,5 +1,117 @@
-# Модуль: 02_json_build.sh
 # Слой: agent
+# Подключается при --json/--push/--config/--dev/любом --selftest/-i.
+# Конфиг агента, сборка health JSON v2, отправка на PUSH_URLS.
+#
+# Разделы этого файла (в порядке подключения; искать по "РАЗДЕЛ: <имя>"):
+#   01_config                Дефолты переменных JSON/push-агента (не затирают уже заданные CLI/env), разбор конфиг-файла (--config FILE) с безопасным снятием кавычек/инлайн-комментариев.
+#   02_json_build            Сборка полного health JSON v2 (build_health_json) и его частей — идентификация хоста, экранирование строк, снимок одного пакета, снимок системных метрик, infrastructure/depends, список репозиториев.
+#   03_push                  Отправка собранного JSON на PUSH_URLS (http/https, с ретраями и диагностикой curl) и верхнеуровневый диспетчер run_health_json(), вызываемый из lib/core.sh (раздел 09_argv) при --json/--push.
+#
+# До объединения (см. git-историю фазы 5) это было 3 отдельных
+# файлов lib/agent/NN_name.sh — слиты в один по итогам код-ревью: три с половиной
+# десятка файлов на весь проект оказались избыточной дробностью для инструмента,
+# который должен быть понятен человеку без глубокого знания bash. Внутренние
+# границы (заголовки "РАЗДЕЛ:") и порядок — те же самые.
+# ==========================================================================
+# РАЗДЕЛ: 01_config
+# ==========================================================================
+# Назначение: Дефолты переменных JSON/push-агента (не затирают уже заданные CLI/env),
+#   разбор конфиг-файла (--config FILE) с безопасным снятием кавычек/инлайн-комментариев.
+# Публичные функции: _json_load_config(file), _conf_strip_value(raw)
+# Зависит от: lib/core (переменные HOST_ID/HOST_IP/SERVICE_NAME/... уже объявлены
+#   в lib/core.sh (раздел 00_globals); здесь только достраиваются PUSH_*-дефолты)
+# Не зависит от: разделов 02_json_build/03_push ниже — идёт первым в этом файле
+# Side effects: читает файл конфига с диска; заполняет глобальные переменные
+#   (только если они ещё пустые — CLI и env имеют приоритет)
+#
+# Источник: перенесено без изменений логики из agent/json_report.inc.sh (строки 5-85).
+
+# Дефолты (не затираем значения из section 0 / окружения)
+
+: "${OUTPUT_JSON:=0}"
+: "${DO_PUSH:=0}"
+: "${CONFIG_FILE:=}"
+: "${SINGLE_PKG:=}"
+: "${FILTER_PRODUCT:=}"
+: "${HOST_ID:=}"
+: "${HOST_IP:=}"
+: "${SERVICE_NAME:=}"
+: "${PUSH_URLS:=${PUSH_URL:-}}"
+: "${PUSH_TOKEN:=}"
+: "${PUSH_TOKENS:=}"
+: "${PUSH_AUTH_HEADER:=Authorization: Bearer}"
+: "${PUSH_CONNECT_TIMEOUT:=5}"
+: "${PUSH_MAX_TIME:=30}"
+: "${PUSH_RETRIES:=2}"
+: "${PUSH_INSECURE:=0}"
+: "${SHOW_REPOS_JSON:=0}"
+
+# Значение из "KEY=..." строки конфига: снимает окружающие кавычки и то, что
+# после них (инлайн-комментарий) — например,
+# SERVICE_NAME="fss-backend"    # см. service_names.md
+# наивный ${val%\"} снимает кавычку только если она в самом конце строки, а
+# ".*" в regex вызова уже захватил весь хвост вместе с комментарием, так что
+# без этой функции в SERVICE_NAME утекало 'fss-backend"    # см. ...'.
+_conf_strip_value() {
+    local raw="$1" val
+    if [[ "$raw" =~ ^[[:space:]]*\"(.*)$ ]]; then
+        val="${BASH_REMATCH[1]%%\"*}"
+    elif [[ "$raw" =~ ^[[:space:]]*\'(.*)$ ]]; then
+        val="${BASH_REMATCH[1]%%\'*}"
+    else
+        val="${raw%%#*}"
+        val="${val%"${val##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+    fi
+    printf '%s' "$val"
+}
+
+_json_load_config() {
+    # Conf заполняет только пустые переменные: CLI и env имеют приоритет.
+    local f="$1" line key val
+    [[ -n "$f" && -f "$f" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="$(_conf_strip_value "${BASH_REMATCH[2]}")"
+            case "$key" in
+                HOST_ID) [[ -z "${HOST_ID}" ]] && HOST_ID="$val" ;;
+                HOST_IP) [[ -z "${HOST_IP}" ]] && HOST_IP="$val" ;;
+                SERVICE_NAME) [[ -z "${SERVICE_NAME}" ]] && SERVICE_NAME="$val" ;;
+                PUSH_URLS) [[ -z "${PUSH_URLS}" ]] && PUSH_URLS="$val" ;;
+                PUSH_URL) [[ -z "${PUSH_URL:-}" ]] && PUSH_URL="$val" ;;
+                PUSH_TOKEN) [[ -z "${PUSH_TOKEN}" ]] && PUSH_TOKEN="$val" ;;
+                PUSH_TOKENS) [[ -z "${PUSH_TOKENS}" ]] && PUSH_TOKENS="$val" ;;
+                PUSH_AUTH_HEADER) [[ -z "${PUSH_AUTH_HEADER}" ]] && PUSH_AUTH_HEADER="$val" ;;
+                PACKAGES) [[ -z "${PACKAGES}" ]] && PACKAGES="$val" ;;
+                PRODUCT) [[ -z "${PRODUCT:-}" ]] && PRODUCT="$val" ;;
+                PUSH_CONNECT_TIMEOUT|PUSH_MAX_TIME|PUSH_RETRIES)
+                    [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
+                    ;;
+                PUSH_INSECURE)
+                    [[ "$val" =~ ^[01]$ ]] && PUSH_INSECURE="$val"
+                    ;;
+                COLLECTOR_JOBS|JOBS)
+                    if [[ "$val" =~ ^[0-9]+$ && "${COLLECTOR_JOBS:-0}" -eq 0 ]]; then
+                        COLLECTOR_JOBS="$val"
+                    fi
+                    ;;
+            esac
+        fi
+    done < "$f"
+    if [[ -z "$PUSH_URLS" && -n "${PUSH_URL:-}" ]]; then
+        PUSH_URLS="$PUSH_URL"
+    fi
+    if [[ -n "${PRODUCT:-}" && -z "$FILTER_PRODUCT" ]]; then
+        FILTER_PRODUCT="$PRODUCT"
+    fi
+}
+
+# ==========================================================================
+# РАЗДЕЛ: 02_json_build
+# ==========================================================================
 # Назначение: Сборка полного health JSON v2 (build_health_json) и его частей —
 #   идентификация хоста, экранирование строк, снимок одного пакета, снимок
 #   системных метрик, infrastructure/depends, список репозиториев.
@@ -30,6 +142,7 @@
 # nginx/postgresql/mariadb выдуманные пути /opt/flat/<pkg> со статусом
 # "missing" вместо честного "n/a" (эти пакеты не живут под /opt/flat). Взята
 # исправленная версия из flat_check.sh/flat_check_2.sh (идентична в обоих).
+
 
 _json_detect_host_ip() {
     local ip
@@ -541,4 +654,111 @@ _json_print() {
         fi
     fi
     printf '%s\n' "$body"
+}
+
+# ==========================================================================
+# РАЗДЕЛ: 03_push
+# ==========================================================================
+# Назначение: Отправка собранного JSON на PUSH_URLS (http/https, с ретраями
+#   и диагностикой curl) и верхнеуровневый диспетчер run_health_json(),
+#   вызываемый из lib/core.sh (раздел 09_argv) при --json/--push.
+# Публичные функции: push_health_json(body), run_health_json()
+# Зависит от: 01_config.sh (_json_load_config), 02_json_build.sh
+#   (build_health_json, _json_print, _json_ensure_identity), lib/core
+#   (warn/info/fail/log_debug)
+# Не зависит от: lib/logging
+# Side effects: запускает curl (сетевые запросы наружу), пишет временные файлы
+#   /tmp/flat_push_body.$$ и /tmp/flat_push_err.$$ (удаляются сразу после использования)
+#
+# Источник: перенесено без изменений логики из agent/json_report.inc.sh
+#   (push_health_json — строки 576-650; run_health_json — строки 668-679).
+
+# Отправка JSON на все URL из PUSH_URLS (http/https).
+# PUSH_INSECURE=1 — не проверять TLS-сертификат (curl -k), для https с self-signed.
+
+push_health_json() {
+    local body="$1"
+    local urls=() tokens=() url token i rc=0 http_code
+    local auth_hdr="${PUSH_AUTH_HEADER:-Authorization: Bearer}"
+    local curl_insecure=()
+    [[ "${PUSH_INSECURE:-0}" == "1" ]] && curl_insecure=(-k)
+
+    _json_ensure_identity
+    [[ -n "$PUSH_URLS" ]] || { warn "push: PUSH_URLS пуст — некуда отправлять"; return 1; }
+    command -v curl >/dev/null 2>&1 || { warn "push: curl не найден"; return 1; }
+
+    # split URLs
+    PUSH_URLS="${PUSH_URLS//,/ }"
+    read -ra urls <<< "$PUSH_URLS"
+    if [[ -n "$PUSH_TOKENS" ]]; then
+        PUSH_TOKENS="${PUSH_TOKENS//,/ }"
+        read -ra tokens <<< "$PUSH_TOKENS"
+    fi
+
+    i=0
+    for url in "${urls[@]}"; do
+        [[ -z "$url" ]] && continue
+        if [[ ! "$url" =~ ^https?:// ]]; then
+            warn "push: пропуск URL без http/https: $url"
+            rc=1
+            continue
+        fi
+        token="${PUSH_TOKEN:-}"
+        [[ -n "${tokens[$i]:-}" ]] && token="${tokens[$i]}"
+        i=$((i + 1))
+
+        local attempt=0 ok=0 curl_errfile="/tmp/flat_push_err.$$"
+        while [[ $attempt -le ${PUSH_RETRIES:-2} ]]; do
+            attempt=$((attempt + 1))
+            # Логируем реальную вызываемую команду (токен маскируем), а не
+            # реконструкцию "по мотивам" — чтобы можно было взять и повторить
+            # руками (curl -v ...) без гадания, какие флаги реально ушли.
+            local curl_display="curl -sS -o <body> -w '%{http_code}'"
+            [[ ${#curl_insecure[@]} -gt 0 ]] && curl_display+=" ${curl_insecure[*]}"
+            curl_display+=" --connect-timeout ${PUSH_CONNECT_TIMEOUT:-5} --max-time ${PUSH_MAX_TIME:-30}"
+            curl_display+=" -X POST '$url' -H 'Content-Type: application/json'"
+            curl_display+=" -H 'X-Flat-Host-Id: ${HOST_ID}' -H 'X-Flat-Service-Name: ${SERVICE_NAME}'"
+            [[ -n "$token" ]] && curl_display+=" -H '${auth_hdr} ***'"
+            curl_display+=" --data-binary <json>"
+            log_debug "push: attempt $attempt → run: $curl_display"
+            http_code=$(curl -sS -o /tmp/flat_push_body.$$ -w '%{http_code}' \
+                "${curl_insecure[@]}" \
+                --connect-timeout "${PUSH_CONNECT_TIMEOUT:-5}" \
+                --max-time "${PUSH_MAX_TIME:-30}" \
+                -X POST "$url" \
+                -H "Content-Type: application/json" \
+                -H "X-Flat-Host-Id: ${HOST_ID}" \
+                -H "X-Flat-Service-Name: ${SERVICE_NAME}" \
+                ${token:+-H "$auth_hdr $token"} \
+                --data-binary "$body" 2>"$curl_errfile") || true
+            [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code="000"
+            # http=000 сам по себе не говорит, ПОЧЕМУ (DNS/refused/timeout/TLS) —
+            # curl обычно пишет это в stderr, раньше просто выбрасывался в /dev/null.
+            [[ -s "$curl_errfile" ]] && log_debug "push: attempt $attempt → curl said: $(tr '\n' ' ' < "$curl_errfile" 2>/dev/null)"
+            rm -f "$curl_errfile" 2>/dev/null
+            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+                info "push: OK $http_code → $url"
+                ok=1
+                break
+            fi
+            log_debug "push: attempt $attempt → $url http=$http_code"
+            sleep 1
+        done
+        rm -f /tmp/flat_push_body.$$ 2>/dev/null
+        [[ $ok -eq 1 ]] || { warn "push: FAIL → $url (last http=$http_code)"; rc=1; }
+    done
+    return "$rc"
+}
+
+run_health_json() {
+    local body
+    [[ -n "$CONFIG_FILE" ]] && _json_load_config "$CONFIG_FILE"
+    body=$(build_health_json) || { fail "не удалось собрать JSON"; return 1; }
+    if [[ "$DO_PUSH" -eq 1 ]]; then
+        # при --push JSON тоже можно показать через --json; иначе только push
+        [[ "$OUTPUT_JSON" -eq 1 ]] && _json_print "$body"
+        push_health_json "$body"
+        return $?
+    fi
+    _json_print "$body"
 }

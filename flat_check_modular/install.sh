@@ -198,7 +198,7 @@ if [[ $DRY_RUN -eq 0 && "$(id -u)" -ne 0 ]]; then
     fi
 fi
 [[ -f "$SRC_TREE/flat_check" ]] || die "не найден $SRC_TREE/flat_check (--src должен указывать на flat_check_modular/)"
-[[ -d "$SRC_TREE/lib/core" ]] || die "не найден $SRC_TREE/lib/core"
+[[ -f "$SRC_TREE/lib/core.sh" ]] || die "не найден $SRC_TREE/lib/core.sh"
 [[ -f "$SRC_CONF" ]] || die "не найден $SRC_CONF"
 
 if [[ -z "$SERVICE_NAME" ]]; then
