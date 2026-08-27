@@ -1,12 +1,20 @@
 # Модуль: 07_collector.sh
 # Слой: logging
 # Назначение: Процессы сборщика логов: online tail -F, обработка сигналов (INT/TERM/Enter), безопасное удаление рабочих каталогов только по шаблону архива, resource-gate воркеров сбора.
-# Публичные функции: run_log_collection()-хелперы, обработчики сигналов, безопасная очистка рабочего каталога
+# Публичные функции: run_log_collection()-хелперы, обработчики сигналов,
+#   безопасная очистка рабочего каталога, _collector_should_stop() (сознательно
+#   переопределяет одноимённый стаб lib/core/06_resource_gate.sh)
 # Зависит от: 06_extract_apply.sh, lib/core (resource-gate), 00_tunables.sh
 # Не зависит от: 08_online_offline.sh — верхнеуровневый режим использует эти хелперы
 # Side effects: запускает tail -F/tcpdump в фоне, ловит сигналы, удаляет каталоги (только по шаблону YYYY.MM.DD_HH-MM_*)
 #
-# Источник: перенесено без изменений логики из flat_check_2.sh (строки 6364-7141).
+# Источник: перенесено без изменений логики из flat_check_2.sh (строки 6364-7141),
+#   ЗА ИСКЛЮЧЕНИЕМ _collector_max_jobs/_get_mem_usage_percent/_get_cpu_usage_percent/
+#   _collector_resources_ok/_collector_wait_slot/_collector_wait_all_jobs — в
+#   оригинале они физически лежали внутри той же секции 9 (значит, при первом
+#   переносе секции целиком удвоились бы с lib/core/06_resource_gate.sh, где эти
+#   же функции уже есть байт-в-байт под тем же именем). Найдено и убрано при
+#   код-ревью фазы 5 — используется версия из core (грузится раньше logging).
 
 # --- 9. Процессы сборщика / сигналы / безопасное удаление -----------------------
 # Root: удалять только рабочие директории, совпадающие с шаблоном имени ARCHIVE внутри COLLECTOR_DIR.
@@ -103,6 +111,18 @@ _on_collect_abort() {
     COLLECTOR_ABORTED=1
     cleanup_on_abort
     exit 130
+}
+
+# Переопределяет стаб lib/core/06_resource_gate.sh (там — «никогда не
+# останавливаться», для health-check без lib/logging). Здесь — настоящая
+# проверка: обработчики сигналов выше — единственное место, где
+# COLLECTOR_ABORTED/COLLECTOR_TIMEOUT_STOP вообще выставляются, поэтому и
+# реальная реализация живёт рядом с ними. lib/core грузится раньше
+# lib/logging, так что эта версия замещает стаб везде, где lib/logging
+# подключён (сборщик логов, мастер, самотест) — см. комментарий в
+# lib/core/06_resource_gate.sh.
+_collector_should_stop() {
+    [[ "${COLLECTOR_ABORTED:-0}" -eq 1 || "${COLLECTOR_TIMEOUT_STOP:-0}" -eq 1 ]]
 }
 
 cleanup() {
@@ -292,20 +312,13 @@ start_tail_for_dir() {
     [[ "$started" -eq 0 ]] && warn "Failed to start tail for ${display_label} ($src_dir)"
 }
 
-_collector_max_jobs() {
-    local n cores
-    if [[ "${COLLECTOR_JOBS:-0}" -gt 0 ]]; then
-        echo "$COLLECTOR_JOBS"
-        return 0
-    fi
-    cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-    [[ -z "$cores" || "$cores" -lt 1 ]] && cores=4
-    # Лимит воркеров по умолчанию от числа ядер; запуск всё равно ограничен общесистемными лимитами RESOURCE_*
-    n=$(( cores * ${RESOURCE_CPU_LIMIT:-80} / 100 ))
-    [[ "$n" -lt 1 ]] && n=1
-    [[ "$n" -gt 32 ]] && n=32
-    echo "$n"
-}
+# _collector_max_jobs() и остальной resource-gate (_get_mem_usage_percent,
+# _get_cpu_usage_percent, _collector_resources_ok, _collector_wait_slot,
+# _collector_wait_all_jobs) НЕ дублируются здесь — это lib/core/06_resource_gate.sh,
+# которая грузится раньше lib/logging и используется как есть (найдено и
+# убрано дублирование при код-ревью фазы 5: в исходном flat_check_2.sh эти
+# функции физически лежали внутри той же секции "9. Процессы сборщика", что
+# и остальной этот файл, и при переносе секции целиком попали сюда повторно).
 
 # Вложенный пул (chunk-seek внутри file-worker): не размножать сверх host-gate.
 # FLAT_INNER_MAX_JOBS задаёт родитель (file-pool); иначе — половина outer max.
@@ -319,137 +332,6 @@ _collector_inner_max_jobs() {
     [[ "$n" -gt 4 ]] && n=$(( (n + 1) / 2 ))
     [[ "$n" -lt 1 ]] && n=1
     echo "$n"
-}
-
-# Процент использованной памяти по всему хосту (100 - MemAvailable/MemTotal*100)
-_get_mem_usage_percent() {
-    local pct
-    # Предпочитать MemAvailable; запасной вариант MemFree (в Git Bash / нестандартных ядрах может не быть Available)
-    pct=$(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} /MemFree:/ {f=$2} END {
-        if (t+0 <= 0) { print 0; exit }
-        if (a+0 <= 0) a = f
-        printf "%d", int((t - a) * 100 / t);
-    }' /proc/meminfo 2>/dev/null)
-    echo "${pct:-0}"
-}
-
-# Процент занятости CPU системы через дельту /proc/stat (первый вызов инициализирует, возвращает 0)
-_get_cpu_usage_percent() {
-    local user nice system idle iowait irq softirq steal guest guest_nice
-    local idle_all non_idle total diff_idle diff_total pct
-    # shellcheck disable=SC2034
-    read -r _cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat 2>/dev/null || {
-        echo 0
-        return 0
-    }
-    idle_all=$((idle + iowait))
-    non_idle=$((user + nice + system + irq + softirq + steal))
-    total=$((idle_all + non_idle))
-    if [[ -z "${_CPU_PREV_TOTAL:-}" || "${_CPU_PREV_TOTAL}" -eq 0 ]]; then
-        _CPU_PREV_IDLE=$idle_all
-        _CPU_PREV_TOTAL=$total
-        echo 0
-        return 0
-    fi
-    diff_idle=$((idle_all - _CPU_PREV_IDLE))
-    diff_total=$((total - _CPU_PREV_TOTAL))
-    _CPU_PREV_IDLE=$idle_all
-    _CPU_PREV_TOTAL=$total
-    if [[ "$diff_total" -le 0 ]]; then
-        echo 0
-        return 0
-    fi
-    pct=$(( (100 * (diff_total - diff_idle)) / diff_total ))
-    [[ "$pct" -lt 0 ]] && pct=0
-    [[ "$pct" -gt 100 ]] && pct=100
-    echo "$pct"
-}
-
-# Истина, если CPU и память всего хоста в пределах настроенных лимитов
-_collector_resources_ok() {
-    local cpu mem cpu_lim mem_lim
-    cpu_lim=${RESOURCE_CPU_LIMIT:-80}
-    mem_lim=${RESOURCE_MEM_LIMIT:-80}
-    mem=$(_get_mem_usage_percent)
-    [[ "$mem" =~ ^[0-9]+$ ]] || mem=0
-    if [[ "$mem" -ge "$mem_lim" ]]; then
-        return 1
-    fi
-    cpu=$(_get_cpu_usage_percent)
-    [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
-    # Первая проба /proc/stat всегда возвращает 0 — всегда берём вторую пробу
-    if [[ "$cpu" -eq 0 ]]; then
-        sleep 0.2
-        cpu=$(_get_cpu_usage_percent)
-        [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
-    fi
-    [[ "$cpu" -lt "$cpu_lim" ]]
-}
-
-# Ждать свободный слот для задачи. Общесистемный лимит придерживает *дополнительные*
-# воркеры, когда CPU/MEM ≥ лимита, но никогда не блокирует навечно:
-#   - 0 запущенных воркеров → всегда разрешить 1 (гарантия прогресса; избегаем зависания на загруженных хостах)
-#   - ≥1 запущено → ждать запаса ресурсов или завершения задачи, до RESOURCE_WAIT_MAX
-_collector_wait_slot() {
-    local max_jobs="$1" pid alive
-    local waited=0
-    local max_wait="${RESOURCE_WAIT_MAX:-120}"
-    local gate_warned=0
-    # Инициализируем счётчик CPU
-    _get_cpu_usage_percent >/dev/null
-    while true; do
-        alive=()
-        for pid in "${COLLECTOR_JOB_PIDS[@]+"${COLLECTOR_JOB_PIDS[@]}"}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                alive+=("$pid")
-            else
-                wait "$pid" 2>/dev/null || true
-            fi
-        done
-        COLLECTOR_JOB_PIDS=("${alive[@]+"${alive[@]}"}")
-
-        if [[ ${#COLLECTOR_JOB_PIDS[@]} -lt "$max_jobs" ]]; then
-            if _collector_resources_ok; then
-                return 0
-            fi
-            # Воркеров пока нет → нужно запустить хотя бы один, иначе deadlock на загруженных хостах (MEM часто ≥80%)
-            if [[ ${#COLLECTOR_JOB_PIDS[@]} -eq 0 ]]; then
-                if [[ "$gate_warned" -eq 0 ]]; then
-                    info "host CPU/MEM at/above ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}% — starting 1 worker (avoid hang)"
-                    gate_warned=1
-                fi
-                return 0
-            fi
-            # Воркеры уже есть: ждём снижения нагрузки или завершения задачи
-            if [[ "$waited" -ge "$max_wait" ]]; then
-                if [[ "$gate_warned" -eq 0 ]]; then
-                    info "host load gate wait ${max_wait}s — allowing another worker"
-                    gate_warned=1
-                fi
-                return 0
-            fi
-        fi
-
-        _collector_should_stop && return 1
-
-        if [[ ${#COLLECTOR_JOB_PIDS[@]} -gt 0 ]]; then
-            if ! wait -n 2>/dev/null; then
-                sleep 0.3
-                waited=$((waited + 1))
-            fi
-        else
-            sleep 0.3
-            waited=$((waited + 1))
-        fi
-    done
-}
-
-_collector_wait_all_jobs() {
-    local pid
-    for pid in "${COLLECTOR_JOB_PIDS[@]+"${COLLECTOR_JOB_PIDS[@]}"}"; do
-        wait "$pid" 2>/dev/null || true
-    done
-    COLLECTOR_JOB_PIDS=()
 }
 
 _collector_kill_jobs() {

@@ -63,9 +63,14 @@ parse_args "$@"
 # logging подключались по флагам ДО входа в мастер, третий пункт меню
 # мастера (самотест) остался бы без build_health_json, а второй (сбор логов)
 # — без lib/logging.
+#
+# --list-targets тоже требует lib/logging даже без -log: dispatch_main
+# (lib/core/09_argv.sh) вызывает list_log_targets() на основании LIST_TARGETS
+# в одиночку, до какой-либо проверки MODE_LOG (найдено при код-ревью фазы 5 —
+# `./flat_check --list-targets` без `-log` падал "command not found").
 NEED_LOGGING=0
 NEED_AGENT=0
-[[ $MODE_LOG -eq 1 || $MODE_INTERACTIVE -eq 1 ]] && NEED_LOGGING=1
+[[ $MODE_LOG -eq 1 || $MODE_INTERACTIVE -eq 1 || $LIST_TARGETS -eq 1 ]] && NEED_LOGGING=1
 [[ -n "${SELFTEST_MODE:-}" || $MODE_DEV -eq 1 ]] && NEED_LOGGING=1
 [[ $OUTPUT_JSON -eq 1 || $DO_PUSH -eq 1 || -n "${CONFIG_FILE:-}" || $MODE_INTERACTIVE -eq 1 ]] && NEED_AGENT=1
 [[ -n "${SELFTEST_MODE:-}" || $MODE_DEV -eq 1 ]] && NEED_AGENT=1
