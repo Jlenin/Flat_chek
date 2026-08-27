@@ -1,0 +1,77 @@
+#!/bin/bash
+# flat_check — модульная версия FLAT/FCS health check + log collector + agent.
+#
+# Это НЕ третий монолит: реализация той же логики, что в flat_check.sh
+# (health, v3.8.10) и flat_check_2.sh (health + log collector, v3.11.10),
+# но разложенная по независимым модулям в lib/ вместо одного файла на
+# 3-9 тысяч строк. Интерфейс командной строки не менялся ни на один флаг
+# (см. lib/core/09_argv.sh) — то, что раньше требовало flat_check.sh ИЛИ
+# flat_check_2.sh, здесь делает один и тот же исполняемый файл: core
+# грузится всегда, lib/logging и lib/agent подключаются только когда
+# реально нужны (по флагам), а не «на всякий случай».
+#
+# Подробности слоёв, порядка подключения и почему именно так — см.
+# ARCHITECTURE.md рядом с этим файлом.
+#
+# Использование: см. `./flat_check -h` (или ARCHITECTURE.md/README.md).
+
+set -uo pipefail
+
+SCRIPT_VERSION="1.0.0"
+
+# SCRIPT_DIR/SCRIPT_NAME обязаны быть вычислены ЗДЕСЬ, в самой точке входа —
+# не в lib/core/00_globals.sh, потому что там ${BASH_SOURCE[0]} указывал бы
+# на путь lib-файла, а не на flat_check. lib/core/00_globals.sh уважает уже
+# выставленные значения (": ${SCRIPT_DIR:=...}") и не перезаписывает их.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+[[ -z "$SCRIPT_DIR" ]] && SCRIPT_DIR="$(pwd)"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+
+LIB_DIR="$SCRIPT_DIR/lib"
+
+if [[ ! -d "$LIB_DIR/core" ]]; then
+    echo "[FAIL] lib/core не найден рядом с $SCRIPT_NAME (ожидался $LIB_DIR/core) — повреждённая установка?" >&2
+    exit 1
+fi
+
+# Пустой glob не должен подставляться буквально (lib/agent, lib/logging
+# в фазе 1 ещё не существуют — появятся в фазах 2-3).
+shopt -s nullglob
+
+# --- Core: грузится всегда, в этом порядке (числовой префикс = порядок) ---
+for f in "$LIB_DIR"/core/*.sh; do
+    # shellcheck disable=SC1090
+    source "$f"
+done
+
+# --- Разбор флагов (сам по себе НИЧЕГО не запускает и не подключает) ---
+parse_args "$@"
+
+# --- Опциональные слои — по уже разобранным флагам, ДО диспетчера.
+# --dev и --selftest extended обязаны проверить оба слоя разом (extended
+# self-test прогоняет agent-функции, см. lib/core/11_selftest.sh).
+NEED_LOGGING=0
+NEED_AGENT=0
+[[ $MODE_LOG -eq 1 || $MODE_INTERACTIVE -eq 1 ]] && NEED_LOGGING=1
+[[ "${SELFTEST_MODE:-}" == "extended" || $MODE_DEV -eq 1 ]] && NEED_LOGGING=1
+[[ $OUTPUT_JSON -eq 1 || $DO_PUSH -eq 1 || -n "${CONFIG_FILE:-}" ]] && NEED_AGENT=1
+[[ "${SELFTEST_MODE:-}" == "extended" || $MODE_DEV -eq 1 ]] && NEED_AGENT=1
+
+if [[ $NEED_LOGGING -eq 1 ]]; then
+    if [[ -d "$LIB_DIR/logging" ]]; then
+        for f in "$LIB_DIR"/logging/*.sh; do source "$f"; done
+    else
+        echo "[FAIL] запрошен режим сборщика логов (-i/-log/--dev), но lib/logging ещё не реализован в этой сборке" >&2
+        exit 1
+    fi
+fi
+if [[ $NEED_AGENT -eq 1 ]]; then
+    if [[ -d "$LIB_DIR/agent" ]]; then
+        for f in "$LIB_DIR"/agent/*.sh; do source "$f"; done
+    else
+        echo "[FAIL] запрошен JSON/push agent (--json/--push/--config/--dev), но lib/agent ещё не реализован в этой сборке" >&2
+        exit 1
+    fi
+fi
+
+dispatch_main "$@"
