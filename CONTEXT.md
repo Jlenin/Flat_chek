@@ -113,6 +113,7 @@ sudo ./agent/install_flat_check.sh \
 - push: код ответа curl не дублируется в `000000`.
 - install: без root можно ставить в свой префикс (`--bin/--conf-dir/--skip-cron`); system-wide — через `sudo`.
 - `agent/reinstall_flat_check.sh` / `agent/uninstall_flat_check.sh` — см. п.17 выше; `-y`/`-n` (или `--yes`/`--no`) отвечают за судьбу конфига без интерактивного вопроса.
+- `_json_collect_pkg` (блок `directories`): не пропускал инфраструктурные пакеты (nginx/postgresql/mariadb) через `_is_infrastructure_pkg()` — показывал бы выдуманные `/opt/flat/<pkg>` со статусом `"missing"` вместо `"n/a"`. Этот фикс уже был в `flat_check.sh`/`flat_check_2.sh`, но не был перенесён в `agent/json_report.inc.sh` — расхождение найдено при разработке `flat_check_modular/` (см. п.24), синхронизировано.
 
 ---
 

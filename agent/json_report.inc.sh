@@ -179,16 +179,23 @@ _json_collect_pkg() {
         enabled=$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)
     fi
 
-    # directories
-    if [[ -d "$opt_path" ]]; then
-        opt_status="ok"
-        opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null || echo "")
-    fi
-    if [[ -d "$log_path" ]]; then
-        log_status="ok"
-        log_owner=$(stat -c '%U:%G' "$log_path" 2>/dev/null || echo "")
-    elif [[ "$status" == "installed" ]]; then
-        log_status="missing"
+    # directories (FLAT layout; Infrastructure — системные пакеты без /opt/flat)
+    if _is_infrastructure_pkg "$pkg"; then
+        opt_status="n/a"
+        log_status="n/a"
+        opt_path=""
+        log_path=""
+    else
+        if [[ -d "$opt_path" ]]; then
+            opt_status="ok"
+            opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null || echo "")
+        fi
+        if [[ -d "$log_path" ]]; then
+            log_status="ok"
+            log_owner=$(stat -c '%U:%G' "$log_path" 2>/dev/null || echo "")
+        elif [[ "$status" == "installed" ]]; then
+            log_status="missing"
+        fi
     fi
 
     deps_pm=$(get_pkg_depends "$pkg" 2>/dev/null || true)
