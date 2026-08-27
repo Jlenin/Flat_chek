@@ -48,14 +48,25 @@ done
 parse_args "$@"
 
 # --- Опциональные слои — по уже разобранным флагам, ДО диспетчера.
-# --dev и --selftest extended обязаны проверить оба слоя разом (extended
-# self-test прогоняет agent-функции, см. lib/core/11_selftest.sh).
+#
+# ЛЮБОЙ --selftest (simple тоже, не только extended) обязан подключать
+# lib/agent: self-test — это проверка целостности всей ПОСТАВКИ, а не только
+# режима, с которым его запустили — lib/core/11_selftest.sh проверяет
+# build_health_json/push_health_json/_json_collect_infra даже на уровне
+# "simple" (см. историю: эти проверки унаследованы от flat_check.sh, где всё
+# было одним файлом и agent-функции существовали всегда).
+#
+# lib/logging НЕ подключаем на --selftest simple/extended сейчас: текущий
+# lib/core/11_selftest.sh портирован из flat_check.sh (health-only, без
+# сборщика логов) и не проверяет ничего из lib/logging. Когда в фазе 3
+# появится lib/logging, self-test extended нужно будет обогатить проверками
+# из flat_check_2.sh (parse_time_point/parse_duration/_collector_wait_slot/
+# seek+chunk) — тогда же этот флаг здесь надо будет добавить и для extended.
 NEED_LOGGING=0
 NEED_AGENT=0
 [[ $MODE_LOG -eq 1 || $MODE_INTERACTIVE -eq 1 ]] && NEED_LOGGING=1
-[[ "${SELFTEST_MODE:-}" == "extended" || $MODE_DEV -eq 1 ]] && NEED_LOGGING=1
 [[ $OUTPUT_JSON -eq 1 || $DO_PUSH -eq 1 || -n "${CONFIG_FILE:-}" ]] && NEED_AGENT=1
-[[ "${SELFTEST_MODE:-}" == "extended" || $MODE_DEV -eq 1 ]] && NEED_AGENT=1
+[[ -n "${SELFTEST_MODE:-}" || $MODE_DEV -eq 1 ]] && NEED_AGENT=1
 
 if [[ $NEED_LOGGING -eq 1 ]]; then
     if [[ -d "$LIB_DIR/logging" ]]; then
