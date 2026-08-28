@@ -841,6 +841,33 @@ _sys_installed_pkgs() {
     done
 }
 
+# Заполняет (один раз за запуск скрипта) кэш установленных пакетов для
+# "cpu top"/"memory top"/"uptime services" в _sys_cpu()/_sys_memory()/
+# _sys_uptime() ниже. Без кэша все три независимо вызывали
+# `<(_sys_installed_pkgs)`, каждый раз заново пробегая ВЕСЬ каталог
+# (~100 записей) через is_pkg_installed_tiny() — на dpkg-системах это
+# отдельный процесс dpkg-query на пакет (и на каждое legacy-имя), измерено
+# ~1.3s на один полный проход каталога, т.е. ~4s впустую на 3 идентичных
+# прохода при каждом health-check (найдено профилированием).
+#
+# Кэшировать пришлось СНАРУЖИ _sys_installed_pkgs(), а не внутри неё:
+# все три вызывающих места используют `<(_sys_installed_pkgs)` (process
+# substitution), а это отдельный subshell — declare -g внутри самой функции
+# был бы виден только этому subshell'у и пропадал бы сразу после его
+# завершения, так что наивное кэширование там не сработало бы вообще.
+# _sys_cpu()/_sys_memory()/_sys_uptime() же вызываются как обычные команды
+# (не через <(...) или $(...)) прямо из check_system(), поэтому declare -g
+# здесь корректно переживает до конца текущего запуска скрипта.
+_sys_installed_pkgs_ensure_cache() {
+    [[ -n "${_SYS_INSTALLED_PKGS_CACHE_READY:-}" ]] && return 0
+    declare -ga _SYS_INSTALLED_PKGS_CACHE=()
+    local pkg
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] && _SYS_INSTALLED_PKGS_CACHE+=("$pkg")
+    done < <(_sys_installed_pkgs)
+    _SYS_INSTALLED_PKGS_CACHE_READY=1
+}
+
 # Суммирует %cpu или %mem по PID (поле ps: pcpu|pmem). Печатает число или пусто.
 _sys_pids_pct_sum() {
     local field="$1"
@@ -1009,12 +1036,12 @@ _sys_cpu() {
         print_info "cpu: usage=n/a"
     fi
 
-    while IFS= read -r pkg; do
-        [[ -z "$pkg" ]] && continue
+    _sys_installed_pkgs_ensure_cache
+    for pkg in "${_SYS_INSTALLED_PKGS_CACHE[@]}"; do
         mapfile -t pids < <(_sys_pkg_pids "$pkg")
         pct=$(_sys_pids_pct_sum pcpu "${pids[@]+"${pids[@]}"}")
         [[ -n "$pct" && "$pct" != "0.0" ]] && top_parts+=("${pkg}=${pct}%")
-    done < <(_sys_installed_pkgs)
+    done
 
     if [[ ${#top_parts[@]} -gt 0 ]]; then
         print_info "cpu top: $(printf '%s\n' "${top_parts[@]}" | sed 's/%$//' | sort -t= -k2,2nr | sed 's/$/%/' | paste -sd' ' -)"
@@ -1047,12 +1074,12 @@ _sys_memory() {
         print_info "memory: total=n/a used=n/a available=n/a"
     fi
 
-    while IFS= read -r pkg; do
-        [[ -z "$pkg" ]] && continue
+    _sys_installed_pkgs_ensure_cache
+    for pkg in "${_SYS_INSTALLED_PKGS_CACHE[@]}"; do
         mapfile -t pids < <(_sys_pkg_pids "$pkg")
         mem=$(_sys_pids_pct_sum pmem "${pids[@]+"${pids[@]}"}")
         [[ -n "$mem" && "$mem" != "0.0" ]] && top_parts+=("${pkg}=${mem}%")
-    done < <(_sys_installed_pkgs)
+    done
 
     if [[ ${#top_parts[@]} -gt 0 ]]; then
         print_info "memory top: $(printf '%s\n' "${top_parts[@]}" | sed 's/%$//' | sort -t= -k2,2nr | sed 's/$/%/' | paste -sd' ' -)"
@@ -1301,8 +1328,8 @@ _sys_uptime() {
 
     now_epoch=$(date +%s 2>/dev/null)
     if command -v systemctl &>/dev/null && [[ -n "$now_epoch" ]]; then
-        while IFS= read -r pkg; do
-            [[ -z "$pkg" ]] && continue
+        _sys_installed_pkgs_ensure_cache
+        for pkg in "${_SYS_INSTALLED_PKGS_CACHE[@]}"; do
             enter=""
             while IFS= read -r name; do
                 [[ -z "$name" ]] && continue
@@ -1318,7 +1345,7 @@ _sys_uptime() {
             fmt=$(_sys_fmt_duration "$sec")
             print_info "uptime: ${pkg}=$fmt"
             count=$((count + 1))
-        done < <(_sys_installed_pkgs)
+        done
     fi
     [[ "$count" -eq 0 ]] && print_info "uptime services: n/a"
 }
