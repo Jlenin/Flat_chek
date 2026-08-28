@@ -1,45 +1,54 @@
-#!/bin/bash
-# flat_check.sh — проверка состояния FLAT/FCS (health check)
+# Слой: core
+# Всегда подключается. Health-check, каталог пакетов, вывод, i18n,
+# ОС-детект, системные метрики, resource-gate, проверки пакетов/инфраструктуры,
+# argv/usage/диспетчер, интерактивный мастер, selftest.
 #
-# Работает на: Debian/Ubuntu, RHEL/CentOS/ALMA/Rocky/РЕД ОС, Astra, … (dpkg/rpm + systemd)
+# Разделы этого файла (в порядке подключения; искать по "РАЗДЕЛ: <имя>"):
+#   00_globals               Глобальные флаги, счётчики (ERRORS/WARNINGS/...), цвета вывода, переменные окружения PUSH_*/HOST_*, читаемые из env до parse_args, и CLI-флаги режимов -i/-log (нужны parse_args() ещё до того, как известно, подключён ли lib/logging в этом запуске).
+#   01_catalog               Каталог продуктов/пакетов: _pkg_set() регистрирует запись (имя пакета, продукт, legacy-имена, порты, API-путь, deps), builtin-fallback и загрузка внешнего flat_check.packages.conf.
+#   02_output                Печать статусов (ok/warn/fail/info), запись сессионного лога (_log_line/log_debug/init_logging), die().
+#   03_i18n                  Локализация текстов интерфейса (_l key) — переключается через переменную CURRENT_LANG (по умолчанию en, мастер переключает на ru). Используется в основном мастером и сборщиком логов (lib/logging), но живёт в core, т.к. это универсальная утилита без зависимостей от остальных слоёв.
+#   04_os_detect             Определение дистрибутива и пакетного менеджера (dpkg/rpm/pacman/apk) — detect_os().
+#   05_system_metrics        Обзор ресурсов хоста для дашборда/health JSON: CPU (по ОС-семействам), память, диск, PostgreSQL/MariaDB роль и репликация, сеть, сертификаты, uptime.
+#   06_resource_gate         Общий host-wide resource-gate (CPU/MEM ≥ 80% → не стартовать новый воркер, минимум один воркер всегда разрешён) — переиспользуется и параллельным опросом пакетов, и offline-сборщиком логов в lib/logging.
+#   07_pkg_checks            Низкоуровневые примитивы по пакетному менеджеру (зависимости, версия, наличие) и проверки состояния конкретного продукта/пакета (служба, порт, API, логи, конфиги).
+#   08_infra_checks          Инфраструктурные пакеты (nginx/postgresql/mariadb — без require /opt/flat), список репозиториев по PM, финальный === Summary ===.
+#   09_argv                  Разбор аргументов командной строки (usage()/parse_args()) и финальный диспетчер режимов (dispatch_main()) — какой путь выполнить после того, как флаги разобраны и точка входа подключила lib/agent и/или lib/logging (если они понадобились по флагам).
+#   10_wizard                Интерактивный мастер (-i/--interactive) — язык, выбор режима (health/сбор логов/самотест), для сбора логов: online/offline, scope, диапазон времени, chunk-настройки, выбор продуктов/служб/типов логов.
+#   11_selftest              --selftest simple|extended — самопроверка ключевых функций/каталога без реального воздействия на систему (кроме чтения состояния). simple — быстрый smoke-test хелперов core+agent; extended — то же плюс проверки lib/logging (парсеры времени, resource-gate, seek+chunk extract) и VERBOSE health-прогон по всем продуктам (то же самое, что --dev).
 #
-# Режимы:
-#   (по умолчанию) проверка установленных служб и ресурсов хоста
-#   -r / --repo     показать репозитории
-#   -v / --version  версия скрипта
-#   --json / --push агент JSON v2 → stdout / PUSH_URLS (см. agent/)
-#   --config/--pkg/--product/--host-id/--host-ip/--service-name
-#   --dev / --selftest  самотест (simple|extended); extended = VERBOSE health
-#   -i не используется здесь (в flat_check_2.sh = интерактивный мастер)
+# До объединения (см. git-историю фазы 5) это было 12 отдельных
+# файлов lib/core/NN_name.sh — слиты в один по итогам код-ревью: три с половиной
+# десятка файлов на весь проект оказались избыточной дробностью для инструмента,
+# который должен быть понятен человеку без глубокого знания bash. Внутренние
+# границы (заголовки "РАЗДЕЛ:") и порядок — те же самые.
+# ==========================================================================
+# РАЗДЕЛ: 00_globals
+# ==========================================================================
+# Назначение: Глобальные флаги, счётчики (ERRORS/WARNINGS/...), цвета вывода,
+#   переменные окружения PUSH_*/HOST_*, читаемые из env до parse_args, и CLI-флаги
+#   режимов -i/-log (нужны parse_args() ещё до того, как известно, подключён ли
+#   lib/logging в этом запуске).
+# Публичные функции: (нет функций — только объявления переменных)
+# Зависит от: ничего
+# Не зависит от: от всех остальных модулей — грузится первым
+# Side effects: не пишет и не запускает ничего, только присваивает переменные
 #
-# Это health-only вариант flat_check_2.sh: тот же опрос ОС/CPU/MEM/диска/БД/
-# сети/сертификатов/uptime, пакетов, портов, API и инфраструктуры — без
-# сборщика логов (online/offline, tail, tcpdump, parce_service_log*).
-#
-# Внутренняя структура (искать "# --- N."):
-#   0  глобальные переменные / флаги (включая SCRIPT_DIR/LOG_FILE)
-#   1  метаданные продуктов PKG_*
-#   2  хелперы вывода + логирование в файл (_log_line/log_debug/init_logging)
-#   3  ОС / пакетный менеджер
-#   3b системные метрики (CPU/MEM/диск/БД/сеть/сертификаты/аптайм)
-#   4  проверки состояния по пакетам
-#   5  инфраструктура + репозитории
-#   9  параллельный опрос пакетов (resource-gate, те же хелперы что в flat_check_2)
-#  11  справка, argv, main, selftest
-#
-# Лог сессии: каждый запуск пишет ${SCRIPT_NAME}.log рядом со скриптом
-#   (перезаписывается). Сборщик логов — в flat_check_2.sh.
-
-SCRIPT_VERSION="3.8.11"
-
-set -uo pipefail
+# Источник: перенесено без изменений логики из flat_check.sh (строки 37-96)
+#   + CLI-флаги -i/-log из flat_check_2.sh (section 0, строки 90-199).
 
 # --- 0. Глобальные переменные ---------------------------------------------------
 
 # Путь и имя скрипта — для сессионного лога; вычисляем один раз.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+# ВАЖНО: в модульной версии этот файл сам подключается через `source` из
+# lib/core/*.sh, поэтому ${BASH_SOURCE[0]} здесь указывал бы на путь ЭТОГО
+# файла (lib/core.sh (раздел 00_globals)), а не на точку входа `flat_check`. Точка
+# входа обязана выставить SCRIPT_DIR/SCRIPT_NAME ДО подключения core — здесь
+# только страховка на случай, если модуль когда-нибудь подключат отдельно.
+
+: "${SCRIPT_DIR:=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)}"
 [[ -z "$SCRIPT_DIR" ]] && SCRIPT_DIR="$(pwd)"
-SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+: "${SCRIPT_NAME:=$(basename "${BASH_SOURCE[0]}")}"
 SCRIPT_NAME="${SCRIPT_NAME%.sh}"
 
 # Путь текущего сессионного лог-файла (<SCRIPT_NAME>.log); "" = логирование в
@@ -94,12 +103,51 @@ RESOURCE_WAIT_MAX=120
 _CPU_PREV_IDLE=""
 _CPU_PREV_TOTAL=""
 
+# Режимы/флаги CLI, специфичные для -i (мастер) и -log (сборщик логов,
+# lib/logging) — объявлены здесь, а не в lib/logging, потому что parse_args()
+# (lib/core.sh (раздел 09_argv)) разбирает их независимо от того, подключён ли
+# lib/logging в этом запуске (см. flat_check_2.sh, section 0, строки 90-199).
+MODE_LOG=0
+MODE_INTERACTIVE=0
+LOG_SUBMODE="online"
+START_TCPDUMP=1
+TIMEOUT_RAW=""
+FROM_TIME=""
+TO_TIME=""
+CLI_TIMEOUT_SET=0
+CLI_FROM_SET=0
+CLI_TO_SET=0
+CLI_T_AS_TO=0
+CLI_TIMEOUT_BEFORE_FROM=0
+OUTPUT_DIR=""
+LOG_SCOPE="brief"
+SELECTED_PRODUCTS=()   # имена продуктов из -p / мастера (в режиме -log)
+SELECTED_SERVICES=()   # имена пакетов из -s / мастера
+LIST_TARGETS=0
+INCLUDE_MGCPCLIENT=""
+LOG_CHUNK_MODE="size"
+LOG_CHUNK_SIZE_BYTES=$((100 * 1024 * 1024))
+LOG_CHUNK_LINES=500000
+
+
+# ==========================================================================
+# РАЗДЕЛ: 01_catalog
+# ==========================================================================
+# Назначение: Каталог продуктов/пакетов: _pkg_set() регистрирует запись (имя пакета, продукт, legacy-имена, порты, API-путь, deps), builtin-fallback и загрузка внешнего flat_check.packages.conf.
+# Публичные функции: _pkg_set(), _pkg_catalog_builtin(), _load_pkg_catalog()
+# Зависит от: 00_globals.sh
+# Не зависит от: от вывода, ОС-детекта, проверок пакетов — сам только наполняет PKG_* массивы
+# Side effects: читает conf/flat_check.packages.conf с диска, если он есть рядом со скриптом
+#
+# Источник: перенесено без изменений логики из flat_check.sh (строки 97-282).
+
 # --- 1. Метаданные продуктов PKG_* (каталог) ---------------------------------
 # Каталог: flat_check.packages.conf рядом со скриптом (предпочтительно).
 # Нет файла → встроенный fallback (_pkg_catalog_builtin). Скрипт не падает.
 # Формат строки каталога: _pkg_set NAME PRODUCT [LEGACY] [PORTS] [API] [DEPS]
 # Пустые PORTS/API/DEPS не задаём. PKG_DEPS — только непустые (для «кто зависит»
 # в авто-разделе Infrastructure при неудовлетворённой зависимости).
+
 
 declare -A PKG_PORTS
 declare -A PKG_API
@@ -263,7 +311,9 @@ FLAT_PKG_CATALOG_EOF
 }
 
 _load_pkg_catalog() {
-    local conf="${SCRIPT_DIR:-.}/flat_check.packages.conf"
+    # В модульной раскладке каталог лежит в conf/, а не рядом со скриптом
+    # (как в оригинальных flat_check.sh/flat_check_2.sh) — см. ARCHITECTURE.md.
+    local conf="${SCRIPT_DIR:-.}/conf/flat_check.packages.conf"
     unset PKG_PRODUCT PKG_LEGACY PKG_PORTS PKG_API PKG_DEPS 2>/dev/null || true
     declare -gA PKG_PRODUCT PKG_LEGACY PKG_PORTS PKG_API PKG_DEPS
     if [[ -f "$conf" && -r "$conf" ]]; then
@@ -280,12 +330,43 @@ _load_pkg_catalog() {
 
 _load_pkg_catalog
 
+
+# ==========================================================================
+# РАЗДЕЛ: 02_output
+# ==========================================================================
+# Назначение: Печать статусов (ok/warn/fail/info), запись сессионного лога (_log_line/log_debug/init_logging), die().
+# Публичные функции: print_ok/warn/fail/info/not_installed(), ok/warn/fail/info(), _log_line(), log_debug(), init_logging(), die()
+# Зависит от: 00_globals.sh (ERRORS/WARNINGS/LOG_FILE/DEBUG_MODE/цвета)
+# Не зависит от: от каталога, ОС-детекта, проверок — используется ими, а не наоборот
+# Side effects: пишет в LOG_FILE (session-лог), печатает в stdout/stderr
+#
+# Источник: перенесено без изменений логики из flat_check.sh (строки 283-372).
+# Единственная сознательная правка: баннер в init_logging() печатал
+# "${SCRIPT_NAME}.sh v..." — там ".sh" дописывался руками, т.к. SCRIPT_NAME
+# всегда был "flat_check"/"flat_check_2" без расширения. Точка входа новой
+# сборки называется просто `flat_check` (без .sh), поэтому дописывание ".sh"
+# убрано — иначе баннер лгал бы ("flat_check.sh" при реальном имени файла
+# "flat_check"). Сам факт и текст остальных сообщений не менялся.
+#
+# Вторая правка (фаза 3, при добавлении lib/logging): die() здесь портирован
+# из flat_check.sh как `die() { fail "$1"; exit 1; }` — health-only скрипт не
+# знает о рабочих каталогах сборщика логов. flat_check_2.sh (строка 512)
+# определяет die() как `fail "$1"; cleanup 2>/dev/null; exit 1;`, чтобы
+# фатальная ошибка в режиме -log не оставляла недоделанный рабочий каталог.
+# В unified-инструменте die() общий на все режимы, поэтому взята версия
+# flat_check_2.sh: `cleanup` определена только в lib/logging.sh (раздел 07_collector),
+# но 2>/dev/null безопасно проглатывает "command not found", если lib/logging
+# не подключён (health-only запуск) — ровно так же безопасно, как и в
+# оригинале, где cleanup() тоже мог быть вызван до того, как до неё дошли
+# другие ветки кода.
+
 # --- 2. Хелперы вывода + логирование в файл --------------------------------------
 # (print_ok / print_warn / print_fail / print_info — используются при проверке состояния)
 
 # Пишет строку сессионного лога (без ANSI-кодов, с таймстампом и уровнем).
 # Тихо ничего не делает, если LOG_FILE не задан/недоступен для записи —
 # логирование в файл никогда не должно ронять сам скрипт или его вывод.
+
 _log_line() {
     [[ -n "${LOG_FILE:-}" ]] || return 0
     # Группа скобок обязательна: если каталог LOG_FILE уже исчез (сборщик
@@ -314,10 +395,10 @@ init_logging() {
         LOG_FILE=""
         return 1
     fi
-    _log_line "INFO" "=== ${SCRIPT_NAME}.sh v${SCRIPT_VERSION} — сессия начата ==="
+    _log_line "INFO" "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} — сессия начата ==="
     # Версия на экран в human-режиме (при --json/--push только в session-log)
     if [[ "${OUTPUT_JSON:-0}" -ne 1 && "${DO_PUSH:-0}" -ne 1 ]]; then
-        info "${SCRIPT_NAME}.sh v${SCRIPT_VERSION}"
+        info "${SCRIPT_NAME} v${SCRIPT_VERSION}"
     fi
     if [[ "${PKG_CATALOG_SOURCE:-internal}" == "external" ]]; then
         _log_line "INFO" "package catalog: external (${PKG_CATALOG_PATH})"
@@ -367,11 +448,269 @@ warn() { echo -e "${C_Y}[WARN]${C_N} $1"; _log_line "WARN" "$1"; }
 fail() { echo -e "${C_R}[FAIL]${C_N} $1"; _log_line "FAIL" "$1"; }
 info() { echo -e "${C_B}[INFO]${C_N} $1"; _log_line "INFO" "$1"; }
 
-die() { fail "$1"; exit 1; }
+die() { fail "$1"; cleanup 2>/dev/null; exit 1; }
 
+
+
+# ==========================================================================
+# РАЗДЕЛ: 03_i18n
+# ==========================================================================
+# Назначение: Локализация текстов интерфейса (_l key) — переключается через
+#   переменную CURRENT_LANG (по умолчанию en, мастер переключает на ru).
+#   Используется в основном мастером и сборщиком логов (lib/logging), но
+#   живёт в core, т.к. это универсальная утилита без зависимостей от
+#   остальных слоёв.
+# Публичные функции: _l(key) — печатает локализованную строку по ключу
+# Зависит от: 00_globals.sh (объявляет свой собственный CURRENT_LANG ниже,
+#   чтобы не требовать правки 00_globals.sh, у которого в flat_check.sh
+#   такой переменной не было — i18n нужен только logging/wizard)
+# Не зависит от: каталога, вывода, ОС-детекта, проверок пакетов
+# Side effects: нет — чистая функция, только echo
+#
+# Источник: перенесено без изменений логики из flat_check_2.sh (строки 514-736,
+#   плюс объявление CURRENT_LANG из строки 128 той же секции 0).
+
+
+CURRENT_LANG="${CURRENT_LANG:-en}"
+
+# --- 2b. Локализация (_l) --------------------------------------------------------
+_l() {
+    local key="$1"
+    case "$CURRENT_LANG" in
+        ru)
+            case "$key" in
+                err_online_need_t) echo "Online без TTY требует -t/--timeout" ;;
+                ask_lang_prompt)   echo "Ваш выбор / Your choice [1-2]: " ;;
+                mode_log)          echo "Режим логов" ;;
+                workdir)           echo "Рабочая директория" ;;
+                found_svcs)        echo "Найдено служб" ;;
+                found_logdirs)     echo "Найдено лог-директорий" ;;
+                tail_running)      echo "Процессов tail" ;;
+                tcpdump_started)   echo "tcpdump запущен (PID" ;;
+                tcpdump_fail)      echo "tcpdump не запустился (нужен root?)" ;;
+                tcpdump_notfound)  echo "tcpdump не найден" ;;
+                log_running)       echo "Сбор логов запущен. Нажмите [Enter] для остановки." ;;
+                log_running_online_note) echo "Online: в архив попадают только НОВЫЕ строки, появившиеся после старта сбора." ;;
+                log_archive_stats) echo "Лог-файлов с данными в архиве:" ;;
+                log_online_no_new) echo "За время сбора новых записей в логах не было (online пишет только новые строки)" ;;
+                log_autostop)      echo "Автоостановка через" ;;
+                log_stopping)      echo "Остановка сбора..." ;;
+                log_files_from)    echo "файлов из" ;;
+                log_copydone)      echo "Копирование завершено" ;;
+                log_all)           echo "Копирование всех логов" ;;
+                archive_pigz)      echo "Архив создан (pigz)" ;;
+                archive_gzip)      echo "Архив создан (gzip)" ;;
+                archive_at)        echo "Архив" ;;
+                done_msg)          echo "Готово" ;;
+                err_no_logdirs)    echo "Не найдено лог-директорий" ;;
+                err_no_logfiles)   echo "Нет лог-файлов для мониторинга" ;;
+                err_perm)          echo "Нет прав на запись" ;;
+                err_cmd_notfound)  echo "Не найдена команда" ;;
+                config_collected)  echo "Собрано конфигов" ;;
+                sys_copied)        echo "Скопирован" ;;
+                wiz_title_mode)    echo "=== Режим ===" ;;
+                wiz_mode_1)        echo "  1 — Проверка служб (health check)" ;;
+                wiz_mode_2)        echo "  2 — Сбор логов" ;;
+                wiz_mode_3)        echo "  3 — Самотест скрипта" ;;
+                wiz_mode_prompt)   echo "Ваш выбор [1-3]: " ;;
+                wiz_title_selftest) echo "=== Самотест ===" ;;
+                wiz_selftest_1)    echo "  1 — Простой (факт запуска функций)" ;;
+                wiz_selftest_2)    echo "  2 — Расширенный (варианты + health + seek/chunk)" ;;
+                wiz_selftest_prompt) echo "Ваш выбор [1-2]: " ;;
+                wiz_title_type)    echo "=== Тип сбора ===" ;;
+                wiz_type_1)        echo "  1 — Online (tail -F, в реальном времени)" ;;
+                wiz_type_2)        echo "  2 — Offline (копирование готовых логов)" ;;
+                wiz_type_prompt)   echo "Ваш выбор [1-2]: " ;;
+                wiz_timeout)       echo -n "Таймаут сбора (например 5h, 30m, Enter = бесконечно): " ;;
+                wiz_tcpdump)       echo -n "tcpdump? (y/n): " ;;
+                wiz_title_range)   echo "=== Диапазон ===" ;;
+                wiz_range_1)       echo "  1 — За последние N (например 5h)" ;;
+                wiz_range_2)       echo "  2 — От даты-времени до даты-времени" ;;
+                wiz_range_3)       echo "  3 — От даты-времени + N часов/минут" ;;
+                wiz_range_all)     echo "  Enter — Все логи" ;;
+                wiz_range_prompt)  echo "Ваш выбор [1-3]: " ;;
+                wiz_for_how_long)  echo -n "За сколько? (например 5h, 30m): " ;;
+                wiz_from_dt)       echo -n "От (например 25.06.2026 10:00): " ;;
+                wiz_to_dt)         echo -n "До (например 25.06.2026 12:00): " ;;
+                wiz_from_dt2)      echo -n "От (например 25.06.2026 10:00): " ;;
+                wiz_for_offset)    echo -n "На сколько? (например +3h, 3h, +30m): " ;;
+                wiz_title_chunk)   echo "=== Разбивка больших логов ===" ;;
+                wiz_chunk_1)       echo "  1 — По размеру (например 100MB) [по умолчанию]" ;;
+                wiz_chunk_2)       echo "  2 — По количеству строк (например 500000)" ;;
+                wiz_chunk_prompt)  echo "Ваш выбор [1-2, Enter=1]: " ;;
+                wiz_chunk_size_prompt)  echo -n "Максимальный размер одной части (например 50M, 200M; Enter = 100M): " ;;
+                wiz_chunk_lines_prompt) echo -n "Максимум строк в одной части (Enter = 500000): " ;;
+                wiz_chunk_size_invalid) echo "Не удалось разобрать размер, используется значение по умолчанию:" ;;
+                wiz_output_dir)    echo -n "Директория для архива (Enter = рядом со скриптом): " ;;
+                wiz_show_repo)     echo -n "Показать репозитории? (y/n): " ;;
+                wiz_title_scope)   echo "=== Объём сбора ===" ;;
+                wiz_scope_1)       echo "  1 — Краткий (только логи выбранных продуктов/служб)" ;;
+                wiz_scope_2)       echo "  2 — Расширенный (+ system, nginx, PostgreSQL, configs; online: tcpdump)" ;;
+                wiz_scope_prompt)  echo "Ваш выбор [1-2]: " ;;
+                wiz_title_products) echo "=== Продукты ===" ;;
+                wiz_products_all)  echo "  a — Все установленные" ;;
+                wiz_products_prompt) echo -n "Номера через запятую/пробел, a=все, n=отмена: " ;;
+                wiz_refine_services) echo -n "Уточнить службы? (y/n, Enter=n): " ;;
+                wiz_title_services) echo "=== Службы ===" ;;
+                wiz_services_all)  echo "  a — Все службы выбранных продуктов" ;;
+                wiz_services_prompt) echo -n "Номера через запятую/пробел, a=все, n=отмена: " ;;
+                wiz_refine_log_types) echo -n "Выбрать конкретные логи служб? (y/n, Enter=n): " ;;
+                wiz_title_log_types) echo "=== Типы логов службы ===" ;;
+                wiz_log_types_for) echo "Логи службы" ;;
+                wiz_log_types_all) echo "  a — все найденные типы" ;;
+                wiz_log_types_prompt) echo -n "Номера через запятую/пробел, a=все, n=отмена: " ;;
+                wiz_log_types_none) echo "типы логов не найдены — будут собраны все доступные файлы" ;;
+                wiz_preview_log_types) echo "типы логов" ;;
+                wiz_no_targets)    echo "На хосте не найдено известных продуктов/служб" ;;
+                wiz_preview_pkgs)  echo "Выбрано служб" ;;
+                wiz_preview_dirs)  echo "Лог-директорий к сбору" ;;
+                ask_mgcpclient)    echo -n "SoftSwitch (fss-server): собирать логи mgcpclient? (y/n, Enter=n): " ;;
+                mgcpclient_default_no) echo "SoftSwitch (fss-server): mgcpclient пропущен (нет TTY; укажите --mgcpclient или --no-mgcpclient)" ;;
+                mgcpclient_not_found) echo "mgcpclient: каталог логов не найден" ;;
+                mgcpclient_include) echo "mgcpclient: добавлено каталогов" ;;
+                mgcpclient_skip)   echo "mgcpclient: пропущен (файлы mgcpclient* и отдельные каталоги)" ;;
+                resource_limits)   echo "Лимиты нагрузки системы (host-wide)" ;;
+                collected)         echo "Скопирован" ;;
+                skipped)           echo "Пропущено" ;;
+                logs_absent_for_period) echo "за указанное время логи отсутствуют" ;;
+                logs_absent_for_collection) echo "за время сбора логи отсутствуют" ;;
+                logs_absent)       echo "логи отсутствуют" ;;
+                absent_files_unit) echo "файлов" ;;
+                more_files)        echo "ещё" ;;
+                pg_logs_not_found) echo "каталог логов не найден (логирование в файл не настроено?)" ;;
+                pg_logs_dir_missing) echo "каталог логов не существует:" ;;
+                pg_logs_not_dir)   echo "путь логов не является каталогом:" ;;
+                pg_logs_no_access) echo "нет доступа к каталогу логов:" ;;
+                pg_logs_try_sudo)  echo "запустите от root или через sudo" ;;
+                *)                 echo "$key" ;;
+            esac
+            ;;
+        *)
+            case "$key" in
+                err_online_need_t) echo "Online without TTY requires -t/--timeout" ;;
+                ask_lang_prompt)   echo "Your choice / Ваш выбор [1-2]: " ;;
+                mode_log)          echo "Log mode" ;;
+                workdir)           echo "Work directory" ;;
+                found_svcs)        echo "Found services" ;;
+                found_logdirs)     echo "Found log directories" ;;
+                tail_running)      echo "Tail processes" ;;
+                tcpdump_started)   echo "tcpdump started (PID" ;;
+                tcpdump_fail)      echo "tcpdump failed to start (needs root?)" ;;
+                tcpdump_notfound)  echo "tcpdump not found" ;;
+                log_running)       echo "Log collection running. Press [Enter] to stop." ;;
+                log_running_online_note) echo "Online: archive includes only NEW lines written after collection started." ;;
+                log_archive_stats) echo "Log files with data in archive:" ;;
+                log_online_no_new) echo "No new log lines during collection (online captures only new lines)" ;;
+                log_autostop)      echo "Auto-stop in" ;;
+                log_stopping)      echo "Stopping collection..." ;;
+                log_files_from)    echo "files from" ;;
+                log_copydone)      echo "Copy done" ;;
+                log_all)           echo "Copying all logs" ;;
+                archive_pigz)      echo "Archive created (pigz)" ;;
+                archive_gzip)      echo "Archive created (gzip)" ;;
+                archive_at)        echo "Archive" ;;
+                done_msg)          echo "Done" ;;
+                err_no_logdirs)    echo "No log directories found" ;;
+                err_no_logfiles)   echo "No log files to monitor" ;;
+                err_perm)          echo "Permission denied" ;;
+                err_cmd_notfound)  echo "Command not found" ;;
+                config_collected)  echo "Configs collected" ;;
+                sys_copied)        echo "Copied" ;;
+                wiz_title_mode)    echo "=== Mode ===" ;;
+                wiz_mode_1)        echo "  1 — Health check" ;;
+                wiz_mode_2)        echo "  2 — Log collection" ;;
+                wiz_mode_3)        echo "  3 — Script self-test" ;;
+                wiz_mode_prompt)   echo "Your choice [1-3]: " ;;
+                wiz_title_selftest) echo "=== Self-test ===" ;;
+                wiz_selftest_1)    echo "  1 — Simple (functions launch)" ;;
+                wiz_selftest_2)    echo "  2 — Extended (variants + health + seek/chunk)" ;;
+                wiz_selftest_prompt) echo "Your choice [1-2]: " ;;
+                wiz_title_type)    echo "=== Collection type ===" ;;
+                wiz_type_1)        echo "  1 — Online (tail -F, real-time)" ;;
+                wiz_type_2)        echo "  2 — Offline (copy existing logs)" ;;
+                wiz_type_prompt)   echo "Your choice [1-2]: " ;;
+                wiz_timeout)       echo -n "Collection timeout (e.g. 5h, 30m, Enter = forever): " ;;
+                wiz_tcpdump)       echo -n "tcpdump? (y/n): " ;;
+                wiz_title_range)   echo "=== Range ===" ;;
+                wiz_range_1)       echo "  1 — Last N (e.g. 5h)" ;;
+                wiz_range_2)       echo "  2 — From date-time to date-time" ;;
+                wiz_range_3)       echo "  3 — From date-time + N hours/minutes" ;;
+                wiz_range_all)     echo "  Enter — All logs" ;;
+                wiz_range_prompt)  echo "Your choice [1-3]: " ;;
+                wiz_for_how_long)  echo -n "For how long? (e.g. 5h, 30m): " ;;
+                wiz_from_dt)       echo -n "From (e.g. 25.06.2026 10:00): " ;;
+                wiz_to_dt)         echo -n "To (e.g. 25.06.2026 12:00): " ;;
+                wiz_from_dt2)      echo -n "From (e.g. 25.06.2026 10:00): " ;;
+                wiz_for_offset)    echo -n "For how long? (e.g. +3h, 3h, +30m): " ;;
+                wiz_title_chunk)   echo "=== Splitting large logs ===" ;;
+                wiz_chunk_1)       echo "  1 — By size (e.g. 100MB) [default]" ;;
+                wiz_chunk_2)       echo "  2 — By line count (e.g. 500000)" ;;
+                wiz_chunk_prompt)  echo "Your choice [1-2, Enter=1]: " ;;
+                wiz_chunk_size_prompt)  echo -n "Max size per part (e.g. 50M, 200M; Enter = 100M): " ;;
+                wiz_chunk_lines_prompt) echo -n "Max lines per part (Enter = 500000): " ;;
+                wiz_chunk_size_invalid) echo "Could not parse size, using default:" ;;
+                wiz_output_dir)    echo -n "Output dir (Enter = script dir): " ;;
+                wiz_show_repo)     echo -n "Show repositories? (y/n): " ;;
+                wiz_title_scope)   echo "=== Collection scope ===" ;;
+                wiz_scope_1)       echo "  1 — Brief (selected product/service logs only)" ;;
+                wiz_scope_2)       echo "  2 — Extended (+ system, nginx, PostgreSQL, configs; online: tcpdump)" ;;
+                wiz_scope_prompt)  echo "Your choice [1-2]: " ;;
+                wiz_title_products) echo "=== Products ===" ;;
+                wiz_products_all)  echo "  a — All present on host" ;;
+                wiz_products_prompt) echo -n "Numbers (comma/space), a=all, n=cancel: " ;;
+                wiz_refine_services) echo -n "Refine services? (y/n, Enter=n): " ;;
+                wiz_title_services) echo "=== Services ===" ;;
+                wiz_services_all)  echo "  a — All services of selected products" ;;
+                wiz_services_prompt) echo -n "Numbers (comma/space), a=all, n=cancel: " ;;
+                wiz_refine_log_types) echo -n "Select specific service logs? (y/n, Enter=n): " ;;
+                wiz_title_log_types) echo "=== Service log types ===" ;;
+                wiz_log_types_for) echo "Logs for" ;;
+                wiz_log_types_all) echo "  a — all discovered types" ;;
+                wiz_log_types_prompt) echo -n "Numbers (comma/space), a=all, n=cancel: " ;;
+                wiz_log_types_none) echo "no log types found — all available files will be collected" ;;
+                wiz_preview_log_types) echo "log types" ;;
+                wiz_no_targets)    echo "No known products/services found on this host" ;;
+                wiz_preview_pkgs)  echo "Selected services" ;;
+                wiz_preview_dirs)  echo "Log directories to collect" ;;
+                ask_mgcpclient)    echo -n "SoftSwitch (fss-server): collect mgcpclient logs? (y/n, Enter=n): " ;;
+                mgcpclient_default_no) echo "SoftSwitch (fss-server): skipping mgcpclient (no TTY; pass --mgcpclient or --no-mgcpclient)" ;;
+                mgcpclient_not_found) echo "mgcpclient: log directory not found" ;;
+                mgcpclient_include) echo "mgcpclient: directories added" ;;
+                mgcpclient_skip)   echo "mgcpclient: skipped (mgcpclient* files and extra dirs)" ;;
+                resource_limits)   echo "Host system load limits" ;;
+                collected)         echo "Copied" ;;
+                skipped)           echo "Skipped" ;;
+                logs_absent_for_period) echo "no logs for the specified time period" ;;
+                logs_absent_for_collection) echo "no logs during collection" ;;
+                logs_absent)       echo "no logs" ;;
+                absent_files_unit) echo "files" ;;
+                more_files)        echo "more" ;;
+                pg_logs_not_found) echo "log directory not found (file logging not configured?)" ;;
+                pg_logs_dir_missing) echo "log directory does not exist:" ;;
+                pg_logs_not_dir)   echo "log path is not a directory:" ;;
+                pg_logs_no_access) echo "no access to log directory:" ;;
+                pg_logs_try_sudo)  echo "run as root or via sudo" ;;
+                *)                 echo "$key" ;;
+            esac
+            ;;
+    esac
+}
+
+
+# ==========================================================================
+# РАЗДЕЛ: 04_os_detect
+# ==========================================================================
+# Назначение: Определение дистрибутива и пакетного менеджера (dpkg/rpm/pacman/apk) — detect_os().
+# Публичные функции: detect_os(), get_os_release()
+# Зависит от: 02_output.sh (log_debug)
+# Не зависит от: от каталога пакетов и проверок — они читают уже установленную переменную PKG_MANAGER
+# Side effects: читает /etc/os-release, запускает dpkg/rpm/pacman/apk для проверки наличия
+#
+# Источник: перенесено без изменений логики из flat_check.sh (строки 373-479).
 
 # --- 3. ОС / пакетный менеджер ---------------------------------------------------
 # Определить ОС и пакетный менеджер
+
 detect_os() {
     OS_NAME="Unknown"
     OS_ID="unknown"
@@ -477,8 +816,21 @@ get_os_release() {
     echo "$id"
 }
 
+
+# ==========================================================================
+# РАЗДЕЛ: 05_system_metrics
+# ==========================================================================
+# Назначение: Обзор ресурсов хоста для дашборда/health JSON: CPU (по ОС-семействам), память, диск, PostgreSQL/MariaDB роль и репликация, сеть, сертификаты, uptime.
+# Публичные функции: check_system(), _sys_cpu()/_sys_memory()/_sys_disk()/_sys_database()/_sys_network()/_sys_certificates()/_sys_uptime(), _sys_cpu_via_procstat(), _sys_pkg_pids()
+# Зависит от: 00_globals.sh, 02_output.sh, 04_os_detect.sh
+# Не зависит от: от каталога пакетов и проверок отдельных пакетов — сам только описывает хост в целом
+# Side effects: запускает top/free/df/ss/psql/openssl/systemctl; печатает раздел === System ===
+#
+# Источник: перенесено без изменений логики из flat_check.sh (строки 480-1005).
+
 # --- 3b. Системные метрики (обзор хоста для дашборда / health JSON) ------------
 # Всегда печатает блок === System ===; отсутствующие данные → n/a (секция никогда не пропускается).
+
 
 _sys_installed_pkgs() {
     local pkg
@@ -1030,6 +1382,194 @@ check_system() {
     rm -rf -- "$tmpdir" 2>/dev/null
 }
 
+
+# ==========================================================================
+# РАЗДЕЛ: 06_resource_gate
+# ==========================================================================
+# Назначение: Общий host-wide resource-gate (CPU/MEM ≥ 80% → не стартовать новый воркер, минимум один воркер всегда разрешён) — переиспользуется и параллельным опросом пакетов, и offline-сборщиком логов в lib/logging.
+# Публичные функции: _collector_max_jobs(), _collector_resources_ok(), _collector_wait_slot(), _collector_wait_all_jobs(), _get_cpu_usage_percent(), _get_mem_usage_percent()
+# Зависит от: 00_globals.sh, 05_system_metrics.sh (_sys_cpu_via_procstat)
+# Не зависит от: от каталога пакетов, вывода-текста, инфраструктуры — чистая утилита планирования воркеров
+# Side effects: запускает фоновые job'ы (&) и ждёт их (wait); не пишет напрямую в лог
+#
+# Источник: перенесено без изменений логики из flat_check.sh (строки 2242-2397).
+
+# --- 9. Параллельный опрос пакетов (resource-gate) ------------------------------
+# Те же хелперы, что использует run_product_checks() в flat_check_2.sh.
+# Имена _collector_* сохранены намеренно — поведение 1к1 с flat_check_2.
+
+# Для health-check (без lib/logging) всегда «не останавливаться» — флагов
+# сборщика логов (COLLECTOR_ABORTED/COLLECTOR_TIMEOUT_STOP) в этом режиме не
+# существует. ВАЖНО: если lib/logging подключён, lib/logging.sh (раздел 07_collector)
+# определяет _collector_should_stop() ПОВТОРНО (сознательно, тем же именем) —
+# та версия реально проверяет сигналы Ctrl+C/timeout сборщика и, поскольку
+# core грузится раньше logging, замещает этот стаб. Здесь — единственное
+# намеренное переопределение функции между слоями во всём проекте; см. её
+# заголовок в lib/logging.sh (раздел 07_collector), если меняете сигнатуру/поведение.
+
+_collector_should_stop() {
+    return 1
+}
+
+_collector_max_jobs() {
+    local n cores
+    if [[ "${COLLECTOR_JOBS:-0}" -gt 0 ]]; then
+        echo "$COLLECTOR_JOBS"
+        return 0
+    fi
+    cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+    [[ -z "$cores" || "$cores" -lt 1 ]] && cores=4
+    # Лимит воркеров по умолчанию от числа ядер; запуск всё равно ограничен общесистемными лимитами RESOURCE_*
+    n=$(( cores * ${RESOURCE_CPU_LIMIT:-80} / 100 ))
+    [[ "$n" -lt 1 ]] && n=1
+    [[ "$n" -gt 32 ]] && n=32
+    echo "$n"
+}
+
+# Процент использованной памяти по всему хосту (100 - MemAvailable/MemTotal*100)
+_get_mem_usage_percent() {
+    local pct
+    # Предпочитать MemAvailable; запасной вариант MemFree (в Git Bash / нестандартных ядрах может не быть Available)
+    pct=$(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} /MemFree:/ {f=$2} END {
+        if (t+0 <= 0) { print 0; exit }
+        if (a+0 <= 0) a = f
+        printf "%d", int((t - a) * 100 / t);
+    }' /proc/meminfo 2>/dev/null)
+    echo "${pct:-0}"
+}
+
+# Процент занятости CPU системы через дельту /proc/stat (первый вызов инициализирует, возвращает 0)
+_get_cpu_usage_percent() {
+    local user nice system idle iowait irq softirq steal guest guest_nice
+    local idle_all non_idle total diff_idle diff_total pct
+    # shellcheck disable=SC2034
+    read -r _cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat 2>/dev/null || {
+        echo 0
+        return 0
+    }
+    idle_all=$((idle + iowait))
+    non_idle=$((user + nice + system + irq + softirq + steal))
+    total=$((idle_all + non_idle))
+    if [[ -z "${_CPU_PREV_TOTAL:-}" || "${_CPU_PREV_TOTAL}" -eq 0 ]]; then
+        _CPU_PREV_IDLE=$idle_all
+        _CPU_PREV_TOTAL=$total
+        echo 0
+        return 0
+    fi
+    diff_idle=$((idle_all - _CPU_PREV_IDLE))
+    diff_total=$((total - _CPU_PREV_TOTAL))
+    _CPU_PREV_IDLE=$idle_all
+    _CPU_PREV_TOTAL=$total
+    if [[ "$diff_total" -le 0 ]]; then
+        echo 0
+        return 0
+    fi
+    pct=$(( (100 * (diff_total - diff_idle)) / diff_total ))
+    [[ "$pct" -lt 0 ]] && pct=0
+    [[ "$pct" -gt 100 ]] && pct=100
+    echo "$pct"
+}
+
+# Истина, если CPU и память всего хоста в пределах настроенных лимитов
+_collector_resources_ok() {
+    local cpu mem cpu_lim mem_lim
+    cpu_lim=${RESOURCE_CPU_LIMIT:-80}
+    mem_lim=${RESOURCE_MEM_LIMIT:-80}
+    mem=$(_get_mem_usage_percent)
+    [[ "$mem" =~ ^[0-9]+$ ]] || mem=0
+    if [[ "$mem" -ge "$mem_lim" ]]; then
+        return 1
+    fi
+    cpu=$(_get_cpu_usage_percent)
+    [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
+    # Первая проба /proc/stat всегда возвращает 0 — всегда берём вторую пробу
+    if [[ "$cpu" -eq 0 ]]; then
+        sleep 0.2
+        cpu=$(_get_cpu_usage_percent)
+        [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
+    fi
+    [[ "$cpu" -lt "$cpu_lim" ]]
+}
+
+# Ждать свободный слот для задачи. Общесистемный лимит придерживает *дополнительные*
+# воркеры, когда CPU/MEM ≥ лимита, но никогда не блокирует навечно:
+#   - 0 запущенных воркеров → всегда разрешить 1 (гарантия прогресса; избегаем зависания на загруженных хостах)
+#   - ≥1 запущено → ждать запаса ресурсов или завершения задачи, до RESOURCE_WAIT_MAX
+_collector_wait_slot() {
+    local max_jobs="$1" pid alive
+    local waited=0
+    local max_wait="${RESOURCE_WAIT_MAX:-120}"
+    local gate_warned=0
+    # Инициализируем счётчик CPU
+    _get_cpu_usage_percent >/dev/null
+    while true; do
+        alive=()
+        for pid in "${COLLECTOR_JOB_PIDS[@]+"${COLLECTOR_JOB_PIDS[@]}"}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                alive+=("$pid")
+            else
+                wait "$pid" 2>/dev/null || true
+            fi
+        done
+        COLLECTOR_JOB_PIDS=("${alive[@]+"${alive[@]}"}")
+
+        if [[ ${#COLLECTOR_JOB_PIDS[@]} -lt "$max_jobs" ]]; then
+            if _collector_resources_ok; then
+                return 0
+            fi
+            # Воркеров пока нет → нужно запустить хотя бы один, иначе deadlock на загруженных хостах (MEM часто ≥80%)
+            if [[ ${#COLLECTOR_JOB_PIDS[@]} -eq 0 ]]; then
+                if [[ "$gate_warned" -eq 0 ]]; then
+                    info "host CPU/MEM at/above ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}% — starting 1 worker (avoid hang)"
+                    gate_warned=1
+                fi
+                return 0
+            fi
+            # Воркеры уже есть: ждём снижения нагрузки или завершения задачи
+            if [[ "$waited" -ge "$max_wait" ]]; then
+                if [[ "$gate_warned" -eq 0 ]]; then
+                    info "host load gate wait ${max_wait}s — allowing another worker"
+                    gate_warned=1
+                fi
+                return 0
+            fi
+        fi
+
+        _collector_should_stop && return 1
+
+        if [[ ${#COLLECTOR_JOB_PIDS[@]} -gt 0 ]]; then
+            if ! wait -n 2>/dev/null; then
+                sleep 0.3
+                waited=$((waited + 1))
+            fi
+        else
+            sleep 0.3
+            waited=$((waited + 1))
+        fi
+    done
+}
+
+_collector_wait_all_jobs() {
+    local pid
+    for pid in "${COLLECTOR_JOB_PIDS[@]+"${COLLECTOR_JOB_PIDS[@]}"}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    COLLECTOR_JOB_PIDS=()
+}
+
+
+
+# ==========================================================================
+# РАЗДЕЛ: 07_pkg_checks
+# ==========================================================================
+# Назначение: Низкоуровневые примитивы по пакетному менеджеру (зависимости, версия, наличие) и проверки состояния конкретного продукта/пакета (служба, порт, API, логи, конфиги).
+# Публичные функции: get_pkg_depends(), get_dep_version(), is_dep_installed(), register_dep(), is_pkg_installed_tiny(), check_process(), check_ports(), check_api_health(), check_single_pkg(), run_product_checks(), is_lib_available()
+# Зависит от: 00_globals.sh, 01_catalog.sh, 02_output.sh, 04_os_detect.sh, 05_system_metrics.sh (_sys_pkg_pids)
+# Не зависит от: от инфраструктуры/repo-проверок и от agent/logging — это их общая база, а не наоборот
+# Side effects: запускает dpkg/rpm/pacman/apk/systemctl/ss/curl; печатает разделы по продуктам; заполняет ALL_DEPENDS
+#
+# Источник: перенесено без изменений логики из flat_check.sh (строки 1006-1880).
+
 # --- Список сырых зависимостей по PM -----------------------------------------
 # По одной самодостаточной функции на каждый пакетный менеджер: печатает сырую,
 # нефильтрованную строку зависимостей для установленного пакета, используя только
@@ -1038,6 +1578,7 @@ check_system() {
 # PM-агностичную очистку (убрать версионные ограничения/альтернативы, дедуп).
 
 # Debian-семья: строка Depends: из dpkg -s, запасной вариант — apt-cache depends.
+
 get_pkg_depends_dpkg() {
     local pkg="$1" deps=""
 
@@ -1905,6 +2446,18 @@ is_lib_available() {
     return 1
 }
 
+
+# ==========================================================================
+# РАЗДЕЛ: 08_infra_checks
+# ==========================================================================
+# Назначение: Инфраструктурные пакеты (nginx/postgresql/mariadb — без require /opt/flat), список репозиториев по PM, финальный === Summary ===.
+# Публичные функции: check_infrastructure(), check_repositories(), print_summary()
+# Зависит от: 00_globals.sh, 02_output.sh, 04_os_detect.sh, 07_pkg_checks.sh
+# Не зависит от: ничего в core/logging не зависит от этого модуля
+# Side effects: печатает разделы === Infrastructure === / === Summary ===, читает списки репозиториев PM
+#
+# Источник: перенесено без изменений логики из flat_check.sh (строки 1881-2241).
+
 # --- 5. Инфраструктура + репозитории --------------------------------------------
 # Проверить все собранные зависимости (Infrastructure)
 # Найти первую службу-кандидата systemd, чей unit-*файл* существует, и
@@ -1914,6 +2467,7 @@ is_lib_available() {
 # никогда не сообщаем о кандидате, чей unit вообще не был установлен.
 # Возвращает 0, если найден подходящий unit-файл, иначе 1 (вызывающий код решает,
 # что значит "нет ни одного подходящего unit" для этой зависимости).
+
 _infra_report_first_unit() {
     local label="$1"; shift
     local svc active
@@ -2266,847 +2820,1077 @@ print_summary() {
 }
 
 
-# --- 9. Параллельный опрос пакетов (resource-gate) ------------------------------
-# Те же хелперы, что использует run_product_checks() в flat_check_2.sh.
-# Имена _collector_* сохранены намеренно — поведение 1к1 с flat_check_2.
 
-# Для health-check всегда «не останавливаться» (флаги сборщика логов отсутствуют).
-_collector_should_stop() {
+# ==========================================================================
+# РАЗДЕЛ: 09_argv
+# ==========================================================================
+# Назначение: Разбор аргументов командной строки (usage()/parse_args()) и
+#   финальный диспетчер режимов (dispatch_main()) — какой путь выполнить
+#   после того, как флаги разобраны и точка входа подключила lib/agent
+#   и/или lib/logging (если они понадобились по флагам).
+# Публичные функции: usage(), parse_args("$@"), dispatch_main("$@")
+# Зависит от: 00_globals.sh, 02_output.sh (die/info/_log_line), 04_os_detect.sh,
+#   05_system_metrics.sh, 07_pkg_checks.sh, 08_infra_checks.sh — всегда;
+#   отдельные ветки dispatch_main() дополнительно ожидают lib/agent (--json/--push,
+#   --config) и/или lib/logging (-i/-log) уже подключёнными точкой входа.
+# Не зависит от: ничего внутри lib/agent или lib/logging напрямую — только
+#   вызывает их функции по имени, когда до этого дошло исполнение
+# Side effects: печатает справку и выходит (usage()/-h/-v), пишет INFO о запуске
+#   в сессионный лог, завершает процесс (exit) в конце большинства веток
+#
+# Источник: usage()+parse_args() перенесены без изменений логики из
+#   flat_check_2.sh (строки 8584-9006, полный CLI — health + JSON agent +
+#   мастер + сборщик логов, тот же набор флагов что и раньше, ничего не
+#   переименовано). dispatch_main() — тело main() оттуда же (строки 9010-9071),
+#   вынесенное в отдельную функцию: раньше parse_args() и диспетчеризация были
+#   одной функцией main(); в модульной версии их разнесли, чтобы точка входа
+#   могла подключить lib/agent/lib/logging МЕЖДУ разбором флагов и запуском —
+#   логика внутри не менялась ни на строчку, только физическое разделение.
+
+
+# ИСКЛЮЧЕНИЕ (найдено при финальной проверке после консолидации в 3 файла):
+# _parse_size_to_bytes() перенесена сюда из lib/logging.sh — она нужна
+# parse_args() при разборе --chunk-size, а parse_args() выполняется ДО того,
+# как точка входа решает, подключать ли lib/logging (решение принимается по
+# уже разобранным флагам). Раньше это работало только потому, что
+# --chunk-size обычно идёт вместе с -log (который сам включает lib/logging),
+# но `./flat_check --chunk-size 50M` без -log падал "command not found" —
+# lib/logging на этот момент ещё не был подключён. Сама функция ничего не
+# знает про logging (чистый парсер "50M"/"200000000" в байты), так что
+# перенос в core корректен и по смыслу, не только по необходимости.
+
+# Разбор человеко-читаемого размера (--chunk-size) в байты: "500000000",
+# "100M"/"100MB", "2G"/"2GB", "512K"/"512KB" (регистр не важен, суффикс "B"
+# необязателен). Печатает байты, возвращает 1 при нераспознанном формате.
+# Используется --chunk-size (parse_args ниже) и шагом настройки chunk'ов в
+# мастере (раздел 10_wizard, тот же файл). Чистая функция, никаких внешних
+# зависимостей.
+_parse_size_to_bytes() {
+    local raw="${1^^}" num unit
+    if [[ "$raw" =~ ^([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$raw" =~ ^([0-9]+)(K|M|G)B?$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            K) echo "$((num * 1024))" ;;
+            M) echo "$((num * 1024 * 1024))" ;;
+            G) echo "$((num * 1024 * 1024 * 1024))" ;;
+        esac
+        return 0
+    fi
     return 1
 }
 
-_collector_max_jobs() {
-    local n cores
-    if [[ "${COLLECTOR_JOBS:-0}" -gt 0 ]]; then
-        echo "$COLLECTOR_JOBS"
-        return 0
-    fi
-    cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-    [[ -z "$cores" || "$cores" -lt 1 ]] && cores=4
-    # Лимит воркеров по умолчанию от числа ядер; запуск всё равно ограничен общесистемными лимитами RESOURCE_*
-    n=$(( cores * ${RESOURCE_CPU_LIMIT:-80} / 100 ))
-    [[ "$n" -lt 1 ]] && n=1
-    [[ "$n" -gt 32 ]] && n=32
-    echo "$n"
+usage() {
+    cat <<'EOF'
+flat_check — FLAT/FCS health check + log collector
+
+Usage: flat_check [MODE] [OPTIONS]
+
+Modes:
+  (no args)               Health check (installed services only)
+  -i, --interactive       Interactive wizard (language, mode, log options)
+  --dev                   Extended self-test (VERBOSE health all packages + seek/chunk)
+  --selftest simple|extended
+                          Self-test: simple = functions launch; extended = same as --dev
+  --debug                 Mirror DEBUG-level session log lines to the screen (stderr)
+  -log                    Log collector mode
+    -on, --online         Real-time capture (tail -F + optional tcpdump)
+    -off, --offline       Copy/extract existing logs
+    -t, --timeout DUR     Alone: last N / online timeout (e.g. 5h, 30m).
+                          After -f: range end (alias of -e/--to). Order -t … -f is an error.
+    -f, --from TIME       Range start (e.g. -2h, 25.06.2026 10:00)
+    -e, --to TIME         Range end (e.g. -1h, 25.06.2026 12:00)
+    --until TIME          Same as -e/--to
+                          Range: -t 2h | -f -2h -e -1h | -f '…' -t '…' | -f '…' -e '…'
+    -n, --no-tcpdump      Skip network capture (online only)
+    -j, --jobs N          Offline: parallel file copy workers (default: nproc*80%, max 32)
+    --chunk-mode size|lines  Offline: how to split large output logs (default: size)
+    --chunk-size SIZE     Offline: max size per part when --chunk-mode size (e.g. 50M, 200M; default: 100M)
+    --chunk-lines N       Offline: max lines per part when --chunk-mode lines (default: 500000)
+    --scope brief|extended  Brief = selected services only (default);
+                          extended = + system/nginx/postgresql/configs (+ tcpdump online)
+    -p, --product NAME    Product to collect (repeatable; see --list-targets)
+    -s, --service PKG     Service/package to collect (repeatable)
+    --list-targets        List products/services present on host and exit
+    --mgcpclient          SoftSwitch/fss-server: include mgcpclient logs (no prompt)
+    --no-mgcpclient       SoftSwitch/fss-server: skip mgcpclient logs (no prompt)
+  -v, --version           Print script version and exit
+  -r, --repo              Show repositories (APT/YUM sources)
+  -o, --output DIR        Write archive to DIR (log mode only)
+  -h, --help              Show this help and exit
+
+Duration suffixes: s=sec, m=min, h=hour, d=day. Bare number = seconds
+
+Offline log range (IMPORTANT):
+  Unlike flat_check_old, time range filters log LINES by timestamp inside files,
+  not only by file modification time. Supports formats:
+    2026-06-25 14:01:49
+    25.06.2026 14:01:49
+    08.06.2026 14:17:29.791
+  Large plain logs (>=1MB): binary-search start/end offsets, then parallel chunk-scan
+  of that window (multi-worker; hang-safe host load gate). Files >=1GB use larger chunks.
+  .gz and tiny files: linear awk. Unsorted large plain: parallel full-file chunk-scan.
+  Same idea as timegrep/tgrep/archeolog (bisect), plus parallel window scan for throughput.
+
+Log discovery:
+  Only known package dirs (PKG_PRODUCT + PKG_LEGACY under /var/log/flat and /opt/flat).
+  Unknown folders (e.g. logforflat) are skipped with [INFO] skip unknown.
+  Default without -p/-s: all packages present on the host.
+  If selection includes fss-server: prompts for mgcpclient (or --mgcpclient / --no-mgcpclient).
+  Other SoftSwitch services (fss-frontend/backend/…) do not prompt.
+  When skipped: excludes mgcpclient* files inside fss-server dirs as well.
+  PostgreSQL / system / nginx / configs: only with --scope extended
+  Offline workers respect host-wide ~80% CPU and ~80% memory (/proc/stat, /proc/meminfo):
+  workers are not spawned when the whole system is already at or above the limit (Zabbix-friendly).
+
+Log collection messages ([INFO]):
+  If logs are missing, the script reports why — this is not an error:
+    offline with -t/-f/-e  → [INFO] no logs for the specified time period
+    online (-log -on)      → [INFO] no logs during collection
+    offline without range  → [INFO] no logs
+  PostgreSQL: also reports missing directory, no access (run as root/sudo)
+  Absent-log hints show source label (nginx, system, postgresql) and up to 4 file names (+N more)
+
+Log collection:
+  Offline: parallel copy of log files (up to nproc workers, -j to override)
+  Online: one tail -F process per source log file (same layout as offline archive)
+  Empty files created during collection with no new lines are removed before archiving
+
+Session log (<script-name>.log):
+  Every run writes a full log of its own work: invocation args or wizard
+  choices, which log dirs/files were found and which were discarded (and
+  why), host CPU/MEM snapshots at start/stop and every 30s during collection.
+  -log: the log file is written inside the collection work dir and packed
+        into the same .tar.gz as the collected logs.
+  otherwise: written next to the script (or -o/--output) and overwritten on
+        each run (no rotation, safe for frequent cron/Zabbix invocations).
+  Terminal [OK]/[WARN]/[FAIL]/[INFO] lines are mirrored there with a
+  timestamp; fine-grained "found/discarded"/resource entries are DEBUG-level
+  and file-only, so the screen output is unaffected.
+
+Required dependencies:
+  bash, coreutils (date, find, cp, tar, mkdir, wc, sort)
+  awk (gawk) — offline log line filtering by timestamp
+  tail — online log collection
+  grep — fallback pattern search in logs
+  gzip OR pigz — archive compression (pigz preferred if available)
+
+Optional dependencies:
+  tcpdump — network capture in online mode (needs root)
+  zcat/gzip — reading .gz log files
+  curl — API health checks in check mode
+  ss or netstat — port checks
+  dpkg or rpm — package manager detection
+  systemctl — service status checks
+  nginx -t — nginx config validation
+
+JSON agent:
+  --config FILE         agent config (/etc/flat/flat_check.conf)
+  --pkg NAME            single package (health/JSON)
+  --product NAME        product filter for health/JSON
+                        (in -log mode -p still selects log products)
+  --json                emit full health JSON v2 to stdout
+  --push                POST JSON to all PUSH_URLS (http/https)
+  --host-id|--host-ip|--service-name   host identity overrides
+
+Examples:
+  ./flat_check                    # Health check only
+  ./flat_check -i                 # Interactive wizard
+  ./flat_check --json
+  ./flat_check --config /etc/flat/flat_check.conf --json --push
+  ./flat_check --pkg fss-server --json
+  ./flat_check -log --list-targets
+  ./flat_check -log -off -t 2h --scope brief -p SoftSwitch --no-mgcpclient
+  ./flat_check -log -off -f -1d --scope extended -s fcs-swui
+  ./flat_check -log -on -t 30m --scope brief -p "Contact Center" -s acs-server
+  ./flat_check -v                 # Print version
+  ./flat_check --selftest simple  # Quick self-test
+  ./flat_check --dev              # Extended self-test
+
+Installer / conf: see agent/README.md
+
+---
+
+flat_check — проверка FLAT/FCS + сборщик логов
+
+Использование: flat_check [РЕЖИМ] [ОПЦИИ]
+
+Режимы:
+  (без аргументов)        Проверка установленных служб
+  -i, --interactive       Интерактивный мастер (язык, режим, параметры логов)
+  --dev                   Расширенный самотест (VERBOSE health по всем пакетам + seek/chunk)
+  --selftest simple|extended
+                          Самотест: simple = запуск функций; extended = как --dev
+  --debug                 Дублировать DEBUG-строки сессионного лога на экран (stderr)
+  -log                    Режим сборщика логов
+    -on, --online         Сбор в реальном времени (tail -F + опц. tcpdump)
+    -off, --offline       Копирование/извлечение готовых логов
+    -t, --timeout ДЛИТ    Одно: last N / online timeout (например 5h, 30m).
+                          После -f: конец диапазона (как -e/--to). Порядок -t … -f — ошибка.
+    -f, --from TIME       Начало диапазона (например -2h, 25.06.2026 10:00)
+    -e, --to TIME         Конец диапазона (например -1h, 25.06.2026 12:00)
+    --until TIME          То же, что -e/--to
+                          Диапазон: -t 2h | -f -2h -e -1h | -f '…' -t '…' | -f '…' -e '…'
+    -n, --no-tcpdump      Не записывать сетевой трафик (только online)
+    -j, --jobs N          Offline: число параллельных копий файлов (по умолч. nproc*80%, макс. 32)
+    --chunk-mode size|lines  Offline: как резать крупные логи (по умолч. size)
+    --chunk-size РАЗМЕР   Offline: макс. размер одной части при --chunk-mode size (например 50M, 200M; по умолч. 100M)
+    --chunk-lines N       Offline: макс. строк в одной части при --chunk-mode lines (по умолч. 500000)
+    --scope brief|extended  Краткий = только выбранные службы (по умолч.);
+                          расширенный = + system/nginx/postgresql/configs (+ tcpdump online)
+    -p, --product NAME    Продукт (повторяемый; см. --list-targets)
+    -s, --service PKG     Служба/пакет (повторяемый)
+    --list-targets        Показать продукты/службы на хосте и выйти
+    --mgcpclient          SoftSwitch/fss-server: включить логи mgcpclient (без вопроса)
+    --no-mgcpclient       SoftSwitch/fss-server: не собирать mgcpclient (без вопроса)
+  -v, --version           Показать версию скрипта и выйти
+  -r, --repo              Показать репозитории (APT/YUM sources)
+  -o, --output ДИР        Записать архив в директорию (только -log)
+  -h, --help              Показать справку и выйти
+
+Offline диапазон (ВАЖНО):
+  В отличие от flat_check_old, диапазон фильтрует СТРОКИ логов по метке времени
+  внутри файла, а не только по дате изменения файла. Форматы:
+    2026-06-25 14:01:49
+    25.06.2026 14:01:49
+    08.06.2026 14:17:29.791
+  Крупные plain-логи (>=1MB): binary-search границ from/to, затем параллельный
+  chunk-scan окна (несколько воркеров; hang-safe лимит нагрузки хоста). При >=1GB —
+  крупные чанки. .gz и мелкие файлы: линейный awk. Неупорядоченные крупные: parallel
+  full-file scan. Как timegrep/tgrep/archeolog (бисекция) + параллельный проход окна.
+
+Поиск логов:
+  Только известные каталоги пакетов (PKG_PRODUCT + PKG_LEGACY в /var/log/flat и /opt/flat).
+  Неизвестные папки (например logforflat) пропускаются: [INFO] skip unknown.
+  Без -p/-s: все пакеты, присутствующие на хосте.
+  Если в выборе есть fss-server: спрашивает про mgcpclient (или --mgcpclient / --no-mgcpclient).
+  Остальные службы SoftSwitch (fss-frontend/backend/…) — без вопроса.
+  При отказе: исключает и файлы mgcpclient* внутри каталогов fss-server.
+  PostgreSQL / system / nginx / configs: только с --scope extended
+  Offline-воркеры учитывают нагрузку всей системы ~до 80% CPU и 80% RAM (/proc/stat, /proc/meminfo):
+  при CPU или RAM системы ≥80% новые воркеры не стартуют (удобно для Zabbix).
+
+Сообщения при сборе логов ([INFO]):
+  Если логов нет — скрипт сообщает об этом, это не ошибка:
+    offline с -t/-f/-e  → [INFO] за указанное время логи отсутствуют
+    online (-log -on)   → [INFO] за время сбора логи отсутствуют
+    offline без диапазона → [INFO] логи отсутствуют
+  PostgreSQL: также сообщает об отсутствии каталога, нет доступа (нужен root/sudo)
+  Подсказки по отсутствующим логам: метка источника (nginx, system, postgresql) и до 4 имён файлов (+N ещё)
+
+Сбор логов:
+  Offline: параллельное копирование файлов (до nproc*80% воркеров, -j для переопределения)
+  Online: отдельный tail -F на каждый исходный лог-файл (структура архива как в offline)
+  Пустые файлы без новых строк удаляются перед упаковкой архива
+
+Обязательные зависимости:
+  bash, coreutils (date, find, cp, tar, mkdir, wc, sort)
+  awk (gawk) — фильтрация строк логов offline по метке времени
+  tail — online сбор логов
+  grep — резервный поиск по шаблонам в логах
+  gzip ИЛИ pigz — сжатие архива (предпочтительно pigz)
+
+Опциональные зависимости:
+  tcpdump — захват сети в online режиме (нужен root)
+  zcat/gzip — чтение .gz логов
+  curl — проверка API health в режиме проверки
+  ss или netstat — проверка портов
+  dpkg или rpm — определение пакетного менеджера
+  systemctl — статус служб
+  nginx -t — проверка конфигурации nginx
+
+JSON-агент:
+  --config FILE         конфиг агента (/etc/flat/flat_check.conf)
+  --pkg NAME            один пакет (health/JSON)
+  --product NAME        фильтр продукта (health/JSON); в -log — выбор лога
+  --json                полный health JSON v2 в stdout
+  --push                POST JSON на все PUSH_URLS (http/https)
+  --host-id|--host-ip|--service-name   идентификация хоста
+
+Примеры:
+  ./flat_check                    # Только проверка
+  ./flat_check -i                 # Интерактивный мастер
+  ./flat_check --json
+  ./flat_check --config /etc/flat/flat_check.conf --json --push
+  ./flat_check --pkg fss-server --json
+  ./flat_check -log --list-targets
+  ./flat_check -log -off -t 2h --scope brief -p SoftSwitch --no-mgcpclient
+  ./flat_check -log -off -f -1d --scope extended -s fcs-swui
+  ./flat_check -log -on -t 30m --scope brief -p "Contact Center"
+  ./flat_check -v                 # Версия
+  ./flat_check --selftest simple  # Быстрый самотест
+  ./flat_check --dev              # Расширенный самотест
+
+Установка: см. agent/README.md
+EOF
+    exit 0
 }
 
-# Процент использованной памяти по всему хосту (100 - MemAvailable/MemTotal*100)
-_get_mem_usage_percent() {
-    local pct
-    # Предпочитать MemAvailable; запасной вариант MemFree (в Git Bash / нестандартных ядрах может не быть Available)
-    pct=$(awk '/MemTotal:/ {t=$2} /MemAvailable:/ {a=$2} /MemFree:/ {f=$2} END {
-        if (t+0 <= 0) { print 0; exit }
-        if (a+0 <= 0) a = f
-        printf "%d", int((t - a) * 100 / t);
-    }' /proc/meminfo 2>/dev/null)
-    echo "${pct:-0}"
-}
-
-# Процент занятости CPU системы через дельту /proc/stat (первый вызов инициализирует, возвращает 0)
-_get_cpu_usage_percent() {
-    local user nice system idle iowait irq softirq steal guest guest_nice
-    local idle_all non_idle total diff_idle diff_total pct
-    # shellcheck disable=SC2034
-    read -r _cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat 2>/dev/null || {
-        echo 0
-        return 0
-    }
-    idle_all=$((idle + iowait))
-    non_idle=$((user + nice + system + irq + softirq + steal))
-    total=$((idle_all + non_idle))
-    if [[ -z "${_CPU_PREV_TOTAL:-}" || "${_CPU_PREV_TOTAL}" -eq 0 ]]; then
-        _CPU_PREV_IDLE=$idle_all
-        _CPU_PREV_TOTAL=$total
-        echo 0
-        return 0
-    fi
-    diff_idle=$((idle_all - _CPU_PREV_IDLE))
-    diff_total=$((total - _CPU_PREV_TOTAL))
-    _CPU_PREV_IDLE=$idle_all
-    _CPU_PREV_TOTAL=$total
-    if [[ "$diff_total" -le 0 ]]; then
-        echo 0
-        return 0
-    fi
-    pct=$(( (100 * (diff_total - diff_idle)) / diff_total ))
-    [[ "$pct" -lt 0 ]] && pct=0
-    [[ "$pct" -gt 100 ]] && pct=100
-    echo "$pct"
-}
-
-# Истина, если CPU и память всего хоста в пределах настроенных лимитов
-_collector_resources_ok() {
-    local cpu mem cpu_lim mem_lim
-    cpu_lim=${RESOURCE_CPU_LIMIT:-80}
-    mem_lim=${RESOURCE_MEM_LIMIT:-80}
-    mem=$(_get_mem_usage_percent)
-    [[ "$mem" =~ ^[0-9]+$ ]] || mem=0
-    if [[ "$mem" -ge "$mem_lim" ]]; then
-        return 1
-    fi
-    cpu=$(_get_cpu_usage_percent)
-    [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
-    # Первая проба /proc/stat всегда возвращает 0 — всегда берём вторую пробу
-    if [[ "$cpu" -eq 0 ]]; then
-        sleep 0.2
-        cpu=$(_get_cpu_usage_percent)
-        [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
-    fi
-    [[ "$cpu" -lt "$cpu_lim" ]]
-}
-
-# Ждать свободный слот для задачи. Общесистемный лимит придерживает *дополнительные*
-# воркеры, когда CPU/MEM ≥ лимита, но никогда не блокирует навечно:
-#   - 0 запущенных воркеров → всегда разрешить 1 (гарантия прогресса; избегаем зависания на загруженных хостах)
-#   - ≥1 запущено → ждать запаса ресурсов или завершения задачи, до RESOURCE_WAIT_MAX
-_collector_wait_slot() {
-    local max_jobs="$1" pid alive
-    local waited=0
-    local max_wait="${RESOURCE_WAIT_MAX:-120}"
-    local gate_warned=0
-    # Инициализируем счётчик CPU
-    _get_cpu_usage_percent >/dev/null
-    while true; do
-        alive=()
-        for pid in "${COLLECTOR_JOB_PIDS[@]+"${COLLECTOR_JOB_PIDS[@]}"}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                alive+=("$pid")
-            else
-                wait "$pid" 2>/dev/null || true
-            fi
-        done
-        COLLECTOR_JOB_PIDS=("${alive[@]+"${alive[@]}"}")
-
-        if [[ ${#COLLECTOR_JOB_PIDS[@]} -lt "$max_jobs" ]]; then
-            if _collector_resources_ok; then
-                return 0
-            fi
-            # Воркеров пока нет → нужно запустить хотя бы один, иначе deadlock на загруженных хостах (MEM часто ≥80%)
-            if [[ ${#COLLECTOR_JOB_PIDS[@]} -eq 0 ]]; then
-                if [[ "$gate_warned" -eq 0 ]]; then
-                    info "host CPU/MEM at/above ${RESOURCE_CPU_LIMIT}%/${RESOURCE_MEM_LIMIT}% — starting 1 worker (avoid hang)"
-                    gate_warned=1
-                fi
-                return 0
-            fi
-            # Воркеры уже есть: ждём снижения нагрузки или завершения задачи
-            if [[ "$waited" -ge "$max_wait" ]]; then
-                if [[ "$gate_warned" -eq 0 ]]; then
-                    info "host load gate wait ${max_wait}s — allowing another worker"
-                    gate_warned=1
-                fi
-                return 0
-            fi
-        fi
-
-        _collector_should_stop && return 1
-
-        if [[ ${#COLLECTOR_JOB_PIDS[@]} -gt 0 ]]; then
-            if ! wait -n 2>/dev/null; then
-                sleep 0.3
-                waited=$((waited + 1))
-            fi
-        else
-            sleep 0.3
-            waited=$((waited + 1))
-        fi
-    done
-}
-
-_collector_wait_all_jobs() {
-    local pid
-    for pid in "${COLLECTOR_JOB_PIDS[@]+"${COLLECTOR_JOB_PIDS[@]}"}"; do
-        wait "$pid" 2>/dev/null || true
-    done
-    COLLECTOR_JOB_PIDS=()
-}
-
-
-# --- JSON report / config / push (agent) ---------------------------------------
-# Общий блок для flat_check.sh и health-пути flat_check_2.sh.
-# Формирует JSON v2 и пушит на один или несколько HTTP/HTTPS URL.
-
-# Дефолты (не затираем значения из section 0 / окружения)
-: "${OUTPUT_JSON:=0}"
-: "${DO_PUSH:=0}"
-: "${CONFIG_FILE:=}"
-: "${SINGLE_PKG:=}"
-: "${FILTER_PRODUCT:=}"
-: "${HOST_ID:=}"
-: "${HOST_IP:=}"
-: "${SERVICE_NAME:=}"
-: "${PUSH_URLS:=${PUSH_URL:-}}"
-: "${PUSH_TOKEN:=}"
-: "${PUSH_TOKENS:=}"
-: "${PUSH_AUTH_HEADER:=Authorization: Bearer}"
-: "${PUSH_CONNECT_TIMEOUT:=5}"
-: "${PUSH_MAX_TIME:=30}"
-: "${PUSH_RETRIES:=2}"
-: "${PUSH_INSECURE:=0}"
-: "${SHOW_REPOS_JSON:=0}"
-
-# Значение из "KEY=..." строки конфига: снимает окружающие кавычки и то, что
-# после них (инлайн-комментарий) — например,
-# SERVICE_NAME="fss-backend"    # см. service_names.md
-# наивный ${val%\"} снимает кавычку только если она в самом конце строки, а
-# ".*" в regex вызова уже захватил весь хвост вместе с комментарием, так что
-# без этой функции в SERVICE_NAME утекало 'fss-backend"    # см. ...'.
-_conf_strip_value() {
-    local raw="$1" val
-    if [[ "$raw" =~ ^[[:space:]]*\"(.*)$ ]]; then
-        val="${BASH_REMATCH[1]%%\"*}"
-    elif [[ "$raw" =~ ^[[:space:]]*\'(.*)$ ]]; then
-        val="${BASH_REMATCH[1]%%\'*}"
-    else
-        val="${raw%%#*}"
-        val="${val%"${val##*[![:space:]]}"}"
-        val="${val#"${val%%[![:space:]]*}"}"
-    fi
-    printf '%s' "$val"
-}
-
-_json_load_config() {
-    # Conf заполняет только пустые переменные: CLI и env имеют приоритет.
-    local f="$1" line key val
-    [[ -n "$f" && -f "$f" ]] || return 0
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "${line//[[:space:]]/}" ]] && continue
-        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-            key="${BASH_REMATCH[1]}"
-            val="$(_conf_strip_value "${BASH_REMATCH[2]}")"
-            case "$key" in
-                HOST_ID) [[ -z "${HOST_ID}" ]] && HOST_ID="$val" ;;
-                HOST_IP) [[ -z "${HOST_IP}" ]] && HOST_IP="$val" ;;
-                SERVICE_NAME) [[ -z "${SERVICE_NAME}" ]] && SERVICE_NAME="$val" ;;
-                PUSH_URLS) [[ -z "${PUSH_URLS}" ]] && PUSH_URLS="$val" ;;
-                PUSH_URL) [[ -z "${PUSH_URL:-}" ]] && PUSH_URL="$val" ;;
-                PUSH_TOKEN) [[ -z "${PUSH_TOKEN}" ]] && PUSH_TOKEN="$val" ;;
-                PUSH_TOKENS) [[ -z "${PUSH_TOKENS}" ]] && PUSH_TOKENS="$val" ;;
-                PUSH_AUTH_HEADER) [[ -z "${PUSH_AUTH_HEADER}" ]] && PUSH_AUTH_HEADER="$val" ;;
-                PACKAGES) [[ -z "${PACKAGES}" ]] && PACKAGES="$val" ;;
-                PRODUCT) [[ -z "${PRODUCT:-}" ]] && PRODUCT="$val" ;;
-                PUSH_CONNECT_TIMEOUT|PUSH_MAX_TIME|PUSH_RETRIES)
-                    [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
-                    ;;
-                PUSH_INSECURE)
-                    [[ "$val" =~ ^[01]$ ]] && PUSH_INSECURE="$val"
-                    ;;
-                COLLECTOR_JOBS|JOBS)
-                    if [[ "$val" =~ ^[0-9]+$ && "${COLLECTOR_JOBS:-0}" -eq 0 ]]; then
-                        COLLECTOR_JOBS="$val"
-                    fi
-                    ;;
-            esac
-        fi
-    done < "$f"
-    if [[ -z "$PUSH_URLS" && -n "${PUSH_URL:-}" ]]; then
-        PUSH_URLS="$PUSH_URL"
-    fi
-    if [[ -n "${PRODUCT:-}" && -z "$FILTER_PRODUCT" ]]; then
-        FILTER_PRODUCT="$PRODUCT"
-    fi
-}
-
-_json_detect_host_ip() {
-    local ip
-    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    [[ -n "$ip" ]] && { echo "$ip"; return 0; }
-    ip=$(ip -4 route get 1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-    echo "${ip:-}"
-}
-
-_json_ensure_identity() {
-    [[ -n "$HOST_ID" ]] || HOST_ID="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
-    [[ -n "$HOST_IP" ]] || HOST_IP="$(_json_detect_host_ip)"
-    [[ -n "$SERVICE_NAME" ]] || SERVICE_NAME="${SINGLE_PKG:-unknown}"
-}
-
-# Экранирование строки для JSON (без внешних зависимостей).
-_json_esc() {
-    local s="${1:-}"
-    s=${s//\\/\\\\}
-    s=${s//\"/\\\"}
-    s=${s//$'\n'/\\n}
-    s=${s//$'\r'/\\r}
-    s=${s//$'\t'/\\t}
-    printf '%s' "$s"
-}
-
-_json_arr_from_csv() {
-    local csv="${1:-}" first=1 item
-    printf '['
-    if [[ -n "$csv" ]]; then
-        IFS=',' read -ra _items <<< "$csv"
-        for item in "${_items[@]}"; do
-            item="${item#"${item%%[![:space:]]*}"}"
-            item="${item%"${item##*[![:space:]]}"}"
-            [[ -z "$item" ]] && continue
-            [[ $first -eq 1 ]] || printf ','
-            first=0
-            printf '"%s"' "$(_json_esc "$item")"
-        done
-    fi
-    printf ']'
-}
-
-# Собрать JSON-объект одного пакета (без печати human-output).
-_json_collect_pkg() {
-    local pkg="$1"
-    local legacy="${PKG_LEGACY[$pkg]:-}"
-    local status="not_installed" ver="" unit="${pkg}.service"
-    local unit_path="" active="unknown" enabled="unknown"
-    local opt_path="/opt/flat/$pkg" opt_owner="" opt_status="missing"
-    local log_path="/var/log/flat/$pkg" log_owner="" log_status="missing"
-    local deps_meta="${PKG_DEPS[$pkg]:-}" deps_pm=""
-    local pids="" ps_lines="" proc_status="not running"
-    local ports_json="" api_url="" api_code=0 api_status="n/a"
-    local configs_json="" port_spec port open
-    local ngx_av ngx_en lr sudoers
-
-    FOUND_PKG_VER=""
-    if is_pkg_installed_tiny "$pkg" "$legacy"; then
-        # тихий сбор версии без print_*
-        case "$PM" in
-            dpkg)
-                ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
-                [[ -z "$ver" && -n "$legacy" ]] && ver=$(dpkg-query -W -f='${Version}' $(echo "$legacy" | tr ',' ' ' | awk '{print $1}') 2>/dev/null)
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -i|--interactive)
+                MODE_INTERACTIVE=1
+                shift
                 ;;
-            rpm)
-                ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null) || true
+            -v|--version)
+                echo "flat_check ${SCRIPT_VERSION}"
+                exit 0
+                ;;
+            --dev)
+                SELFTEST_MODE="extended"
+                MODE_DEV=1
+                shift
+                ;;
+            --debug)
+                DEBUG_MODE=1
+                shift
+                ;;
+            --selftest)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for --selftest (simple|extended)"; fi
+                case "$2" in
+                    simple|extended) SELFTEST_MODE="$2" ;;
+                    *) die "Invalid --selftest: '$2' (use simple|extended)" ;;
+                esac
+                [[ "$SELFTEST_MODE" == "extended" ]] && MODE_DEV=1
+                shift 2
+                ;;
+            -log)
+                MODE_LOG=1
+                shift
+                ;;
+            -on|--online)
+                LOG_SUBMODE="online"
+                shift
+                ;;
+            -off|--offline)
+                LOG_SUBMODE="offline"
+                shift
+                ;;
+            -t|--timeout)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                # Контекст: если -f уже был — это конец диапазона (alias --to).
+                # Иначе — last-N / online timeout.
+                if [[ "${CLI_FROM_SET:-0}" -eq 1 ]]; then
+                    if [[ "${CLI_TO_SET:-0}" -eq 1 ]]; then
+                        die "Conflicting end time: both -e/--to and -t used as range end"
+                    fi
+                    TO_TIME="$2"
+                    CLI_TO_SET=1
+                    CLI_T_AS_TO=1
+                else
+                    TIMEOUT_RAW="$2"
+                    CLI_TIMEOUT_SET=1
+                fi
+                shift 2
+                ;;
+            --until)
+                if [[ -z "${2:-}" ]]; then die "Missing value for $1"; fi
+                if [[ "${CLI_TO_SET:-0}" -eq 1 ]]; then
+                    die "Conflicting end time: --until with existing -e/-t end"
+                fi
+                TO_TIME="$2"
+                CLI_TO_SET=1
+                shift 2
+                ;;
+            -f|--from)
+                if [[ -z "${2:-}" ]]; then die "Missing value for $1"; fi
+                if [[ "${CLI_TIMEOUT_SET:-0}" -eq 1 && "${CLI_T_AS_TO:-0}" -eq 0 ]]; then
+                    CLI_TIMEOUT_BEFORE_FROM=1
+                fi
+                FROM_TIME="$2"
+                CLI_FROM_SET=1
+                shift 2
+                ;;
+            -e|--to)
+                if [[ -z "${2:-}" ]]; then die "Missing value for $1"; fi
+                if [[ "${CLI_TO_SET:-0}" -eq 1 ]]; then
+                    die "Conflicting end time: -e/--to with existing -t/--until end"
+                fi
+                TO_TIME="$2"
+                CLI_TO_SET=1
+                shift 2
+                ;;
+            -n|--no-tcpdump)
+                START_TCPDUMP=0; shift
+                ;;
+            -j|--jobs)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then die "Invalid -j/--jobs value: '$2' (positive integer)"; fi
+                COLLECTOR_JOBS="$2"; shift 2
+                ;;
+            --chunk-mode)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                case "$2" in
+                    size|lines) LOG_CHUNK_MODE="$2" ;;
+                    *) die "Invalid --chunk-mode: '$2' (use size|lines)" ;;
+                esac
+                shift 2
+                ;;
+            --chunk-size)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                if ! LOG_CHUNK_SIZE_BYTES=$(_parse_size_to_bytes "$2") || [[ "$LOG_CHUNK_SIZE_BYTES" -le 0 ]]; then
+                    die "Invalid --chunk-size: '$2' (e.g. 50M, 200000000)"
+                fi
+                LOG_CHUNK_MODE="size"; shift 2
+                ;;
+            --chunk-lines)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then die "Invalid --chunk-lines: '$2' (positive integer)"; fi
+                LOG_CHUNK_LINES="$2"; LOG_CHUNK_MODE="lines"; shift 2
+                ;;
+            --scope)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                case "$2" in
+                    brief|extended) LOG_SCOPE="$2" ;;
+                    *) die "Invalid --scope: '$2' (use brief|extended)" ;;
+                esac
+                shift 2
+                ;;
+            -p|--product)
+                # -log: список продуктов для сбора; иначе — фильтр health/JSON
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                if [[ $MODE_LOG -eq 1 ]]; then
+                    SELECTED_PRODUCTS+=("$2")
+                else
+                    FILTER_PRODUCT="$2"
+                fi
+                shift 2
+                ;;
+            -s|--service)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                SELECTED_SERVICES+=("$2"); shift 2
+                ;;
+            --list-targets)
+                LIST_TARGETS=1; shift
+                ;;
+            --mgcpclient)
+                INCLUDE_MGCPCLIENT=1; shift
+                ;;
+            --no-mgcpclient)
+                INCLUDE_MGCPCLIENT=0; shift
+                ;;
+            -r|--repo)
+                SHOW_REPO=1; SHOW_REPOS_JSON=1; shift
+                ;;
+            -o|--output)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then die "Missing value for $1"; fi
+                OUTPUT_DIR="$2"; shift 2
+                ;;
+            --config)
+                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
+                CONFIG_FILE="$2"; shift 2 ;;
+            --pkg)
+                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
+                SINGLE_PKG="$2"; shift 2 ;;
+            --json) OUTPUT_JSON=1; shift ;;
+            --push) DO_PUSH=1; shift ;;
+            --host-id)
+                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
+                HOST_ID="$2"; shift 2 ;;
+            --host-ip)
+                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
+                HOST_IP="$2"; shift 2 ;;
+            --service-name)
+                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
+                SERVICE_NAME="$2"; shift 2 ;;
+            -h|--help)
+                usage
                 ;;
             *)
-                ver=$(get_pkg_version "$pkg" 2>/dev/null || true)
+                die "Unknown option: $1 (try -h)"
                 ;;
         esac
-        status="installed"
-        INSTALLED=$((INSTALLED + 1))
-    else
-        if [[ $VERBOSE -eq 1 ]] || [[ -n "$SINGLE_PKG" ]]; then
-            NOT_INSTALLED=$((NOT_INSTALLED + 1))
-        else
-            # в обычном JSON-снимке не включаем не установленные
-            return 1
-        fi
-    fi
-
-    # systemd
-    if [[ -f "/usr/lib/systemd/system/$unit" ]]; then
-        unit_path="/usr/lib/systemd/system/$unit"
-    elif [[ -f "/lib/systemd/system/$unit" ]]; then
-        unit_path="/lib/systemd/system/$unit"
-    elif [[ -f "/etc/systemd/system/$unit" ]]; then
-        unit_path="/etc/systemd/system/$unit"
-    fi
-    if command -v systemctl >/dev/null 2>&1; then
-        active=$(systemctl is-active "$unit" 2>/dev/null || echo unknown)
-        enabled=$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)
-    fi
-
-    # directories (FLAT layout; Infrastructure — системные пакеты без /opt/flat)
-    if _is_infrastructure_pkg "$pkg"; then
-        opt_status="n/a"
-        log_status="n/a"
-        opt_path=""
-        log_path=""
-    else
-        if [[ -d "$opt_path" ]]; then
-            opt_status="ok"
-            opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null || echo "")
-        fi
-        if [[ -d "$log_path" ]]; then
-            log_status="ok"
-            log_owner=$(stat -c '%U:%G' "$log_path" 2>/dev/null || echo "")
-        elif [[ "$status" == "installed" ]]; then
-            log_status="missing"
-        fi
-    fi
-
-    deps_pm=$(get_pkg_depends "$pkg" 2>/dev/null || true)
-
-    # process
-    # _sys_pkg_pids() (не голый pgrep по имени пакета) — иначе пакеты вроде
-    # fss-capagent, которые запускают сторонний бинарь другим именем (heplify,
-    # без "fss-capagent" где-либо в argv), всегда виделись бы как "not running",
-    # хотя systemd честно показывает unit активным. _sys_pkg_pids добавляет
-    # запасной путь через `systemctl show -p MainPID`, который от имени
-    # процесса не зависит.
-    pids=$(_sys_pkg_pids "$pkg" 2>/dev/null | paste -sd',' - 2>/dev/null)
-    if [[ -n "$pids" ]]; then
-        proc_status="running"
-        ps_lines=$(ps -o pid=,args= -p "${pids//,/ }" 2>/dev/null | head -5 | sed 's/"/\\"/g' || true)
-    fi
-
-    # ports
-    ports_json="["
-    local first_port=1
-    for port_spec in $(echo "${PKG_PORTS[$pkg]:-}" | tr ',' ' '); do
-        [[ -z "$port_spec" ]] && continue
-        open="not listening"
-        if command -v ss >/dev/null 2>&1; then
-            if ss -lntu 2>/dev/null | grep -qE ":${port_spec%%-*}\\b"; then
-                open="listening"
-            fi
-        elif command -v netstat >/dev/null 2>&1; then
-            if netstat -lntu 2>/dev/null | grep -qE ":${port_spec%%-*}\\b"; then
-                open="listening"
-            fi
-        fi
-        [[ $first_port -eq 1 ]] || ports_json+=","
-        first_port=0
-        ports_json+=$(printf '{"number":"%s","status":"%s"}' "$(_json_esc "$port_spec")" "$(_json_esc "$open")")
     done
-    ports_json+="]"
-
-    # api
-    local ep="${PKG_API[$pkg]:-}"
-    if [[ -n "$ep" ]]; then
-        if [[ "$ep" == http://* || "$ep" == https://* ]]; then
-            api_url="$ep"
-        else
-            api_url="http://localhost:${PKG_PORTS[$pkg]%%,*}$ep"
-            # если порт диапазон/пуст — оставим как path на localhost
-            [[ "${PKG_PORTS[$pkg]:-}" == *","* || "${PKG_PORTS[$pkg]:-}" == *"-"* || -z "${PKG_PORTS[$pkg]:-}" ]] && api_url="http://localhost$ep"
-        fi
-        if command -v curl >/dev/null 2>&1; then
-            api_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "$api_url" 2>/dev/null) || true
-            [[ "$api_code" =~ ^[0-9]{3}$ ]] || api_code=0
-            api_code=$((10#${api_code:-0}))
-            [[ "$api_code" -eq 200 || "$api_code" -eq 204 ]] && api_status="ok" || api_status="fail"
-        else
-            api_code=0
-            api_status="curl_not_found"
-        fi
-    fi
-
-    # configs
-    configs_json="["
-    local first_cfg=1
-    ngx_av="/etc/nginx/sites-available/$pkg"
-    ngx_en="/etc/nginx/sites-enabled/$pkg"
-    lr="/etc/logrotate.d/${pkg}.conf"
-    [[ -f "/etc/logrotate.d/$pkg" && ! -f "$lr" ]] && lr="/etc/logrotate.d/$pkg"
-    sudoers="/etc/sudoers.d/$pkg"
-    for pair in "nginx:$ngx_av" "nginx:$ngx_en" "logrotate:$lr" "sudoers:$sudoers"; do
-        local svc="${pair%%:*}" path="${pair#*:}" st="missing"
-        [[ -e "$path" || -L "$path" ]] && st="ok"
-        [[ "$path" == "$ngx_en" && ( -e "$path" || -L "$path" ) ]] && st="enabled"
-        [[ $first_cfg -eq 1 ]] || configs_json+=","
-        first_cfg=0
-        configs_json+=$(printf '{"service_name":"%s","path":"%s","status":"%s"}' \
-            "$(_json_esc "$svc")" "$(_json_esc "$path")" "$(_json_esc "$st")")
-    done
-    configs_json+="]"
-
-    # ps_lines → JSON array
-    local ps_json="[" pl first_ps=1
-    while IFS= read -r pl; do
-        [[ -z "$pl" ]] && continue
-        [[ $first_ps -eq 1 ]] || ps_json+=","
-        first_ps=0
-        ps_json+=$(printf '"%s"' "$(_json_esc "$pl")")
-    done <<< "$ps_lines"
-    ps_json+="]"
-
-    # pids → JSON array
-    local pids_json="[" first_pid=1 pid
-    if [[ -n "$pids" ]]; then
-        IFS=',' read -ra _pids <<< "$pids"
-        for pid in "${_pids[@]}"; do
-            [[ "$pid" =~ ^[0-9]+$ ]] || continue
-            [[ $first_pid -eq 1 ]] || pids_json+=","
-            first_pid=0
-            pids_json+="$pid"
-        done
-    fi
-    pids_json+="]"
-
-    printf '{'
-    printf '"name":"%s",' "$(_json_esc "$pkg")"
-    printf '"status":"%s",' "$(_json_esc "$status")"
-    printf '"version":"%s",' "$(_json_esc "$ver")"
-    printf '"depends_meta":%s,' "$(_json_arr_from_csv "$deps_meta")"
-    printf '"depends_pm":%s,' "$(_json_arr_from_csv "$deps_pm")"
-    printf '"systemd":{"unit_path":"%s","service_name":"%s","status":"%s"},' \
-        "$(_json_esc "$unit_path")" "$(_json_esc "$unit")" "$(_json_esc "$active")"
-    printf '"directories":['
-    printf '{"type":"opt","path":"%s","owner":"%s","status":"%s"},' \
-        "$(_json_esc "$opt_path")" "$(_json_esc "$opt_owner")" "$(_json_esc "$opt_status")"
-    printf '{"type":"log","path":"%s","owner":"%s","status":"%s"}' \
-        "$(_json_esc "$log_path")" "$(_json_esc "$log_owner")" "$(_json_esc "$log_status")"
-    printf '],'
-    printf '"configs":%s,' "$configs_json"
-    printf '"process":{"status":"%s","pids":%s,"ps_lines":%s},' \
-        "$(_json_esc "$proc_status")" "$pids_json" "$ps_json"
-    printf '"ports":%s,' "$ports_json"
-    printf '"api":{"url":"%s","status_code":%s,"status":"%s"}' \
-        "$(_json_esc "$api_url")" "${api_code:-0}" "$(_json_esc "$api_status")"
-    printf '}'
-    return 0
 }
 
-_json_collect_system() {
-    local cpu_pct=0 mem_total=0 mem_used=0 mem_avail=0
-    local up_sec=0
-    # _sys_cpu_via_procstat() сама делает init-вызов без $(...) (иначе дельта
-    # /proc/stat теряется вместе с субшеллом, и результат всегда 0) — не дублируем
-    # эту логику здесь, а переиспользуем уже проверенный замер.
-    cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
-    [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
-    if [[ "$cpu_pct" -eq 0 ]]; then
-        # Один замер за 0.5s-окно может честно попасть на затишье между
-        # всплесками — берём соседнее окно ещё раз, прежде чем поверить в 0%.
-        cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
-        [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
+# dispatch_main(): тело main() из flat_check_2.sh (строки 9010-9071) без
+# изменений логики, только без повторного вызова parse_args() (это уже
+# сделала точка входа flat_check ДО подключения lib/agent/lib/logging).
+dispatch_main() {
+    init_logging "${OUTPUT_DIR:-$SCRIPT_DIR}"
+    _log_line "INFO" "Запуск: $0 $* (аргументов: $#)"
+
+    # -i: интерактивный мастер
+    if [[ $MODE_INTERACTIVE -eq 1 ]]; then
+        run_interactive_wizard
     fi
 
-    if [[ -r /proc/meminfo ]]; then
-        mem_total=$(awk '/MemTotal:/{printf "%d",$2/1024}' /proc/meminfo)
-        mem_avail=$(awk '/MemAvailable:/{printf "%d",$2/1024}' /proc/meminfo)
-        [[ -z "$mem_avail" || "$mem_avail" == "0" ]] && mem_avail=$(awk '/MemFree:/{printf "%d",$2/1024}' /proc/meminfo)
-        mem_used=$((mem_total - mem_avail))
-        [[ "$mem_used" -lt 0 ]] && mem_used=0
-    fi
-    up_sec=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
-
-    # disk
-    local disk_json="[" first=1 fs mount usep
-    while read -r fs _ _ _ usep mount; do
-        [[ "$fs" == Filesystem* || "$fs" == "tmpfs" || "$fs" == "devtmpfs" ]] && continue
-        [[ "$mount" == "/proc"* || "$mount" == "/sys"* || "$mount" == "/run"* ]] && continue
-        usep="${usep%%%}"
-        [[ "$usep" =~ ^[0-9]+$ ]] || continue
-        [[ $first -eq 1 ]] || disk_json+=","
-        first=0
-        disk_json+=$(printf '{"filesystem":"%s","mount":"%s","used_percent":%s}' \
-            "$(_json_esc "$fs")" "$(_json_esc "$mount")" "$usep")
-    done < <(df -P 2>/dev/null | awk 'NR>1{print $1,$2,$3,$4,$5,$6}')
-    disk_json+="]"
-
-    # network (упрощённо: интерфейсы без замера sleep — mbps=0.0; полный замер дорог для JSON-пути)
-    local net_json="[" first=1 iface
-    for iface in /sys/class/net/*; do
-        iface=$(basename "$iface")
-        [[ "$iface" == "lo" ]] && continue
-        [[ $first -eq 1 ]] || net_json+=","
-        first=0
-        net_json+=$(printf '{"interface":"%s","mbps":0.0}' "$(_json_esc "$iface")")
-    done
-    net_json+="]"
-
-    # database brief
-    local db_name="n/a" db_status="n/a" db_repl="none" db_nodes=0
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-active --quiet postgresql 2>/dev/null || systemctl is-active --quiet postgresql@* 2>/dev/null; then
-            db_name="postgresql"; db_status="active"; db_nodes=1
-        elif systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysqld 2>/dev/null; then
-            db_name="mariadb"; db_status="active"; db_nodes=1
-        fi
+    if [[ $LIST_TARGETS -eq 1 ]]; then
+        detect_os
+        list_log_targets
+        exit 0
     fi
 
-    # certificates (пути-кандидаты)
-    local certs_json="[" first=1 cert days subject
-    for cert in /etc/nginx/ssl/*.crt /etc/nginx/ssl/*.pem /opt/flat/cert/*/*.pem /etc/ssl/certs/flat*.pem; do
-        [[ -f "$cert" ]] || continue
-        days=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/notAfter=//' | xargs -I{} date -d {} +%s 2>/dev/null || echo "")
-        if [[ -n "$days" ]]; then
-            days=$(( (days - $(date +%s)) / 86400 ))
-        else
-            days=0
-        fi
-        subject=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/subject=//' || echo "")
-        [[ $first -eq 1 ]] || certs_json+=","
-        first=0
-        certs_json+=$(printf '{"path":"%s","subject":"%s","days_left":%s}' \
-            "$(_json_esc "$cert")" "$(_json_esc "$subject")" "$days")
-        [[ $first -eq 0 && ${#certs_json} -gt 2000 ]] && break
-    done
-    certs_json+="]"
-
-    printf '{'
-    printf '"cpu":{"usage_percent":%s},' "${cpu_pct:-0}"
-    printf '"cpu_services":[],'
-    printf '"memory":{"total_mb":%s,"used_mb":%s,"available_mb":%s},' \
-        "${mem_total:-0}" "${mem_used:-0}" "${mem_avail:-0}"
-    printf '"memory_services":[],'
-    printf '"disk":%s,' "$disk_json"
-    printf '"database":{"name":"%s","status":"%s","replication":"%s","nodes":%s},' \
-        "$(_json_esc "$db_name")" "$(_json_esc "$db_status")" "$(_json_esc "$db_repl")" "${db_nodes:-0}"
-    printf '"network":%s,' "$net_json"
-    printf '"uptime_seconds":%s' "${up_sec:-0}"
-    printf '}'
-    # certificates returned via global side file
-    printf '%s' "$certs_json" > "${_JSON_TMP}/certificates.json"
-}
-
-_json_collect_infra() {
-    local out="[" first=1 dep status ver port req
-    # важно: не ${!ALL_DEPENDS[@]+...} — при значениях с "-" bash считает это
-    # косвенным раскрытием имён переменных (fps-server -> «недопустимое имя»)
-    for dep in "${!ALL_DEPENDS[@]}"; do
-        status="not_installed"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
-        # Статус пакета/библиотеки — тот же источник истины, что и текстовый
-        # === Depends === (is_dep_installed/is_lib_available). Раньше здесь
-        # смотрели только на systemctl, поэтому все обычные пакеты и
-        # библиотеки (libc6, sudo, nodejs, …) всегда получали "unknown",
-        # даже будучи установленными — только реальные systemd-юниты (nginx,
-        # redis, …) когда-либо получали осмысленный статус.
-        if [[ "$dep" == *.so.* ]]; then
-            is_lib_available "$dep" 2>/dev/null && status="installed"
-        else
-            is_dep_installed "$dep" 2>/dev/null && status="installed"
-            ver=$(get_dep_version "$dep" 2>/dev/null || true)
-        fi
-        # Если это ещё и systemd-служба (nginx/mariadb/postgresql/redis/…) —
-        # уточняем состояние поверх "installed": активна она или нет.
-        if command -v systemctl >/dev/null 2>&1; then
-            if systemctl is-active --quiet "$dep" 2>/dev/null; then
-                status="active"
-            elif systemctl status "$dep" &>/dev/null; then
-                status=$(systemctl is-active "$dep" 2>/dev/null || echo inactive)
-            fi
-        fi
-        [[ $first -eq 1 ]] || out+=","
-        first=0
-        out+=$(printf '{"service_name":"%s","status":"%s","version":"%s","port_open":"%s","required_by":"%s"}' \
-            "$(_json_esc "$dep")" "$(_json_esc "$status")" "$(_json_esc "$ver")" "$(_json_esc "$port")" "$(_json_esc "$req")")
-    done
-    out+="]"
-    printf '%s' "$out"
-}
-
-_json_collect_repos() {
-    local out="[" first=1 line
-    if [[ "$PM" == "dpkg" ]]; then
-        while IFS= read -r line; do
-            [[ -z "$line" || "$line" =~ ^# ]] && continue
-            [[ $first -eq 1 ]] || out+=","
-            first=0
-            out+=$(printf '"[apt] %s"' "$(_json_esc "$line")")
-        done < <(grep -hE '^deb ' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null | head -50)
-    elif [[ "$PM" == "rpm" ]]; then
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            [[ $first -eq 1 ]] || out+=","
-            first=0
-            out+=$(printf '"[yum] %s"' "$(_json_esc "$line")")
-        done < <(grep -hE '^\[|^baseurl=' /etc/yum.repos.d/*.repo 2>/dev/null | head -50)
+    # Самотест: --dev / --selftest / режим 3 мастера
+    if [[ -n "${SELFTEST_MODE:-}" ]]; then
+        run_selftest "$SELFTEST_MODE"
+        exit $?
     fi
-    out+="]"
-    printf '%s' "$out"
-}
+    if [[ $MODE_DEV -eq 1 ]]; then
+        run_selftest extended
+        exit $?
+    fi
 
-# Полный снимок JSON v2 → stdout
-build_health_json() {
-    local products_list=()
-    local p pkg product_json packages_json first_prod=1 first_pkg
-    local ts system_json infra_json repos_json certs_json
-    local pkg_filter="${PACKAGES:-}"
+    [[ -n "$CONFIG_FILE" ]] && _json_load_config "$CONFIG_FILE"
 
-    _JSON_TMP=$(mktemp -d "${TMPDIR:-/tmp}/flat_json.XXXXXX") || return 1
-    _json_ensure_identity
-    detect_os >/dev/null 2>&1 || detect_os
+    # JSON / push (1к1 с flat_check.sh) — до -log
+    if [[ "$OUTPUT_JSON" -eq 1 || "$DO_PUSH" -eq 1 ]]; then
+        run_health_json
+        exit $?
+    fi
 
-    ERRORS=0; WARNINGS=0; INSTALLED=0; NOT_INSTALLED=0
-    # -g обязателен: без него `declare -A` внутри функции создаёт ЛОКАЛЬНУЮ
-    # переменную, а глобальный ALL_DEPENDS (объявлен -A в разделе 0) остаётся
-    # unset после return — тогда register_dep() увидит его как обычный
-    # индексированный массив и попытается вычислить "$dep" арифметически
-    # (bash: arr[идентификатор] без -A трактуется как арифметика), что на
-    # дефисных именах вида "fss-frontend" падает под set -u: "fss: unbound variable".
-    declare -gA ALL_DEPENDS=()
+    # -log: только сбор логов
+    if [[ $MODE_LOG -eq 1 ]]; then
+        _validate_time_cli_combo
+        run_log_collection "$LOG_SUBMODE" "$TIMEOUT_RAW"
+        [[ $SHOW_REPO -eq 1 ]] && { detect_os; check_repositories; }
+        exit 0
+    fi
 
-    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    system_json=$(_json_collect_system)
-    certs_json=$(cat "${_JSON_TMP}/certificates.json" 2>/dev/null || echo '[]')
+    # Один пакет — текстовый health
+    if [[ -n "$SINGLE_PKG" ]]; then
+        detect_os
+        [[ -n "${PKG_PRODUCT[$SINGLE_PKG]:-}" ]] || die "Unknown package: $SINGLE_PKG"
+        check_single_pkg "$SINGLE_PKG"
+        exit $?
+    fi
 
-    products_list=("${FLAT_PRODUCTS_ORDER[@]}")
+    # ПО УМОЛЧАНИЮ: только проверка состояния (исходное поведение flat_check)
+    detect_os
+    check_system
+    local products=("${FLAT_PRODUCTS_ORDER[@]}")
+    local p
     if [[ -n "$FILTER_PRODUCT" ]]; then
-        products_list=("$FILTER_PRODUCT")
+        products=("$FILTER_PRODUCT")
+    fi
+    for p in "${products[@]}"; do run_product_checks "$p"; done
+    check_infrastructure
+    [[ $SHOW_REPO -eq 1 ]] && check_repositories
+    print_summary
+}
+
+# ==========================================================================
+# РАЗДЕЛ: 10_wizard
+# ==========================================================================
+# Назначение: Интерактивный мастер (-i/--interactive) — язык, выбор режима
+#   (health/сбор логов/самотест), для сбора логов: online/offline, scope,
+#   диапазон времени, chunk-настройки, выбор продуктов/служб/типов логов.
+# Публичные функции: run_interactive_wizard()
+# Зависит от: lib/core (00_globals, 02_output, 03_i18n — _l(), 01_catalog —
+#   PKG_PRODUCT/PKG_LEGACY); ветка сбора логов (_wizard_configure_log_mode →
+#   _wizard_select_log_targets) дополнительно ожидает lib/logging уже
+#   подключённым (список целей/типов логов строится через lib/logging.sh (раздел 02_log_discovery)).
+# Не зависит от: lib/agent — ветка --selftest/health не использует JSON/push напрямую
+# Side effects: интерактивный ввод с терминала (read), печатает вопросы/списки,
+#   устанавливает MODE_LOG/LOG_SUBMODE/SELFTEST_MODE/... как обычный parse_args()
+#
+# Источник: перенесено без изменений логики из flat_check_2.sh (строки 7434-7898).
+#   Живёт в lib/core (а не в lib/logging), т.к. должен быть доступен ДО того,
+#   как известно, какой режим выберет пользователь внутри мастера — сам мастер
+#   решает, понадобится ли lib/logging, а не наоборот (см. flat_check: -i
+#   безусловно подключает lib/logging, т.к. мастер может привести в режим сбора
+#   логов уже после старта, когда подключать модули по флагам CLI уже поздно).
+
+# --- 11. Мастер / справка / argv / main ------------------------------------------
+
+# Единый разбор y/n в мастере (раскладки, регистр, yes/да/no/нет).
+# Пустой ввод — НЕ yes (для вопросов с Enter=n это безопасный отказ).
+# «н» = русская клавиша на месте латинской Y при RU-раскладке → не yes.
+# «т» = русская клавиша на месте латинской N при RU-раскладке → no.
+
+_wizard_is_yes() {
+    local a="${1:-}"
+    a="${a#"${a%%[![:space:]]*}"}"
+    a="${a%"${a##*[![:space:]]}"}"
+    [[ -z "$a" ]] && return 1
+    case "$a" in
+        y|Y|yes|YES|Yes|YeS|д|Д|да|ДА|Да) return 0 ;;
+    esac
+    local al
+    al=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+    [[ "$al" == "y" || "$al" == "yes" ]] && return 0
+    return 1
+}
+
+_wizard_is_no() {
+    local a="${1:-}"
+    a="${a#"${a%%[![:space:]]*}"}"
+    a="${a%"${a##*[![:space:]]}"}"
+    [[ -z "$a" ]] && return 1
+    case "$a" in
+        n|N|no|NO|No|н|Н|нет|НЕТ|Нет|т|Т) return 0 ;;
+    esac
+    local al
+    al=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+    [[ "$al" == "n" || "$al" == "no" ]] && return 0
+    return 1
+}
+
+# Интерактивный выбор продукта/службы; устанавливает SELECTED_PRODUCTS / SELECTED_SERVICES
+# Печатает нумерованный список заранее, затем читает+разбирает выбор пользователя в
+# отбор из этого же списка: "a"/"A"/"а"/"А"/"all"/"все" (или пустой ввод) выбирает
+# всё; индексы через запятую и/или пробел выбирают конкретные элементы (невалидные
+# токены выдают warn и пропускаются); если ничего валидного не выбрано, откатывается
+# на "всё" — так же, как явное "all". Это шаг чтения+разбора,
+# который раньше был скопипащен для списка продуктов и списка служб
+# ниже; сама *печать* нумерованного списка отличается между ними (разная
+# аннотация на элемент) и остаётся в каждом вызывающем коде.
+# Аргументы: label (для предупреждения "Invalid <label> choice"), имя
+# исходного массива, имя массива назначения.
+_wizard_pick_from_list() {
+    local label="$1"
+    local -n _wpfl_src=$2
+    local -n _wpfl_dst=$3
+    local choice="" part normalized
+    local -a _parts=()
+
+    read -r choice 2>/dev/null || true
+    choice="${choice:-a}"
+    # trim
+    choice="${choice#"${choice%%[![:space:]]*}"}"
+    choice="${choice%"${choice##*[![:space:]]}"}"
+    [[ -z "$choice" ]] && choice="a"
+
+    _wpfl_dst=()
+    case "$choice" in
+        a|A|а|А|all|ALL|All|все|ВСЕ|Все)
+            _wpfl_dst=("${_wpfl_src[@]}")
+            ;;
+        n|N|нет|НЕТ|Нет|none|NONE|None)
+            # Явная отмена сбора логов (не fallback на «все»)
+            _wpfl_dst=()
+            WIZARD_SKIP_LOG=1
+            ;;
+        *)
+            # Запятые и пробелы — равноправные разделители ("1,3" и "1 3")
+            normalized="${choice//,/ }"
+            # shellcheck disable=SC2206
+            _parts=($normalized)
+            for part in "${_parts[@]}"; do
+                [[ -z "$part" ]] && continue
+                if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 && "$part" -le ${#_wpfl_src[@]} ]]; then
+                    _wpfl_dst+=("${_wpfl_src[$((part - 1))]}")
+                else
+                    warn "Invalid $label choice: $part"
+                fi
+            done
+            [[ ${#_wpfl_dst[@]} -eq 0 ]] && _wpfl_dst=("${_wpfl_src[@]}")
+            ;;
+    esac
+    log_debug "wizard: $label choice='$choice' -> selected: ${_wpfl_dst[*]+"${_wpfl_dst[*]}"} skip=${WIZARD_SKIP_LOG:-0}"
+}
+
+_wizard_select_log_targets() {
+    local -a prods=()
+    local -A prod_pkgs=()
+    local pkg prod i refine=""
+    local -a svc_list=()
+
+    SELECTED_PRODUCTS=()
+    SELECTED_SERVICES=()
+
+    for pkg in $(printf '%s\n' "${!PKG_PRODUCT[@]}" | sort); do
+        _pkg_present_on_host "$pkg" || continue
+        prod="${PKG_PRODUCT[$pkg]}"
+        if [[ -z "${prod_pkgs[$prod]:-}" ]]; then
+            prods+=("$prod")
+            prod_pkgs["$prod"]="$pkg"
+        else
+            prod_pkgs["$prod"]="${prod_pkgs[$prod]} $pkg"
+        fi
+    done
+
+    if [[ ${#prods[@]} -eq 0 ]]; then
+        warn "$(_l wiz_no_targets)"
+        return 0
+    fi
+    log_debug "wizard: available products on host: ${prods[*]}"
+
+    echo ""
+    echo "$(_l wiz_title_products)"
+    i=1
+    for prod in "${prods[@]}"; do
+        echo "  $i — $prod (${prod_pkgs[$prod]})"
+        i=$((i + 1))
+    done
+    echo "$(_l wiz_products_all)"
+    echo -n "$(_l wiz_products_prompt)"
+    _wizard_pick_from_list product prods SELECTED_PRODUCTS
+    if [[ "${WIZARD_SKIP_LOG:-0}" -eq 1 ]]; then
+        warn "Log collection cancelled (n)."
+        return 0
     fi
 
-    printf '{'
-    printf '"timestamp":"%s",' "$(_json_esc "$ts")"
-    printf '"host_id":"%s",' "$(_json_esc "$HOST_ID")"
-    printf '"host_ip":"%s",' "$(_json_esc "$HOST_IP")"
-    printf '"service_name":"%s",' "$(_json_esc "$SERVICE_NAME")"
-    printf '"script_version":"%s",' "$(_json_esc "$SCRIPT_VERSION")"
-    printf '"os":"%s",' "$(_json_esc "${OS_FULL_VER:-${OS_NAME:-unknown}}")"
-    printf '"package_manager":"%s",' "$(_json_esc "${PM:-unknown}")"
+    # Опциональное уточнение по службам: предлагаем всегда, если выбран хоть один продукт
+    echo ""
+    echo -n "$(_l wiz_refine_services)"
+    read -r refine 2>/dev/null || true
+    if _wizard_is_yes "$refine"; then
+        svc_list=()
+        for prod in "${SELECTED_PRODUCTS[@]}"; do
+            for pkg in ${prod_pkgs[$prod]}; do
+                svc_list+=("$pkg")
+            done
+        done
+        echo "$(_l wiz_title_services)"
+        i=1
+        for pkg in "${svc_list[@]}"; do
+            echo "  $i — $pkg [${PKG_PRODUCT[$pkg]}]"
+            i=$((i + 1))
+        done
+        echo "$(_l wiz_services_all)"
+        echo -n "$(_l wiz_services_prompt)"
+        _wizard_pick_from_list service svc_list SELECTED_SERVICES
+        if [[ "${WIZARD_SKIP_LOG:-0}" -eq 1 ]]; then
+            warn "Log collection cancelled (n)."
+            return 0
+        fi
+        SELECTED_PRODUCTS=()
+    fi
 
-    printf '"products":['
-    first_prod=1
-    for p in "${products_list[@]}"; do
-        packages_json="["
-        first_pkg=1
-        local product_pkgs=()
-        for pkg in "${!PKG_PRODUCT[@]}"; do
-            [[ "${PKG_PRODUCT[$pkg]}" == "$p" ]] || continue
-            if [[ -n "$SINGLE_PKG" && "$pkg" != "$SINGLE_PKG" ]]; then
+    resolve_selected_packages
+
+    # Шаг 9: опциональный выбор конкретных типов логов по каждой службе
+    LOG_TYPE_FILTER=0
+    SELECTED_LOG_TYPES=()
+    local refine_types="" stem_list=() picked_types=() stem i_lt prod_label
+    echo ""
+    echo -n "$(_l wiz_refine_log_types)"
+    read -r refine_types 2>/dev/null || true
+    if _wizard_is_yes "$refine_types"; then
+        LOG_TYPE_FILTER=1
+        # Список служб — на fd 3: иначе _wizard_pick_from_list (read stdin)
+        # съедает имена пакетов / EOF и всегда выбирает «все типы».
+        while IFS= read -r pkg <&3; do
+            [[ -n "$pkg" ]] || continue
+            stem_list=()
+            while IFS= read -r stem; do
+                [[ -n "$stem" ]] && stem_list+=("$stem")
+            done < <(_discover_log_type_stems_for_pkg "$pkg")
+            prod_label="${PKG_PRODUCT[$pkg]:-?} ($pkg)"
+            echo ""
+            echo "$(_l wiz_title_log_types)"
+            echo "$(_l wiz_log_types_for): $prod_label"
+            if [[ ${#stem_list[@]} -eq 0 ]]; then
+                info "$(_l wiz_log_types_none)"
+                SELECTED_LOG_TYPES["$pkg"]="*"
                 continue
             fi
-            if [[ -n "$pkg_filter" ]]; then
-                [[ ",${pkg_filter}," == *",$pkg,"* ]] || continue
+            i_lt=1
+            for stem in "${stem_list[@]}"; do
+                echo "  $i_lt — $stem"
+                i_lt=$((i_lt + 1))
+            done
+            echo "$(_l wiz_log_types_all)"
+            echo -n "$(_l wiz_log_types_prompt)"
+            picked_types=()
+            _wizard_pick_from_list "log-type($pkg)" stem_list picked_types
+            if [[ "${WIZARD_SKIP_LOG:-0}" -eq 1 ]]; then
+                warn "Log collection cancelled (n)."
+                return 0
             fi
-            product_pkgs+=("$pkg")
-        done
-        if ((${#product_pkgs[@]} > 0)); then
-            local sorted
-            sorted=$(printf '%s\n' "${product_pkgs[@]}" | sort)
-            product_pkgs=()
-            while IFS= read -r pkg; do
-                [[ -n "$pkg" ]] && product_pkgs+=("$pkg")
-            done <<< "$sorted"
+            if [[ ${#picked_types[@]} -eq 0 || ${#picked_types[@]} -eq ${#stem_list[@]} ]]; then
+                SELECTED_LOG_TYPES["$pkg"]="*"
+            else
+                SELECTED_LOG_TYPES["$pkg"]="${picked_types[*]}"
+            fi
+            log_debug "wizard: log types for $pkg -> ${SELECTED_LOG_TYPES[$pkg]}"
+        done 3< <(
+            for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
+                printf '%s\t%s\n' "${PKG_PRODUCT[$pkg]:-ZZZ}" "$pkg"
+            done | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 | cut -f2
+        )
+        # При y инженер уже выбрал типы (включая/исключая mgcpclient) — вопрос не задаём
+        _apply_mgcpclient_from_log_types
+    else
+        _resolve_mgcpclient_option
+    fi
+
+    echo ""
+    info "$(_l wiz_preview_pkgs): ${#SELECTED_PKGS[@]}"
+    for pkg in "${SELECTED_PKGS[@]+"${SELECTED_PKGS[@]}"}"; do
+        if [[ "${LOG_TYPE_FILTER:-0}" -eq 1 ]]; then
+            info "  → $pkg [${SELECTED_LOG_TYPES[$pkg]:-*}]"
+        else
+            info "  → $pkg"
         fi
-        for pkg in ${product_pkgs[@]+"${product_pkgs[@]}"}; do
-            local pj
-            # $() - subshell: INSTALLED++ внутри _json_collect_pkg не доходит сюда
-            pj=$(_json_collect_pkg "$pkg") || continue
-            if [[ "$pj" == *"\"status\":\"installed\""* ]] || [[ "$pj" == *'"status":"installed"'* ]]; then
-                INSTALLED=$((INSTALLED + 1))
-            fi
-            # Регистрация deps для infra: и meta (PKG_DEPS), и реальные PM-deps —
-            # как в текстовом пути (_register_pkg_deps/check_single_pkg), иначе
-            # "infrastructure" в JSON видит только явно прописанные в каталоге
-            # зависимости и пропускает всё, что реально тянет пакетный менеджер
-            # (libc6, libssl3, redis, sudo, …), которые есть в "=== Depends ===".
-            _register_pkg_deps "$pkg" 2>/dev/null || true
-            [[ $first_pkg -eq 1 ]] || packages_json+=","
-            first_pkg=0
-            packages_json+="$pj"
-        done
-        packages_json+="]"
-        # пустые продукты в JSON не включаем (даже при --pkg)
-        [[ "$packages_json" == "[]" ]] && continue
-        [[ $first_prod -eq 1 ]] || printf ','
-        first_prod=0
-        printf '{"name":"%s","packages":%s}' "$(_json_esc "$p")" "$packages_json"
     done
-    printf '],'
-
-    infra_json=$(_json_collect_infra)
-    repos_json='[]'
-    [[ $SHOW_REPO -eq 1 || $SHOW_REPOS_JSON -eq 1 ]] && repos_json=$(_json_collect_repos)
-
-    printf '"infrastructure":%s,' "$infra_json"
-    printf '"repositories":%s,' "$repos_json"
-    printf '"apt_priorities":[],'
-    printf '"summary":{"installed":%s,"errors":%s,"warnings":%s},' \
-        "${INSTALLED:-0}" "${ERRORS:-0}" "${WARNINGS:-0}"
-    printf '"system":%s,' "$system_json"
-    printf '"certificates":%s,' "$certs_json"
-    printf '"uptime_services":[]'
-    printf '}\n'
-
-    rm -rf -- "$_JSON_TMP" 2>/dev/null
-}
-
-# Отправка JSON на все URL из PUSH_URLS (http/https).
-# PUSH_INSECURE=1 — не проверять TLS-сертификат (curl -k), для https с self-signed.
-push_health_json() {
-    local body="$1"
-    local urls=() tokens=() url token i rc=0 http_code
-    local auth_hdr="${PUSH_AUTH_HEADER:-Authorization: Bearer}"
-    local curl_insecure=()
-    [[ "${PUSH_INSECURE:-0}" == "1" ]] && curl_insecure=(-k)
-
-    _json_ensure_identity
-    [[ -n "$PUSH_URLS" ]] || { warn "push: PUSH_URLS пуст — некуда отправлять"; return 1; }
-    command -v curl >/dev/null 2>&1 || { warn "push: curl не найден"; return 1; }
-
-    # split URLs
-    PUSH_URLS="${PUSH_URLS//,/ }"
-    read -ra urls <<< "$PUSH_URLS"
-    if [[ -n "$PUSH_TOKENS" ]]; then
-        PUSH_TOKENS="${PUSH_TOKENS//,/ }"
-        read -ra tokens <<< "$PUSH_TOKENS"
+    if [[ "${LOG_TYPE_FILTER:-0}" -eq 1 ]]; then
+        info "$(_l wiz_preview_log_types): filter=on"
     fi
-
-    i=0
-    for url in "${urls[@]}"; do
-        [[ -z "$url" ]] && continue
-        if [[ ! "$url" =~ ^https?:// ]]; then
-            warn "push: пропуск URL без http/https: $url"
-            rc=1
-            continue
-        fi
-        token="${PUSH_TOKEN:-}"
-        [[ -n "${tokens[$i]:-}" ]] && token="${tokens[$i]}"
-        i=$((i + 1))
-
-        local attempt=0 ok=0 curl_errfile="/tmp/flat_push_err.$$"
-        while [[ $attempt -le ${PUSH_RETRIES:-2} ]]; do
-            attempt=$((attempt + 1))
-            # Логируем реальную вызываемую команду (токен маскируем), а не
-            # реконструкцию "по мотивам" — чтобы можно было взять и повторить
-            # руками (curl -v ...) без гадания, какие флаги реально ушли.
-            local curl_display="curl -sS -o <body> -w '%{http_code}'"
-            [[ ${#curl_insecure[@]} -gt 0 ]] && curl_display+=" ${curl_insecure[*]}"
-            curl_display+=" --connect-timeout ${PUSH_CONNECT_TIMEOUT:-5} --max-time ${PUSH_MAX_TIME:-30}"
-            curl_display+=" -X POST '$url' -H 'Content-Type: application/json'"
-            curl_display+=" -H 'X-Flat-Host-Id: ${HOST_ID}' -H 'X-Flat-Service-Name: ${SERVICE_NAME}'"
-            [[ -n "$token" ]] && curl_display+=" -H '${auth_hdr} ***'"
-            curl_display+=" --data-binary <json>"
-            log_debug "push: attempt $attempt → run: $curl_display"
-            http_code=$(curl -sS -o /tmp/flat_push_body.$$ -w '%{http_code}' \
-                "${curl_insecure[@]}" \
-                --connect-timeout "${PUSH_CONNECT_TIMEOUT:-5}" \
-                --max-time "${PUSH_MAX_TIME:-30}" \
-                -X POST "$url" \
-                -H "Content-Type: application/json" \
-                -H "X-Flat-Host-Id: ${HOST_ID}" \
-                -H "X-Flat-Service-Name: ${SERVICE_NAME}" \
-                ${token:+-H "$auth_hdr $token"} \
-                --data-binary "$body" 2>"$curl_errfile") || true
-            [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code="000"
-            # http=000 сам по себе не говорит, ПОЧЕМУ (DNS/refused/timeout/TLS) —
-            # curl обычно пишет это в stderr, раньше просто выбрасывался в /dev/null.
-            [[ -s "$curl_errfile" ]] && log_debug "push: attempt $attempt → curl said: $(tr '\n' ' ' < "$curl_errfile" 2>/dev/null)"
-            rm -f "$curl_errfile" 2>/dev/null
-            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-                info "push: OK $http_code → $url"
-                ok=1
-                break
-            fi
-            log_debug "push: attempt $attempt → $url http=$http_code"
-            sleep 1
-        done
-        rm -f /tmp/flat_push_body.$$ 2>/dev/null
-        [[ $ok -eq 1 ]] || { warn "push: FAIL → $url (last http=$http_code)"; rc=1; }
+    # Тоже в текущем shell — сохраняем LOG_DIR_OWNER для последующего сбора.
+    local dirs=()
+    discover_log_dirs_for_selected >/dev/null
+    dirs=("${DISCOVERED_LOG_DIRS[@]+"${DISCOVERED_LOG_DIRS[@]}"}")
+    info "$(_l wiz_preview_dirs): ${#dirs[@]}"
+    for d in "${dirs[@]+"${dirs[@]}"}"; do
+        info "  → $d"
     done
-    return "$rc"
 }
 
-# Печать JSON: с отступами (jq, иначе python3 -m json.tool), если stdout —
-# интерактивный терминал (глазами читать одну гигантскую строку неудобно);
-# компактно в одну строку иначе (пайп/файл/cron — не ломаем автоматизацию,
-# которая ждёт ровно одну строку JSON). Нет ни jq, ни python3 — как раньше.
-_json_print() {
-    local body="$1"
-    if [[ -t 1 ]]; then
-        if command -v jq >/dev/null 2>&1; then
-            printf '%s' "$body" | jq . 2>/dev/null && return 0
-        elif command -v python3 >/dev/null 2>&1; then
-            printf '%s' "$body" | python3 -m json.tool 2>/dev/null && return 0
+# --- Шаги диалога мастера (каждый читает ровно один запрос) --------------------
+# Локальные переменные предварительно инициализируются в "" перед каждым read: при
+# `set -u` `read`, наткнувшийся на EOF (неинтерактивный stdin), может оставить целевую
+# переменную неустановленной, а не пустой, и любой последующий `[[ "$var" == ... ]]`
+# на никогда не назначенной локальной переменной прервёт выполнение скрипта.
+
+_wizard_step_language() {
+    local lang_choice=""
+    echo ""
+    echo "=== Language / Язык ==="
+    echo "  1 — Русский"
+    echo "  2 — English"
+    echo -n "$(_l ask_lang_prompt)"
+    read -r lang_choice 2>/dev/null || true
+    if [[ "$lang_choice" == "1" ]]; then CURRENT_LANG="ru"; else CURRENT_LANG="en"; fi
+    log_debug "wizard: lang_choice='$lang_choice' -> CURRENT_LANG=$CURRENT_LANG"
+}
+
+# Устанавливает глобальную WIZARD_MODE_CHOICE для диспетчеризации у вызывающего кода — НЕ печатает:
+# эта функция уже печатает текст запроса в тот же stdout, так что
+# возврат выбора через $(...) захватил бы и этот текст тоже.
+_wizard_step_mode() {
+    WIZARD_MODE_CHOICE=""
+    echo ""
+    echo "$(_l wiz_title_mode)"
+    echo "$(_l wiz_mode_1)"
+    echo "$(_l wiz_mode_2)"
+    echo "$(_l wiz_mode_3)"
+    echo -n "$(_l wiz_mode_prompt)"
+    read -r WIZARD_MODE_CHOICE 2>/dev/null || true
+    log_debug "wizard: mode_choice='$WIZARD_MODE_CHOICE'"
+}
+
+_wizard_step_online_offline() {
+    local submode_choice=""
+    echo ""
+    echo "$(_l wiz_title_type)"
+    echo "$(_l wiz_type_1)"
+    echo "$(_l wiz_type_2)"
+    echo -n "$(_l wiz_type_prompt)"
+    read -r submode_choice 2>/dev/null || true
+    [[ "$submode_choice" == "2" ]] && LOG_SUBMODE="offline" || LOG_SUBMODE="online"
+    log_debug "wizard: submode_choice='$submode_choice' -> LOG_SUBMODE=$LOG_SUBMODE"
+}
+
+_wizard_step_scope() {
+    local scope_choice=""
+    echo ""
+    echo "$(_l wiz_title_scope)"
+    echo "$(_l wiz_scope_1)"
+    echo "$(_l wiz_scope_2)"
+    echo -n "$(_l wiz_scope_prompt)"
+    read -r scope_choice 2>/dev/null || true
+    [[ "$scope_choice" == "2" ]] && LOG_SCOPE="extended" || LOG_SCOPE="brief"
+    log_debug "wizard: scope_choice='$scope_choice' -> LOG_SCOPE=$LOG_SCOPE"
+}
+
+# Online: timeout, плюс (только для extended scope) отказ от tcpdump.
+_wizard_step_online_time_settings() {
+    local tcpdump_choice=""
+    echo ""
+    echo -n "$(_l wiz_timeout)"
+    read -r TIMEOUT_RAW 2>/dev/null || true
+    TIMEOUT_RAW="${TIMEOUT_RAW:-}"
+    if [[ "$LOG_SCOPE" == "extended" ]]; then
+        echo -n "$(_l wiz_tcpdump)"
+        read -r tcpdump_choice 2>/dev/null || true
+        _wizard_is_no "$tcpdump_choice" && START_TCPDUMP=0
+    else
+        START_TCPDUMP=0
+    fi
+    log_debug "wizard: online timeout='$TIMEOUT_RAW' tcpdump_choice='$tcpdump_choice' -> START_TCPDUMP=$START_TCPDUMP"
+}
+
+# Offline: выбрать режим диапазона (отступ по длительности / явные from+to / from+offset).
+_wizard_step_offline_time_settings() {
+    local range_choice=""
+    echo ""
+    echo "$(_l wiz_title_range)"
+    echo "$(_l wiz_range_1)"
+    echo "$(_l wiz_range_2)"
+    echo "$(_l wiz_range_3)"
+    echo "$(_l wiz_range_all)"
+    echo -n "$(_l wiz_range_prompt)"
+    read -r range_choice 2>/dev/null || true
+    case "$range_choice" in
+        1)
+            echo -n "$(_l wiz_for_how_long)"
+            read -r TIMEOUT_RAW 2>/dev/null || true
+            TIMEOUT_RAW="${TIMEOUT_RAW:-}"
+            ;;
+        2)
+            echo -n "$(_l wiz_from_dt)"
+            read -r FROM_TIME 2>/dev/null || true
+            FROM_TIME="${FROM_TIME:-}"
+            echo -n "$(_l wiz_to_dt)"
+            read -r TO_TIME 2>/dev/null || true
+            TO_TIME="${TO_TIME:-}"
+            ;;
+        3)
+            echo -n "$(_l wiz_from_dt2)"
+            read -r FROM_TIME 2>/dev/null || true
+            FROM_TIME="${FROM_TIME:-}"
+            echo -n "$(_l wiz_for_offset)"
+            read -r TO_TIME 2>/dev/null || true
+            TO_TIME="${TO_TIME:-}"
+            ;;
+    esac
+    log_debug "wizard: range_choice='$range_choice' -> TIMEOUT_RAW='${TIMEOUT_RAW:-}' FROM_TIME='${FROM_TIME:-}' TO_TIME='${TO_TIME:-}'"
+}
+
+# Только offline: как резать итоговые part_*.log в архиве — по размеру
+# (LOG_CHUNK_SIZE_BYTES) или по числу строк (LOG_CHUNK_LINES). См.
+# LOG_CHUNK_MODE / _psl_split_final_output().
+_wizard_step_chunk_settings() {
+    local chunk_choice="" value="" bytes
+    echo ""
+    echo "$(_l wiz_title_chunk)"
+    echo "$(_l wiz_chunk_1)"
+    echo "$(_l wiz_chunk_2)"
+    echo -n "$(_l wiz_chunk_prompt)"
+    read -r chunk_choice 2>/dev/null || true
+    if [[ "$chunk_choice" == "2" ]]; then
+        LOG_CHUNK_MODE="lines"
+        echo -n "$(_l wiz_chunk_lines_prompt)"
+        read -r value 2>/dev/null || true
+        [[ "$value" =~ ^[1-9][0-9]*$ ]] && LOG_CHUNK_LINES="$value"
+    else
+        LOG_CHUNK_MODE="size"
+        echo -n "$(_l wiz_chunk_size_prompt)"
+        read -r value 2>/dev/null || true
+        if [[ -n "$value" ]]; then
+            if bytes=$(_parse_size_to_bytes "$value") && [[ "$bytes" -gt 0 ]]; then
+                LOG_CHUNK_SIZE_BYTES="$bytes"
+            else
+                warn "$(_l wiz_chunk_size_invalid) '$value'"
+            fi
         fi
     fi
-    printf '%s\n' "$body"
+    log_debug "wizard: chunk_choice='$chunk_choice' value='$value' -> LOG_CHUNK_MODE=$LOG_CHUNK_MODE LOG_CHUNK_SIZE_BYTES=$LOG_CHUNK_SIZE_BYTES LOG_CHUNK_LINES=$LOG_CHUNK_LINES"
 }
 
-run_health_json() {
-    local body
-    [[ -n "$CONFIG_FILE" ]] && _json_load_config "$CONFIG_FILE"
-    body=$(build_health_json) || { fail "не удалось собрать JSON"; return 1; }
-    if [[ "$DO_PUSH" -eq 1 ]]; then
-        # при --push JSON тоже можно показать через --json; иначе только push
-        [[ "$OUTPUT_JSON" -eq 1 ]] && _json_print "$body"
-        push_health_json "$body"
-        return $?
+_wizard_step_output_dir() {
+    local out_dir=""
+    echo -n "$(_l wiz_output_dir)"
+    read -r out_dir 2>/dev/null || true
+    [[ -n "$out_dir" ]] && OUTPUT_DIR="$out_dir"
+}
+
+# Режим 2: настроить сбор логов от начала до конца — online/offline, область,
+# настройки времени, выбор продукта/службы, директория вывода.
+_wizard_configure_log_mode() {
+    MODE_LOG=1
+    MODE_DEV=0
+    SELFTEST_MODE=""
+    WIZARD_SKIP_LOG=0
+
+    _wizard_step_online_offline
+    _wizard_step_scope
+
+    if [[ "$LOG_SUBMODE" == "online" ]]; then
+        _wizard_step_online_time_settings
+    else
+        _wizard_step_offline_time_settings
+        # Разбивка на part_*.log касается только offline — online просто
+        # tail -F в один файл на источник, без нарезки.
+        _wizard_step_chunk_settings
     fi
-    _json_print "$body"
+
+    # Выбор продукта / службы
+    detect_os
+    _wizard_select_log_targets
+    if [[ "${WIZARD_SKIP_LOG:-0}" -eq 1 ]]; then
+        MODE_LOG=0
+        _log_line "INFO" "wizard: сбор логов отменён (n)"
+        return 0
+    fi
+    log_debug "wizard: SELECTED_PRODUCTS=(${SELECTED_PRODUCTS[*]+"${SELECTED_PRODUCTS[*]}"}) SELECTED_SERVICES=(${SELECTED_SERVICES[*]+"${SELECTED_SERVICES[*]}"})"
+
+    _wizard_step_output_dir
+    _log_line "INFO" "wizard: режим=сбор логов $LOG_SUBMODE, scope=$LOG_SCOPE, output_dir='${OUTPUT_DIR:-(по умолчанию)}'"
 }
 
-# --- 11. Selftest / справка / argv / main ---------------------------------------
+# Режим 3: настроить режим самотеста (simple/extended).
+_wizard_configure_selftest() {
+    local selftest_choice=""
+    MODE_LOG=0
+    MODE_DEV=0
+    echo ""
+    echo "$(_l wiz_title_selftest)"
+    echo "$(_l wiz_selftest_1)"
+    echo "$(_l wiz_selftest_2)"
+    echo -n "$(_l wiz_selftest_prompt)"
+    read -r selftest_choice 2>/dev/null || true
+    case "$selftest_choice" in
+        2) SELFTEST_MODE="extended"; MODE_DEV=1 ;;
+        *) SELFTEST_MODE="simple" ;;
+    esac
+    _log_line "INFO" "wizard: режим=самотест ($SELFTEST_MODE)"
+}
+
+# Режим по умолчанию: проверка состояния, с опциональной секцией репозиториев.
+_wizard_configure_healthcheck() {
+    local repo_choice=""
+    MODE_LOG=0
+    MODE_DEV=0
+    SELFTEST_MODE=""
+    echo -n "$(_l wiz_show_repo)"
+    read -r repo_choice 2>/dev/null || true
+    _wizard_is_yes "$repo_choice" && SHOW_REPO=1
+    _log_line "INFO" "wizard: режим=проверка служб (health check), show_repo=$SHOW_REPO"
+}
+
+run_interactive_wizard() {
+    # Сбрасываем режимы, чтобы предыдущий -log/--dev из argv не протёк в выбор проверки состояния
+    MODE_LOG=0
+    MODE_DEV=0
+    SELFTEST_MODE=""
+
+    _wizard_step_language
+
+    _wizard_step_mode
+
+    case "$WIZARD_MODE_CHOICE" in
+        2) _wizard_configure_log_mode ;;
+        3) _wizard_configure_selftest ;;
+        *) _wizard_configure_healthcheck ;;
+    esac
+}
+
+# ==========================================================================
+# РАЗДЕЛ: 11_selftest
+# ==========================================================================
+# Назначение: --selftest simple|extended — самопроверка ключевых функций/каталога
+#   без реального воздействия на систему (кроме чтения состояния). simple — быстрый
+#   smoke-test хелперов core+agent; extended — то же плюс проверки lib/logging
+#   (парсеры времени, resource-gate, seek+chunk extract) и VERBOSE health-прогон
+#   по всем продуктам (то же самое, что --dev).
+# Публичные функции: run_selftest(level), _run_selftest_simple(), _run_selftest_extended()
+# Зависит от: 00_globals.sh, 02_output.sh, 04_os_detect.sh, 05_system_metrics.sh,
+#   06_resource_gate.sh, 07_pkg_checks.sh, 08_infra_checks.sh; ожидает уже
+#   подключённые lib/agent/*.sh (build_health_json, push_health_json,
+#   _json_collect_infra — проверяются даже на уровне simple) и, для extended,
+#   lib/logging/*.sh (parse_time_point/parse_duration/time_to_epoch,
+#   _selftest_seek_extract) — точка входа обязана подключать оба слоя перед
+#   ЛЮБЫМ run_selftest (см. flat_check и ARCHITECTURE.md).
+# Не зависит от: ничего внутри lib/agent или lib/logging не зависит от этого модуля
+# Side effects: печатает результаты [OK]/[FAIL], временно выставляет VERBOSE=1
+#   и тестовые ALL_DEPENDS/HOST_ID при extended
+#
+# Источник: simple/run_selftest — перенесено без изменений логики из
+#   flat_check.sh (строки 3084-3200). extended дополнительно вобрал в себя
+#   logging-проверки из flat_check_2.sh (строки 6120-6176: time formats,
+#   parse_duration, _collector_wait_slot, _selftest_seek_extract) — при
+#   портировании core в фазе 1 они были пропущены, т.к. flat_check.sh
+#   (health-only, без сборщика логов) их не содержит; добавлены в фазе 3,
+#   когда появился lib/logging, без изменения логики самих проверок.
+
 
 _SELFTEST_PASS=0
 _SELFTEST_FAIL=0
@@ -3190,8 +3974,52 @@ _run_selftest_simple() {
 }
 
 _run_selftest_extended() {
-    info "Self-test EXTENDED (VERBOSE health)"
+    info "Self-test EXTENDED (VERBOSE health + log collector)"
     _run_selftest_simple
+
+    # Проверки сборщика логов (lib/logging) — портировано из flat_check_2.sh
+    # _run_selftest_extended(). Точка входа обязана подключить lib/logging до
+    # вызова run_selftest extended (см. flat_check и ARCHITECTURE.md); если
+    # тест запущен без lib/logging, ниже будут честные [FAIL] "command not
+    # found", а не тихий пропуск — это тоже полезный сигнал о поломанной сборке.
+    local t1 t2 ep1 ep2 d
+    t1=$(parse_time_point "25.06.2026 10:00") || t1=""
+    t2=$(parse_time_point "2026-06-25 10:00:00") || t2=""
+    ep1=$(time_to_epoch "$t1")
+    ep2=$(time_to_epoch "$t2")
+    if [[ -n "$t1" && -n "$t2" && "$ep1" =~ ^[0-9]+$ && "$ep2" =~ ^[0-9]+$ && "$ep1" -eq "$ep2" ]]; then
+        _selftest_ok "time formats DD.MM.YYYY ≡ YYYY-MM-DD"
+    else
+        _selftest_bad "time formats DD.MM.YYYY ≡ YYYY-MM-DD (got '$t1'/'$t2')"
+    fi
+    if parse_time_point "-1h" >/dev/null; then
+        _selftest_ok "parse_time_point -1h"
+    else
+        _selftest_bad "parse_time_point -1h"
+    fi
+    for d in 30s 5m 2h 1d; do
+        if parse_duration "$d"; then
+            _selftest_ok "parse_duration $d"
+        else
+            _selftest_bad "parse_duration $d"
+        fi
+    done
+
+    # Лимит ресурсов должен разрешать ≥1 воркер (защита от зависания)
+    COLLECTOR_JOB_PIDS=()
+    if _collector_wait_slot 2; then
+        _selftest_ok "_collector_wait_slot (hang-safe)"
+    else
+        _selftest_bad "_collector_wait_slot"
+    fi
+
+    # Полный путь seek + параллельные чанки
+    if _selftest_seek_extract; then
+        _selftest_ok "seek+chunk extract (bisect)"
+    else
+        _selftest_bad "seek+chunk extract (bisect)"
+    fi
+
     VERBOSE=1
     detect_os
     check_system
@@ -3225,132 +4053,3 @@ run_selftest() {
     print_fail "Self-test $level: ${_SELFTEST_PASS} passed, ${_SELFTEST_FAIL} failed"
     return 1
 }
-
-usage() {
-    cat <<EOF
-flat_check.sh v${SCRIPT_VERSION} — FLAT/FCS health check (JSON agent / no log collector)
-
-Usage:
-  $0 [OPTIONS]
-
-Health (text):
-  -r, --repo            show repositories
-  -j, --jobs N          parallel package-check workers
-  -p, --product NAME    single product only
-  --pkg NAME            single package only
-  -v, --version         print version
-  -h, --help            this help
-
-JSON agent (dashboard / multi-product):
-  --config FILE         agent config (/etc/flat/flat_check.conf)
-  --json                emit health JSON v2 to stdout
-  --push                POST JSON to all PUSH_URLS (http/https)
-  --host-id ID          override HOST_ID
-  --host-ip IP          override HOST_IP
-  --service-name NAME   override SERVICE_NAME (fss-backend, fps-backend, …)
-
-Selftest:
-  --selftest [simple|extended]
-  --dev                 = --selftest extended (VERBOSE health по всем пакетам)
-  --debug               дублировать DEBUG-строки сессионного лога на экран (stderr)
-
-Note: -i здесь не используется. В flat_check_2.sh -i = интерактивный мастер.
-
-Examples:
-  $0
-  $0 --config /etc/flat/flat_check.conf --json
-  $0 --config /etc/flat/flat_check.conf --json --push
-  $0 --pkg fss-server --json
-
-Installer: see agent/README.md
-Log collector: flat_check_2.sh
-EOF
-    exit 0
-}
-
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -r|--repo|-repo) SHOW_REPO=1; SHOW_REPOS_JSON=1; shift ;;
-            -v|--version) echo "flat_check ${SCRIPT_VERSION}"; exit 0 ;;
-            -j|--jobs)
-                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
-                [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "Invalid --jobs: '$2'"
-                COLLECTOR_JOBS="$2"; shift 2 ;;
-            --config)
-                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
-                CONFIG_FILE="$2"; shift 2 ;;
-            --pkg)
-                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
-                SINGLE_PKG="$2"; shift 2 ;;
-            -p|--product)
-                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
-                FILTER_PRODUCT="$2"; shift 2 ;;
-            --json) OUTPUT_JSON=1; shift ;;
-            --push) DO_PUSH=1; shift ;;
-            --host-id)
-                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
-                HOST_ID="$2"; shift 2 ;;
-            --host-ip)
-                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
-                HOST_IP="$2"; shift 2 ;;
-            --service-name)
-                [[ -z "${2:-}" || "$2" == -* ]] && die "Missing value for $1"
-                SERVICE_NAME="$2"; shift 2 ;;
-            --selftest)
-                if [[ -n "${2:-}" && "$2" != -* ]]; then SELFTEST_MODE="$2"; shift 2
-                else SELFTEST_MODE="simple"; shift; fi ;;
-            --dev) MODE_DEV=1; SELFTEST_MODE="extended"; shift ;;
-            --debug) DEBUG_MODE=1; shift ;;
-            -h|--help|-help) usage ;;
-            *) die "Unknown option: $1 (try -h)" ;;
-        esac
-    done
-}
-
-main() {
-    parse_args "$@"
-    [[ -n "$CONFIG_FILE" ]] && _json_load_config "$CONFIG_FILE"
-
-    init_logging "${SCRIPT_DIR}"
-    _log_line "INFO" "Запуск: $0 $* (аргументов: $#)"
-
-    if [[ -n "${SELFTEST_MODE:-}" ]]; then
-        run_selftest "$SELFTEST_MODE"
-        exit $?
-    fi
-    if [[ $MODE_DEV -eq 1 ]]; then
-        run_selftest extended
-        exit $?
-    fi
-
-    # JSON / push (dashboard)
-    if [[ "$OUTPUT_JSON" -eq 1 || "$DO_PUSH" -eq 1 ]]; then
-        run_health_json
-        exit $?
-    fi
-
-    # Single package — text mode
-    if [[ -n "$SINGLE_PKG" ]]; then
-        detect_os
-        if [[ -z "${PKG_PRODUCT[$SINGLE_PKG]:-}" ]]; then
-            die "Unknown package: $SINGLE_PKG"
-        fi
-        check_single_pkg "$SINGLE_PKG"
-        exit $?
-    fi
-
-    detect_os
-    check_system
-    local products=("${FLAT_PRODUCTS_ORDER[@]}")
-    local p
-    if [[ -n "$FILTER_PRODUCT" ]]; then
-        products=("$FILTER_PRODUCT")
-    fi
-    for p in "${products[@]}"; do run_product_checks "$p"; done
-    check_infrastructure
-    [[ $SHOW_REPO -eq 1 ]] && check_repositories
-    print_summary
-}
-
-main "$@"

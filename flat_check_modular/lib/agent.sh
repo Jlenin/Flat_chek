@@ -1,8 +1,33 @@
-# --- JSON report / config / push (agent) ---------------------------------------
-# Общий блок для flat_check.sh и health-пути flat_check_2.sh.
-# Формирует JSON v2 и пушит на один или несколько HTTP/HTTPS URL.
+# Слой: agent
+# Подключается при --json/--push/--config/--dev/любом --selftest/-i.
+# Конфиг агента, сборка health JSON v2, отправка на PUSH_URLS.
+#
+# Разделы этого файла (в порядке подключения; искать по "РАЗДЕЛ: <имя>"):
+#   01_config                Дефолты переменных JSON/push-агента (не затирают уже заданные CLI/env), разбор конфиг-файла (--config FILE) с безопасным снятием кавычек/инлайн-комментариев.
+#   02_json_build            Сборка полного health JSON v2 (build_health_json) и его частей — идентификация хоста, экранирование строк, снимок одного пакета, снимок системных метрик, infrastructure/depends, список репозиториев.
+#   03_push                  Отправка собранного JSON на PUSH_URLS (http/https, с ретраями и диагностикой curl) и верхнеуровневый диспетчер run_health_json(), вызываемый из lib/core.sh (раздел 09_argv) при --json/--push.
+#
+# До объединения (см. git-историю фазы 5) это было 3 отдельных
+# файлов lib/agent/NN_name.sh — слиты в один по итогам код-ревью: три с половиной
+# десятка файлов на весь проект оказались избыточной дробностью для инструмента,
+# который должен быть понятен человеку без глубокого знания bash. Внутренние
+# границы (заголовки "РАЗДЕЛ:") и порядок — те же самые.
+# ==========================================================================
+# РАЗДЕЛ: 01_config
+# ==========================================================================
+# Назначение: Дефолты переменных JSON/push-агента (не затирают уже заданные CLI/env),
+#   разбор конфиг-файла (--config FILE) с безопасным снятием кавычек/инлайн-комментариев.
+# Публичные функции: _json_load_config(file), _conf_strip_value(raw)
+# Зависит от: lib/core (переменные HOST_ID/HOST_IP/SERVICE_NAME/... уже объявлены
+#   в lib/core.sh (раздел 00_globals); здесь только достраиваются PUSH_*-дефолты)
+# Не зависит от: разделов 02_json_build/03_push ниже — идёт первым в этом файле
+# Side effects: читает файл конфига с диска; заполняет глобальные переменные
+#   (только если они ещё пустые — CLI и env имеют приоритет)
+#
+# Источник: перенесено без изменений логики из agent/json_report.inc.sh (строки 5-85).
 
 # Дефолты (не затираем значения из section 0 / окружения)
+
 : "${OUTPUT_JSON:=0}"
 : "${DO_PUSH:=0}"
 : "${CONFIG_FILE:=}"
@@ -83,6 +108,41 @@ _json_load_config() {
         FILTER_PRODUCT="$PRODUCT"
     fi
 }
+
+# ==========================================================================
+# РАЗДЕЛ: 02_json_build
+# ==========================================================================
+# Назначение: Сборка полного health JSON v2 (build_health_json) и его частей —
+#   идентификация хоста, экранирование строк, снимок одного пакета, снимок
+#   системных метрик, infrastructure/depends, список репозиториев.
+# Публичные функции: build_health_json(), _json_ensure_identity(),
+#   _json_detect_host_ip(), _json_esc(s), _json_arr_from_csv(csv),
+#   _json_collect_pkg(pkg), _json_collect_system(), _json_collect_infra(),
+#   _json_collect_repos(), _json_print(body)
+# Зависит от: 01_config.sh (переменные-дефолты), lib/core (_sys_cpu_via_procstat,
+#   _sys_pkg_pids, get_dep_version, get_pkg_depends, is_dep_installed,
+#   is_lib_available, is_pkg_installed_tiny, get_pkg_version, register_dep через
+#   _register_pkg_deps, detect_os, PKG_PRODUCT/PKG_LEGACY/PKG_PORTS/PKG_API/PKG_DEPS,
+#   ALL_DEPENDS, FLAT_PRODUCTS_ORDER)
+# Не зависит от: lib/logging — ничего из сборщика логов здесь не используется
+# Side effects: запускает systemctl/dpkg/rpm/ss/curl/openssl/df; пишет во временный
+#   каталог $_JSON_TMP (сертификаты передаются через файл, не через subshell —
+#   иначе терялись бы вместе с состоянием CPU-дельты, см. комментарий ниже)
+#
+# Источник: перенесено без изменений логики из agent/json_report.inc.sh
+#   (строки 87-465 и 468-574 — build_health_json; _json_print — строки 656-666,
+#   вынесен сюда, а не в 03_push.sh, т.к. используется и при простом --json
+#   без --push).
+#
+# ОБНАРУЖЕННОЕ РАСХОЖДЕНИЕ (найдено при сверке --json со старым flat_check.sh,
+# не исправлено в оригиналах в рамках этой задачи — см. CONTEXT.md/README для
+# отдельного тикета): agent/json_report.inc.sh отстал от копий, вшитых в
+# flat_check.sh/flat_check_2.sh, в блоке directories внутри _json_collect_pkg —
+# он не пропускал через _is_infrastructure_pkg() и показывал бы для
+# nginx/postgresql/mariadb выдуманные пути /opt/flat/<pkg> со статусом
+# "missing" вместо честного "n/a" (эти пакеты не живут под /opt/flat). Взята
+# исправленная версия из flat_check.sh/flat_check_2.sh (идентична в обоих).
+
 
 _json_detect_host_ip() {
     local ip
@@ -580,8 +640,42 @@ build_health_json() {
     rm -rf -- "$_JSON_TMP" 2>/dev/null
 }
 
+# Печать JSON: с отступами (jq, иначе python3 -m json.tool), если stdout —
+# интерактивный терминал (глазами читать одну гигантскую строку неудобно);
+# компактно в одну строку иначе (пайп/файл/cron — не ломаем автоматизацию,
+# которая ждёт ровно одну строку JSON). Нет ни jq, ни python3 — как раньше.
+_json_print() {
+    local body="$1"
+    if [[ -t 1 ]]; then
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$body" | jq . 2>/dev/null && return 0
+        elif command -v python3 >/dev/null 2>&1; then
+            printf '%s' "$body" | python3 -m json.tool 2>/dev/null && return 0
+        fi
+    fi
+    printf '%s\n' "$body"
+}
+
+# ==========================================================================
+# РАЗДЕЛ: 03_push
+# ==========================================================================
+# Назначение: Отправка собранного JSON на PUSH_URLS (http/https, с ретраями
+#   и диагностикой curl) и верхнеуровневый диспетчер run_health_json(),
+#   вызываемый из lib/core.sh (раздел 09_argv) при --json/--push.
+# Публичные функции: push_health_json(body), run_health_json()
+# Зависит от: 01_config.sh (_json_load_config), 02_json_build.sh
+#   (build_health_json, _json_print, _json_ensure_identity), lib/core
+#   (warn/info/fail/log_debug)
+# Не зависит от: lib/logging
+# Side effects: запускает curl (сетевые запросы наружу), пишет временные файлы
+#   /tmp/flat_push_body.$$ и /tmp/flat_push_err.$$ (удаляются сразу после использования)
+#
+# Источник: перенесено без изменений логики из agent/json_report.inc.sh
+#   (push_health_json — строки 576-650; run_health_json — строки 668-679).
+
 # Отправка JSON на все URL из PUSH_URLS (http/https).
 # PUSH_INSECURE=1 — не проверять TLS-сертификат (curl -k), для https с self-signed.
+
 push_health_json() {
     local body="$1"
     local urls=() tokens=() url token i rc=0 http_code
@@ -654,22 +748,6 @@ push_health_json() {
         [[ $ok -eq 1 ]] || { warn "push: FAIL → $url (last http=$http_code)"; rc=1; }
     done
     return "$rc"
-}
-
-# Печать JSON: с отступами (jq, иначе python3 -m json.tool), если stdout —
-# интерактивный терминал (глазами читать одну гигантскую строку неудобно);
-# компактно в одну строку иначе (пайп/файл/cron — не ломаем автоматизацию,
-# которая ждёт ровно одну строку JSON). Нет ни jq, ни python3 — как раньше.
-_json_print() {
-    local body="$1"
-    if [[ -t 1 ]]; then
-        if command -v jq >/dev/null 2>&1; then
-            printf '%s' "$body" | jq . 2>/dev/null && return 0
-        elif command -v python3 >/dev/null 2>&1; then
-            printf '%s' "$body" | python3 -m json.tool 2>/dev/null && return 0
-        fi
-    fi
-    printf '%s\n' "$body"
 }
 
 run_health_json() {
