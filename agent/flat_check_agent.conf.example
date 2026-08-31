@@ -1,4 +1,4 @@
-# flat_check_agent.conf — конфиг для flat_check_agent.sh
+# flat_check_agent.conf — эталонный конфиг для flat_check_agent.sh
 #
 # Кладётся РЯДОМ со скриптом (по умолчанию flat_check_agent.sh ищет файл
 # "flat_check_agent.conf" в своём же каталоге — переопределяется переменной
@@ -6,16 +6,24 @@
 # переменные окружения > этот файл > встроенные дефолты. Отсутствие файла —
 # не ошибка, скрипт просто работает на env/дефолтах.
 #
+# Этот файл — одновременно и пример, и рабочий эталон: PUSH_URLS ниже
+# указывает на 127.0.0.1, поэтому конфиг можно использовать как есть для
+# локальной проверки (запустить у себя тестовый приёмник на этом порту —
+# см. agent/ingest-request.example.http) — никуда во внешнюю сеть он не
+# уйдёт. Перед боевым использованием впишите свой реальный PUSH_URLS и
+# PUSH_TOKEN.
+#
 # Скопируйте этот файл в flat_check_agent.conf и заполните под свой стенд:
 #   cp flat_check_agent.conf.example flat_check_agent.conf
 
 # Куда слать снимок (http/https). Несколько URL — через запятую или пробел.
 # Пусто = только stdout, без сети (JSON всё равно печатается всегда).
-PUSH_URLS="https://partner.example.local/api/v1/health/ingest"
+PUSH_URLS="http://127.0.0.1:8080/api/v1/health/ingest"
 # PUSH_URL="https://..."   # алиас, если PUSH_URLS пуст
 
-# Токен стенда (по умолчанию уходит как: Authorization: Bearer <token>)
-PUSH_TOKEN="CHANGE_ME"
+# Токен стенда (по умолчанию уходит как: Authorization: Bearer <token>).
+# Перед боевым использованием замените на настоящий токен приёмника.
+PUSH_TOKEN="correct-horse-battery-staple"
 # PUSH_TOKENS="token1,token2"          # по одному на каждый URL
 # PUSH_AUTH_HEADER="Authorization: Bearer"
 # PUSH_AUTH_HEADER="X-Api-Key"
@@ -38,4 +46,8 @@ PUSH_RETRIES=2
 # 1 = не проверять TLS-сертификат при https push (curl -k).
 # Нужно, если у приёмника (Partner) самоподписанный сертификат — иначе
 # push будет падать с "FAIL (last http=000)" при видимо верном URL.
-# PUSH_INSECURE=1
+# Включено по умолчанию в этом эталонном конфиге: PUSH_URLS выше — plain
+# http на 127.0.0.1, для него флаг не имеет эффекта (TLS тут просто нет),
+# так что держать его всегда включённым безопасно и удобно — при переходе
+# на боевой https-приёмник с валидным сертификатом можно смело отключить.
+PUSH_INSECURE=1
