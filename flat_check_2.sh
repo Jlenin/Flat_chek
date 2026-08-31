@@ -1689,10 +1689,16 @@ check_pkg_installed() {
     esac
 }
 
+# Каталог /opt/flat/${pkg} сюда сознательно НЕ входит: после `apt purge`
+# каталог часто остаётся (dpkg предупреждает "not empty so not removed",
+# если внутри лежат данные пакета — рекординги, БД и т.п.), из-за чего
+# purge-нутый пакет ошибочно опознавался бы как всё ещё установленный.
+# Unit-файл — обычный файл, которым владеет пакет, и он всегда удаляется
+# при purge, поэтому остаётся надёжным сигналом.
 has_any_trace() {
     local pkg="$1"
     local unit="${pkg}.service"
-    [[ -f "/usr/lib/systemd/system/${unit}" ]] || [[ -f "/etc/systemd/system/${unit}" ]] || [[ -f "/lib/systemd/system/${unit}" ]] || [[ -d "/opt/flat/${pkg}" ]]
+    [[ -f "/usr/lib/systemd/system/${unit}" ]] || [[ -f "/etc/systemd/system/${unit}" ]] || [[ -f "/lib/systemd/system/${unit}" ]]
 }
 
 # --- Тихие проверки наличия по PM --------------------------------------------
