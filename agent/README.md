@@ -32,6 +32,9 @@
 | `ingest-request.example.http` | пример HTTP |
 | `cli.examples.sh` | примеры ручных запусков |
 | `json_report.inc.sh` | общий блок JSON/push (вшит в оба скрипта в корне) |
+| `flat_check_agent.sh` | автономный JSON-агент для мониторинга (без argv/логов, см. ниже) |
+| `flat_check_agent.conf.example` | шаблон конфига для `flat_check_agent.sh` |
+| `flat_check_agent.sudoers.example` | справка по необязательному ACL для non-root запуска |
 
 ---
 
@@ -253,8 +256,95 @@ chmod 0644 /etc/cron.d/flat-check
 
 ---
 
+## Standalone-агент для мониторинга (`flat_check_agent.sh`)
+
+Отдельный, полностью самостоятельный скрипт для прямой интеграции в
+мониторинг (Zabbix external check, systemd timer + HTTP-пуш и т.п.), когда
+не нужны ни `--help`, ни интерактивный мастер, ни сессионные логи — только
+JSON-снимок здоровья хоста.
+
+- **Не подключает** `json_report.inc.sh`/`flat_check.sh`/`flat_check_2.sh` —
+  весь нужный код скопирован внутрь одного файла. Разворачивается как один
+  файл, без установщика: скопировать и `chmod +x`.
+- **Без аргументов командной строки.** Поведение — только через переменные
+  окружения и/или конфиг-файл `flat_check_agent.conf` рядом со скриптом
+  (переопределяется `FLAT_AGENT_CONF`). Это даёт одну строку для cron/timer.
+- **Вывод:** в stdout — всегда только JSON, одной строкой (безопасно
+  парсить как есть, даже если настроен push). Диагностика push (`curl`
+  ошибки, `push: OK/FAIL`) — в stderr. При ручном запуске в терминале видно
+  оба потока сразу, то есть видно и снимок, и что именно отправилось.
+- **Код возврата:** `0` — JSON собран (и push, если был настроен, прошёл
+  успешно); ненулевой — сбой сборки JSON или сбой хотя бы одного push.
+  Содержимое JSON (какие пакеты не установлены и т.п.) на код возврата не
+  влияет — это для дашборда, не признак поломки самого агента.
+- **Права доступа:** рассчитан на обычного пользователя, не root. Почти
+  все проверки (dpkg/rpm/pacman/apk, systemctl, слушающие порты, curl к
+  локальным API, чтение сертификатов) прав не требуют. Единственное
+  известное исключение — `configs[].status="sudoers"` (не может проверить
+  файл внутри `/etc/sudoers.d`, если у каталога нет `x` для остальных):
+  без доп. прав деградирует до `"missing"`, без падений. Подробности и
+  необязательный узкий ACL — `flat_check_agent.sudoers.example`.
+
+Пример cron-строки (всё через env, без конфиг-файла):
+
+```cron
+*/5 * * * * PUSH_URLS=https://partner.example/api/v1/health/ingest \
+            PUSH_TOKEN=*** HOST_ID=ss-n1 SERVICE_NAME=fss-backend \
+            /opt/flat/flat_check_agent.sh >/dev/null
+```
+
+Или с конфиг-файлом рядом со скриптом (командная строка короче):
+
+```bash
+cp agent/flat_check_agent.sh agent/flat_check_agent.conf.example /opt/flat/
+mv /opt/flat/flat_check_agent.conf.example /opt/flat/flat_check_agent.conf
+# заполнить PUSH_URLS, PUSH_TOKEN, HOST_ID, SERVICE_NAME в конфиге
+chmod +x /opt/flat/flat_check_agent.sh
+```
+
+```cron
+*/5 * * * * /opt/flat/flat_check_agent.sh >/dev/null
+```
+
+Пример systemd timer + service (та же логика, если в организации принят
+timer, а не cron):
+
+```ini
+# /etc/systemd/system/flat-check-agent.service
+[Unit]
+Description=flat_check_agent health snapshot + push
+
+[Service]
+Type=oneshot
+User=flat-agent
+ExecStart=/opt/flat/flat_check_agent.sh
+```
+
+```ini
+# /etc/systemd/system/flat-check-agent.timer
+[Unit]
+Description=Run flat-check-agent.service every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl enable --now flat-check-agent.timer
+```
+
+---
+
 ## Сопровождение
 
 - Логику JSON/push менять в `json_report.inc.sh` и синхронно в обоих скриптах корня.
 - Новые пакеты health — в `PKG_*` обоих скриптов (см. корневой README).
 - На ноде conf держать с правами `0640`; секреты в git не коммитить.
+- `flat_check_agent.sh` — самостоятельная копия той же JSON/push-логики
+  (см. заголовок файла). При правке `json_report.inc.sh`/каталога пакетов
+  проверить, нужна ли та же правка и в `flat_check_agent.sh` — синхронизация
+  ручная, скрипт её не подключает.
