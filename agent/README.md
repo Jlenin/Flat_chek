@@ -1,4 +1,26 @@
-# Агент flat_check → Flat Partner
+# agent/ — два независимых инструмента
+
+Этот каталог содержит **два разных, независимых** способа получить health
+JSON продукта на мониторинг/Flat Partner. Они не связаны рантаймом и не
+взаимозаменяемы — важно не перепутать, какой раздел ниже про какой:
+
+| | 1. Push-toolkit | 2. Standalone-агент |
+|---|---|---|
+| Скрипт | `../flat_check.sh` / `../flat_check_2.sh` | `flat_check_agent.sh` |
+| Ставится | `install_flat_check.sh` → `/usr/local/bin` + `/etc/flat` + cron | никак — просто скопировать файл, `chmod +x` |
+| Аргументы/флаги | есть (`--json`, `--push`, `--config`, `-i`, …) | нет, только env/conf-файл |
+| Логи | есть (`init_logging`, `/var/log/flat/...`) | нет, сознательно не нужны |
+| Для чего | эксплуатация продукта людьми (health на экран, wizard, сбор логов) | прямая интеграция в мониторинг (Zabbix external check, systemd timer) |
+| Документация | раздел [1](#1-push-toolkit-flat_checksh--flat_check_2sh) ниже | раздел [2](#2-standalone-агент-для-мониторинга-flat_check_agentsh) ниже |
+
+**Важно:** `install_flat_check.sh`/`reinstall_flat_check.sh`/`uninstall_flat_check.sh`
+относятся только к инструменту 1 (`flat_check.sh`/`flat_check_2.sh`). Они
+**не устанавливают и не трогают** `flat_check_agent.sh` — у него установщика
+нет и не нужен, см. раздел 2.
+
+---
+
+## 1. Push-toolkit: `flat_check.sh` / `flat_check_2.sh`
 
 Установка и настройка периодической отправки health JSON с ноды продукта на ingest Flat Partner.
 
@@ -12,12 +34,10 @@
                  GET /health → UI
 ```
 
-Скрипт агента — `../flat_check.sh` (тот же health, что у `flat_check_2.sh`).  
-Версия: **3.7.0**.
+Скрипт — `../flat_check.sh` (тот же health, что у `flat_check_2.sh`).
+Версия: **3.8.11** (`flat_check_2.sh` — **3.11.11**, см. корневой README).
 
----
-
-## Состав каталога
+### Состав (инструмент 1)
 
 | Файл | Назначение |
 |------|------------|
@@ -32,13 +52,8 @@
 | `ingest-request.example.http` | пример HTTP |
 | `cli.examples.sh` | примеры ручных запусков |
 | `json_report.inc.sh` | общий блок JSON/push (вшит в оба скрипта в корне) |
-| `flat_check_agent.sh` | автономный JSON-агент для мониторинга (без argv/логов, см. ниже) |
-| `flat_check_agent.conf.example` | шаблон конфига для `flat_check_agent.sh` |
-| `flat_check_agent.sudoers.example` | справка по необязательному ACL для non-root запуска |
 
----
-
-## Установка
+### Установка
 
 Из корня репозитория (**нужен sudo** для установки в `/usr/local` и `/etc`):
 
@@ -95,7 +110,7 @@ sudo ./agent/install_flat_check.sh ... --with-logs
 # дополнительно: /usr/local/bin/flat_check_2
 ```
 
-### Прочие флаги
+### Прочие флаги установщика
 
 | Флаг | Описание |
 |------|----------|
@@ -111,9 +126,7 @@ sudo ./agent/install_flat_check.sh ... --with-logs
 
 Если conf уже есть, параметры `--push-*` / `--host-*` / `--service-name` **не меняют** его — нужен `--force-conf` либо правка файла вручную.
 
----
-
-## Переустановка / удаление
+### Переустановка / удаление
 
 ```bash
 # переустановка: бинарь/cron/каталог пакетов обновляются всегда;
@@ -135,9 +148,7 @@ sudo ./agent/uninstall_flat_check.sh -y                     # удалить к�
 при каждом запуске, так что достаточно один раз сделать исполняемым любой
 из трёх (см. «Установка» выше).
 
----
-
-## Конфиг
+### Конфиг
 
 Минимальный рабочий набор:
 
@@ -163,9 +174,7 @@ SERVICE_NAME="fss-backend"
 
 Полный шаблон: `flat_check.conf.example`.
 
----
-
-## Запуск
+### Запуск
 
 ```bash
 # снимок в stdout
@@ -186,18 +195,14 @@ flat_check --json --host-id ss-n1 --host-ip 10.0.1.5 --service-name fss-backend
 
 Cron по умолчанию вызывает `--push` без `--json`, чтобы лог не раздувался телом снимка.
 
----
-
-## Каталог пакетов
+### Каталог пакетов
 
 При установке `install_flat_check.sh` копирует `flat_check.packages.conf` рядом с бинарём
 (`dirname(INSTALL_BIN)/flat_check.packages.conf`). Если файла нет — скрипт использует
 встроенный каталог. Human-раздел зависимостей называется `=== Depends ===`; в JSON ключ
 по-прежнему `infrastructure` (схема v2 не менялась).
 
----
-
-## Формат JSON
+### Формат JSON
 
 Обязательные поля идентичности:
 
@@ -220,9 +225,7 @@ X-Flat-Service-Name: <SERVICE_NAME>
 
 Настройка приёма токена на стороне backend: `backend-token.example.yaml`.
 
----
-
-## Проверка
+### Проверка
 
 ```bash
 flat_check -v
@@ -240,9 +243,7 @@ tail -f /var/log/flat/flat_check_push.log
 | `http=000` | DNS, firewall, TLS; если приёмник на self-signed https — `PUSH_INSECURE=1`. Точную причину curl (connection refused / timed out / …) смотрите в `flat_check_push.log` или `--push --debug` — строка `push: curl → URL: ...` |
 | `service_name: unknown` | `SERVICE_NAME` в conf или `--service-name` |
 
----
-
-## Установка вручную
+### Установка вручную
 
 ```bash
 install -m 0755 flat_check.sh /usr/local/bin/flat_check
@@ -256,12 +257,24 @@ chmod 0644 /etc/cron.d/flat-check
 
 ---
 
-## Standalone-агент для мониторинга (`flat_check_agent.sh`)
+## 2. Standalone-агент для мониторинга: `flat_check_agent.sh`
 
 Отдельный, полностью самостоятельный скрипт для прямой интеграции в
 мониторинг (Zabbix external check, systemd timer + HTTP-пуш и т.п.), когда
 не нужны ни `--help`, ни интерактивный мастер, ни сессионные логи — только
-JSON-снимок здоровья хоста.
+JSON-снимок здоровья хоста. **Установщика нет и не нужен** — это не
+альтернативная опция `install_flat_check.sh`, а другой инструмент, который
+разворачивается копированием одного файла (см. ниже).
+
+### Состав (инструмент 2)
+
+| Файл | Назначение |
+|------|------------|
+| `flat_check_agent.sh` | сам агент — один файл, `chmod +x`, и всё |
+| `flat_check_agent.conf.example` | эталонный конфиг (копировать в `flat_check_agent.conf` рядом со скриптом) |
+| `flat_check_agent.sudoers.example` | справка по необязательному ACL для non-root запуска |
+
+### Особенности
 
 - **Не подключает** `json_report.inc.sh`/`flat_check.sh`/`flat_check_2.sh` —
   весь нужный код скопирован внутрь одного файла. Разворачивается как один
@@ -285,6 +298,17 @@ JSON-снимок здоровья хоста.
   без доп. прав деградирует до `"missing"`, без падений. Подробности и
   необязательный узкий ACL — `flat_check_agent.sudoers.example`.
 
+### Быстрый старт
+
+```bash
+cp agent/flat_check_agent.sh agent/flat_check_agent.conf.example /opt/flat/
+mv /opt/flat/flat_check_agent.conf.example /opt/flat/flat_check_agent.conf
+chmod +x /opt/flat/flat_check_agent.sh
+# по умолчанию в конфиге PUSH_URLS указывает на 127.0.0.1 — это эталонный
+# пример для локальной проверки; впишите свой реальный приёмник и токен
+/opt/flat/flat_check_agent.sh | jq .
+```
+
 Пример cron-строки (всё через env, без конфиг-файла):
 
 ```cron
@@ -293,14 +317,7 @@ JSON-снимок здоровья хоста.
             /opt/flat/flat_check_agent.sh >/dev/null
 ```
 
-Или с конфиг-файлом рядом со скриптом (командная строка короче):
-
-```bash
-cp agent/flat_check_agent.sh agent/flat_check_agent.conf.example /opt/flat/
-mv /opt/flat/flat_check_agent.conf.example /opt/flat/flat_check_agent.conf
-# заполнить PUSH_URLS, PUSH_TOKEN, HOST_ID, SERVICE_NAME в конфиге
-chmod +x /opt/flat/flat_check_agent.sh
-```
+Или с конфиг-файлом рядом со скриптом (командная строка ещё короче):
 
 ```cron
 */5 * * * * /opt/flat/flat_check_agent.sh >/dev/null
@@ -341,10 +358,10 @@ systemctl enable --now flat-check-agent.timer
 
 ## Сопровождение
 
-- Логику JSON/push менять в `json_report.inc.sh` и синхронно в обоих скриптах корня.
+- Логику JSON/push для инструмента 1 менять в `json_report.inc.sh` и синхронно в обоих скриптах корня (`flat_check.sh`/`flat_check_2.sh`).
 - Новые пакеты health — в `PKG_*` обоих скриптов (см. корневой README).
 - На ноде conf держать с правами `0640`; секреты в git не коммитить.
-- `flat_check_agent.sh` — самостоятельная копия той же JSON/push-логики
-  (см. заголовок файла). При правке `json_report.inc.sh`/каталога пакетов
-  проверить, нужна ли та же правка и в `flat_check_agent.sh` — синхронизация
-  ручная, скрипт её не подключает.
+- `flat_check_agent.sh` (инструмент 2) — самостоятельная копия той же
+  JSON/push-логики (см. заголовок файла). При правке `json_report.inc.sh`/
+  каталога пакетов проверить, нужна ли та же правка и в
+  `flat_check_agent.sh` — синхронизация ручная, скрипт её не подключает.
