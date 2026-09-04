@@ -1,0 +1,52 @@
+[Unit]
+Description=Monitoring script + crone management
+
+# Basic dependencies
+Wants=network-online.target
+After=network-online.target
+Wants=nss-lookup.target
+After=nss-lookup.target
+After=cron.service crond.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+LimitCORE=infinity
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=append:/var/log/flat/flat-check/output.log
+StandardError=append:/var/log/flat/flat-check/error.log
+SyslogIdentifier=flat-check
+
+# Working directory and PID
+WorkingDirectory=/opt/flat/flat-check
+
+
+
+# Management commands
+# Запуск скрипта до cron
+ExecStartPre=/sbin/runuser -u flat-service -- /bin/bash -c '/opt/flat/flat-check/flat_check_agent.sh >/dev/null 2>>/var/log/flat/flat-check/flat_check_push.log'
+
+# Создание временного файла с cron-заданиями
+ExecStart=/bin/bash -c 'printf "# Обновление данных каждые 5 минут \n*/5 * * * * /opt/flat/flat-check/flat_check_agent.sh >/dev/null 2>>/var/log/flat/flat-check/flat_check_push.log\n" > /opt/flat/flat-check/check-cron-tmp'
+
+# Установка заданий для пользователя flat-service
+ExecStart=/usr/bin/crontab -u flat-service /opt/flat/flat-check/check-cron-tmp
+# Очистка временного файла
+ExecStartPost=/bin/rm -f /opt/flat/flat-check/check-cron-tmp
+# Проверка установленного crontab (для логов)
+ExecStartPost=/usr/bin/crontab -u flat-service -l
+
+# Останавливаем выполнение cron
+ExecStop=-/usr/bin/crontab -u flat-service -r
+# Удаляем логи
+# ExecStopPost=/bin/bash -c 'if [ -d /var/log/flat/flat-check ]; then find /var/log/flat/flat-check -type f -exec shred -u {} + 2>/dev/null || true; fi'
+
+
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
