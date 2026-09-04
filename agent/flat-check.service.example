@@ -27,8 +27,12 @@ WorkingDirectory=/opt/flat/flat-check
 
 
 # Management commands
-# Запуск скрипта до cron
-ExecStartPre=/sbin/runuser -u flat-service -- /bin/bash -c '/opt/flat/flat-check/flat_check_agent.sh >/dev/null 2>>/var/log/flat/flat-check/flat_check_push.log'
+# Запуск скрипта до cron. "-" в начале — провал этого шага (например,
+# приёмник push временно недоступен/вернул 5xx) не должен валить весь
+# сервис и мешать установке recurring cron-задания ниже — иначе один
+# неудачный пуш "здесь и сейчас" навсегда оставляет unit в failed,
+# так и не поставив периодическую проверку через cron.
+ExecStartPre=-/sbin/runuser -u flat-service -- /bin/bash -c '/opt/flat/flat-check/flat_check_agent.sh >/dev/null 2>>/var/log/flat/flat-check/flat_check_push.log'
 
 # Создание временного файла с cron-заданиями
 ExecStart=/bin/bash -c 'printf "# Обновление данных каждые 5 минут \n*/5 * * * * /opt/flat/flat-check/flat_check_agent.sh >/dev/null 2>>/var/log/flat/flat-check/flat_check_push.log\n" > /opt/flat/flat-check/check-cron-tmp'
