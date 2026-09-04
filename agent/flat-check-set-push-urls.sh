@@ -17,10 +17,6 @@
 # Карта портов (all_local_port.json) — JSON вида [ { "pkg-name": "port ...", ... } ],
 # копируется в тот же каталог до вызова этого скрипта (before_script сборки).
 # Ничего не делает и не падает, если карты/jq нет — конфиг остаётся как был.
-# Если на хосте не установлено ни одного *-backend — PUSH_URLS всё равно
-# перезаписывается, но пустой строкой (не остаётся дефолт из example-конфига):
-# flat_check_agent.sh при пустом PUSH_URLS просто печатает JSON и не пытается
-# пушить — это штатный режим "нечего пушить", а не ошибка.
 
 set -uo pipefail
 
@@ -46,6 +42,8 @@ while IFS=$'\t' read -r name ports; do
     done
 done < <(jq -r '.[0] | to_entries[] | "\(.key)\t\(.value)"' "$port_map")
 
-sed -i "s#^PUSH_URLS=.*#PUSH_URLS=\"${urls}\"#" "$dest_path/$config_file"
+if [[ -n "$urls" ]]; then
+    sed -i "s#^PUSH_URLS=.*#PUSH_URLS=\"${urls}\"#" "$dest_path/$config_file"
+fi
 
 rm -f "$port_map"
