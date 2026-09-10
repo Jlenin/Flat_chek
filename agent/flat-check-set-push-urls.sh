@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# flat-check-set-push-urls.sh — генерирует PUSH_URLS в flat_check_agent.conf
-# из реально установленных на хосте *-backend пакетов и их портов.
+# flat-check-set-push-urls.sh — генерирует PUSH_URLS и SERVICE_NAME в
+# flat_check_agent.conf из реально установленных на хосте *-backend
+# пакетов и их портов.
 #
 # Вызывается из POSTINST_INSTALL пакета flat-check ОДНОЙ строкой:
 #   bash $DESTINATION_PATH/flat-check-set-push-urls.sh "$DESTINATION_PATH" "$CONFIG_FILE"
@@ -17,6 +18,8 @@
 # Карта портов (all_local_port.json) — JSON вида [ { "pkg-name": "port ...", ... } ],
 # копируется в тот же каталог до вызова этого скрипта (before_script сборки).
 # Ничего не делает и не падает, если карты/jq нет — конфиг остаётся как был.
+# Если на хосте нет ни одного *-backend — PUSH_URLS и SERVICE_NAME в конфиге
+# не трогаются, остаются шаблонными значениями из example-конфига.
 
 set -uo pipefail
 
@@ -28,6 +31,7 @@ port_map="$dest_path/all_local_port.json"
 command -v jq >/dev/null 2>&1 || exit 0
 
 urls=""
+names=""
 while IFS=$'\t' read -r name ports; do
     [[ "$name" == *-backend ]] || continue
     if command -v dpkg >/dev/null 2>&1 && dpkg -s "$name" >/dev/null 2>&1; then
@@ -37,6 +41,7 @@ while IFS=$'\t' read -r name ports; do
     else
         continue
     fi
+    names="${names:+$names,}$name"
     for port in $ports; do
         urls="${urls:+$urls,}http://127.0.0.1:${port}/api/v1/health/ingest"
     done
@@ -44,6 +49,10 @@ done < <(jq -r '.[0] | to_entries[] | "\(.key)\t\(.value)"' "$port_map")
 
 if [[ -n "$urls" ]]; then
     sed -i "s#^PUSH_URLS=.*#PUSH_URLS=\"${urls}\"#" "$dest_path/$config_file"
+fi
+
+if [[ -n "$names" ]]; then
+    sed -i "s#^SERVICE_NAME=.*#SERVICE_NAME=\"${names}\"#" "$dest_path/$config_file"
 fi
 
 rm -f "$port_map"
