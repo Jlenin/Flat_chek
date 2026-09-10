@@ -23,15 +23,17 @@ PUSH_URLS="http://127.0.0.1:8080/api/v1/health/ingest"
 
 # Токен стенда (по умолчанию уходит как: Authorization: Bearer <token>).
 # Перед боевым использованием замените на настоящий токен приёмника.
-PUSH_TOKEN="correct-horse-battery-staple"
+PUSH_TOKEN="REPLACE_ME"
 # PUSH_TOKENS="token1,token2"          # по одному на каждый URL
 # PUSH_AUTH_HEADER="Authorization: Bearer"
 # PUSH_AUTH_HEADER="X-Api-Key"
 
 # Идентификация ноды в полях JSON (host_id/host_ip/service_name)
-HOST_ID="ss-n1"
-SERVICE_NAME="fss-backend"    # см. service_names.md
-# HOST_IP="10.0.1.5"          # иначе определяется автоматически
+HOST_ID="n1"
+SERVICE_NAME="REPLACE_ME"
+# см. service_names.md    
+# HOST_IP="10.0.1.5"          
+# иначе определяется автоматически
 
 # Что включать в JSON (пусто = все установленные продукты/пакеты)
 PACKAGES=""
