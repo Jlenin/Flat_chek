@@ -2560,6 +2560,8 @@ _json_arr_from_csv() {
 _json_collect_pkg() {
     local pkg="$1"
     local legacy="${PKG_LEGACY[$pkg]:-}"
+    local is_infra=0 pkg_warnings=0
+    _is_infrastructure_pkg "$pkg" && is_infra=1
     local status="not_installed" ver="" unit="${pkg}.service"
     local unit_path="" active="unknown" enabled="unknown"
     local opt_path="/opt/flat/$pkg" opt_owner="" opt_status="missing"
@@ -2608,6 +2610,17 @@ _json_collect_pkg() {
         active=$(systemctl is-active "$unit" 2>/dev/null || echo unknown)
         enabled=$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)
     fi
+    # Как в текстовом режиме (check_systemd_unit): юнит не найден на диске,
+    # либо найден, но не active — отдельная WARN-причина на каждый случай.
+    # Для Infrastructure-пакетов этот путь вообще не считается — в текстовом
+    # режиме для них вызывается check_infrastructure_pkg с другими правилами.
+    if [[ $is_infra -eq 0 ]]; then
+        if [[ -z "$unit_path" ]]; then
+            pkg_warnings=$((pkg_warnings + 1))
+        elif [[ "$active" != "active" ]]; then
+            pkg_warnings=$((pkg_warnings + 1))
+        fi
+    fi
 
     # directories (FLAT layout; Infrastructure — системные пакеты без /opt/flat)
     if _is_infrastructure_pkg "$pkg"; then
@@ -2619,6 +2632,10 @@ _json_collect_pkg() {
         if [[ -d "$opt_path" ]]; then
             opt_status="ok"
             opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null || echo "")
+        else
+            # check_opt_directory() в текстовом режиме тоже безусловно WARN'ит
+            # на отсутствующий /opt/flat/<pkg>.
+            pkg_warnings=$((pkg_warnings + 1))
         fi
         if [[ -d "$log_path" ]]; then
             log_status="ok"
@@ -2642,6 +2659,10 @@ _json_collect_pkg() {
         proc_status="running"
         ps_lines=$(ps -o pid=,args= -p "${pids//,/ }" 2>/dev/null | head -5 | sed 's/"/\\"/g' || true)
     fi
+    # check_log_directory(): текстовый режим WARN'ит на отсутствующую
+    # лог-директорию только пока процесс активен (иначе это просто INFO) —
+    # повторяем то же условие здесь.
+    [[ "$log_status" == "missing" && -n "$pids" ]] && pkg_warnings=$((pkg_warnings + 1))
 
     # ports
     ports_json="["
@@ -2658,6 +2679,7 @@ _json_collect_pkg() {
                 open="listening"
             fi
         fi
+        [[ "$open" == "not listening" && $is_infra -eq 0 ]] && pkg_warnings=$((pkg_warnings + 1))
         [[ $first_port -eq 1 ]] || ports_json+=","
         first_port=0
         ports_json+=$(printf '{"number":"%s","status":"%s"}' "$(_json_esc "$port_spec")" "$(_json_esc "$open")")
@@ -2683,6 +2705,7 @@ _json_collect_pkg() {
             api_code=0
             api_status="curl_not_found"
         fi
+        [[ "$api_status" != "ok" && $is_infra -eq 0 ]] && pkg_warnings=$((pkg_warnings + 1))
     fi
 
     # configs
@@ -2693,6 +2716,12 @@ _json_collect_pkg() {
     lr="/etc/logrotate.d/${pkg}.conf"
     [[ -f "/etc/logrotate.d/$pkg" && ! -f "$lr" ]] && lr="/etc/logrotate.d/$pkg"
     sudoers="/etc/sudoers.d/$pkg"
+    # check_configs(): WARN только когда nginx-конфиг есть в sites-available,
+    # но не включён в sites-enabled (logrotate/sudoers в текстовом режиме
+    # никогда не WARN'ят на отсутствие).
+    if [[ $is_infra -eq 0 && -f "$ngx_av" && ! -e "$ngx_en" && ! -L "$ngx_en" ]]; then
+        pkg_warnings=$((pkg_warnings + 1))
+    fi
     for pair in "nginx:$ngx_av" "nginx:$ngx_en" "logrotate:$lr" "sudoers:$sudoers"; do
         local svc="${pair%%:*}" path="${pair#*:}" st="missing"
         [[ -e "$path" || -L "$path" ]] && st="ok"
@@ -2748,6 +2777,11 @@ _json_collect_pkg() {
     printf '"api":{"url":"%s","status_code":%s,"status":"%s"}' \
         "$(_json_esc "$api_url")" "${api_code:-0}" "$(_json_esc "$api_status")"
     printf '}'
+    # WARNINGS++ здесь не доходит до вызывающего кода — _json_collect_pkg()
+    # всегда запускается в сабшелле через $(...) (см. комментарий у места
+    # вызова в build_health_json). Копим счётчик в сайд-файл в _JSON_TMP —
+    # тот же паттерн, что certs_json/svc_uptime_json уже используют.
+    [[ "$pkg_warnings" -gt 0 ]] && printf '%s\n' "$pkg_warnings" >> "${_JSON_TMP}/pkg_warnings.count" 2>/dev/null
     return 0
 }
 
@@ -2829,20 +2863,76 @@ _json_collect_system() {
     done
     certs_json+="]"
 
+    # per-service метрики (cpu/memory % по PID пакета, uptime по systemd-юниту).
+    # Тот же источник PID, что и в _json_collect_pkg()/_sys_pkg_pids(), но
+    # отдельный проход по ВСЕМ установленным пакетам (не зависит от фильтра
+    # --pkg/PACKAGES) — как и остальные системные метрики (disk/network) выше.
+    local svc_cpu_json="[" svc_mem_json="[" svc_uptime_json="["
+    local first_cpu=1 first_mem=1 first_up=1
+    local now_epoch svc_pkg svc_pids svc_pct svc_mem svc_enter svc_name svc_unit svc_ts svc_sec
+    now_epoch=$(date +%s 2>/dev/null)
+    for svc_pkg in "${!PKG_PRODUCT[@]}"; do
+        is_pkg_installed_tiny "$svc_pkg" "${PKG_LEGACY[$svc_pkg]:-}" || continue
+        svc_pids=$(_sys_pkg_pids "$svc_pkg" 2>/dev/null | paste -sd',' - 2>/dev/null)
+        if [[ -n "$svc_pids" ]]; then
+            svc_pct=$(ps -p "$svc_pids" -o pcpu= 2>/dev/null | awk '{s+=$1} END{if(NR) printf "%.1f", s}')
+            if [[ -n "$svc_pct" ]] && awk -v p="$svc_pct" 'BEGIN{exit !(p>0)}' 2>/dev/null; then
+                [[ $first_cpu -eq 1 ]] || svc_cpu_json+=","
+                first_cpu=0
+                svc_cpu_json+=$(printf '{"service_name":"%s","usage_percent":%s}' "$(_json_esc "$svc_pkg")" "$svc_pct")
+            fi
+            svc_mem=$(ps -p "$svc_pids" -o pmem= 2>/dev/null | awk '{s+=$1} END{if(NR) printf "%.1f", s}')
+            if [[ -n "$svc_mem" ]] && awk -v p="$svc_mem" 'BEGIN{exit !(p>0)}' 2>/dev/null; then
+                [[ $first_mem -eq 1 ]] || svc_mem_json+=","
+                first_mem=0
+                svc_mem_json+=$(printf '{"service_name":"%s","usage_percent":%s}' "$(_json_esc "$svc_pkg")" "$svc_mem")
+            fi
+        fi
+        if command -v systemctl >/dev/null 2>&1 && [[ -n "$now_epoch" ]]; then
+            svc_enter=""
+            while IFS= read -r svc_name; do
+                [[ -z "$svc_name" ]] && continue
+                svc_unit="${svc_name}.service"
+                systemctl is-active --quiet "$svc_unit" 2>/dev/null || continue
+                svc_enter=$(systemctl show "$svc_unit" -p ActiveEnterTimestamp --value 2>/dev/null)
+                [[ -n "$svc_enter" && "$svc_enter" != "n/a" && "$svc_enter" != "0" ]] && break
+            done < <(_sys_pkg_names "$svc_pkg")
+            if [[ -n "$svc_enter" && "$svc_enter" != "n/a" && "$svc_enter" != "0" ]]; then
+                svc_ts=$(date -d "$svc_enter" +%s 2>/dev/null)
+                if [[ -n "$svc_ts" ]]; then
+                    svc_sec=$((now_epoch - svc_ts))
+                    [[ "$svc_sec" -ge 0 ]] || svc_sec=""
+                    if [[ -n "$svc_sec" ]]; then
+                        [[ $first_up -eq 1 ]] || svc_uptime_json+=","
+                        first_up=0
+                        svc_uptime_json+=$(printf '{"service_name":"%s","uptime":%s}' "$(_json_esc "$svc_pkg")" "$svc_sec")
+                    fi
+                fi
+            fi
+        fi
+    done
+    svc_cpu_json+="]"
+    svc_mem_json+="]"
+    svc_uptime_json+="]"
+
     printf '{'
     printf '"cpu":{"usage_percent":%s},' "${cpu_pct:-0}"
-    printf '"cpu_services":[],'
+    printf '"cpu_services":%s,' "$svc_cpu_json"
     printf '"memory":{"total_mb":%s,"used_mb":%s,"available_mb":%s},' \
         "${mem_total:-0}" "${mem_used:-0}" "${mem_avail:-0}"
-    printf '"memory_services":[],'
+    printf '"memory_services":%s,' "$svc_mem_json"
     printf '"disk":%s,' "$disk_json"
     printf '"database":{"name":"%s","status":"%s","replication":"%s","nodes":%s},' \
         "$(_json_esc "$db_name")" "$(_json_esc "$db_status")" "$(_json_esc "$db_repl")" "${db_nodes:-0}"
     printf '"network":%s,' "$net_json"
     printf '"uptime_seconds":%s' "${up_sec:-0}"
     printf '}'
-    # certificates returned via global side file
+    # certificates/uptime_services возвращаются через side-file'ы в _JSON_TMP —
+    # тот же паттерн, что certs_json уже использовал: build_health_json() читает
+    # их обратно и печатает на верхнем уровне JSON (uptime_services — там, а не
+    # внутри system{}, как и certificates).
     printf '%s' "$certs_json" > "${_JSON_TMP}/certificates.json"
+    printf '%s' "$svc_uptime_json" > "${_JSON_TMP}/uptime_services.json"
 }
 
 _json_collect_infra() {
@@ -2906,7 +2996,7 @@ _json_collect_repos() {
 build_health_json() {
     local products_list=()
     local p pkg product_json packages_json first_prod=1 first_pkg
-    local ts system_json infra_json repos_json certs_json
+    local ts system_json infra_json repos_json certs_json uptime_services_json
     local pkg_filter="${PACKAGES:-}"
 
     _JSON_TMP=$(mktemp -d "${TMPDIR:-/tmp}/flat_json.XXXXXX") || return 1
@@ -2925,6 +3015,7 @@ build_health_json() {
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     system_json=$(_json_collect_system)
     certs_json=$(cat "${_JSON_TMP}/certificates.json" 2>/dev/null || echo '[]')
+    uptime_services_json=$(cat "${_JSON_TMP}/uptime_services.json" 2>/dev/null || echo '[]')
 
     products_list=("${FLAT_PRODUCTS_ORDER[@]}")
     if [[ -n "$FILTER_PRODUCT" ]]; then
@@ -2990,6 +3081,12 @@ build_health_json() {
     done
     printf '],'
 
+    if [[ -f "${_JSON_TMP}/pkg_warnings.count" ]]; then
+        local pkg_warnings_total
+        pkg_warnings_total=$(awk '{s+=$1} END{print s+0}' "${_JSON_TMP}/pkg_warnings.count" 2>/dev/null)
+        [[ "$pkg_warnings_total" =~ ^[0-9]+$ ]] && WARNINGS=$((WARNINGS + pkg_warnings_total))
+    fi
+
     infra_json=$(_json_collect_infra)
     repos_json='[]'
     [[ $SHOW_REPO -eq 1 || $SHOW_REPOS_JSON -eq 1 ]] && repos_json=$(_json_collect_repos)
@@ -3001,7 +3098,7 @@ build_health_json() {
         "${INSTALLED:-0}" "${ERRORS:-0}" "${WARNINGS:-0}"
     printf '"system":%s,' "$system_json"
     printf '"certificates":%s,' "$certs_json"
-    printf '"uptime_services":[]'
+    printf '"uptime_services":%s' "$uptime_services_json"
     printf '}\n'
 
     rm -rf -- "$_JSON_TMP" 2>/dev/null
