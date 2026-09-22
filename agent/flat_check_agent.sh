@@ -877,6 +877,8 @@ _json_arr_from_csv() {
 _json_collect_pkg() {
     local pkg="$1"
     local legacy="${PKG_LEGACY[$pkg]:-}"
+    local is_infra=0 pkg_warnings=0
+    _is_infrastructure_pkg "$pkg" && is_infra=1
     local status="not_installed" ver="" unit="${pkg}.service"
     local unit_path="" active="unknown" enabled="unknown"
     local opt_path="/opt/flat/$pkg" opt_owner="" opt_status="missing"
@@ -925,6 +927,17 @@ _json_collect_pkg() {
         active=$(systemctl is-active "$unit" 2>/dev/null || echo unknown)
         enabled=$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)
     fi
+    # Как в текстовом режиме (check_systemd_unit): юнит не найден на диске,
+    # либо найден, но не active — отдельная WARN-причина на каждый случай.
+    # Для Infrastructure-пакетов этот путь вообще не считается — в текстовом
+    # режиме для них вызывается check_infrastructure_pkg с другими правилами.
+    if [[ $is_infra -eq 0 ]]; then
+        if [[ -z "$unit_path" ]]; then
+            pkg_warnings=$((pkg_warnings + 1))
+        elif [[ "$active" != "active" ]]; then
+            pkg_warnings=$((pkg_warnings + 1))
+        fi
+    fi
 
     # directories (FLAT layout; Infrastructure — системные пакеты без /opt/flat)
     if _is_infrastructure_pkg "$pkg"; then
@@ -936,6 +949,10 @@ _json_collect_pkg() {
         if [[ -d "$opt_path" ]]; then
             opt_status="ok"
             opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null || echo "")
+        else
+            # check_opt_directory() в текстовом режиме тоже безусловно WARN'ит
+            # на отсутствующий /opt/flat/<pkg>.
+            pkg_warnings=$((pkg_warnings + 1))
         fi
         if [[ -d "$log_path" ]]; then
             log_status="ok"
@@ -959,6 +976,10 @@ _json_collect_pkg() {
         proc_status="running"
         ps_lines=$(ps -o pid=,args= -p "${pids//,/ }" 2>/dev/null | head -5 | sed 's/"/\\"/g' || true)
     fi
+    # check_log_directory(): текстовый режим WARN'ит на отсутствующую
+    # лог-директорию только пока процесс активен (иначе это просто INFO) —
+    # повторяем то же условие здесь.
+    [[ "$log_status" == "missing" && -n "$pids" ]] && pkg_warnings=$((pkg_warnings + 1))
 
     # ports
     ports_json="["
@@ -975,6 +996,7 @@ _json_collect_pkg() {
                 open="listening"
             fi
         fi
+        [[ "$open" == "not listening" && $is_infra -eq 0 ]] && pkg_warnings=$((pkg_warnings + 1))
         [[ $first_port -eq 1 ]] || ports_json+=","
         first_port=0
         ports_json+=$(printf '{"number":"%s","status":"%s"}' "$(_json_esc "$port_spec")" "$(_json_esc "$open")")
@@ -1000,6 +1022,7 @@ _json_collect_pkg() {
             api_code=0
             api_status="curl_not_found"
         fi
+        [[ "$api_status" != "ok" && $is_infra -eq 0 ]] && pkg_warnings=$((pkg_warnings + 1))
     fi
 
     # configs
@@ -1010,6 +1033,12 @@ _json_collect_pkg() {
     lr="/etc/logrotate.d/${pkg}.conf"
     [[ -f "/etc/logrotate.d/$pkg" && ! -f "$lr" ]] && lr="/etc/logrotate.d/$pkg"
     sudoers="/etc/sudoers.d/$pkg"
+    # check_configs(): WARN только когда nginx-конфиг есть в sites-available,
+    # но не включён в sites-enabled (logrotate/sudoers в текстовом режиме
+    # никогда не WARN'ят на отсутствие).
+    if [[ $is_infra -eq 0 && -f "$ngx_av" && ! -e "$ngx_en" && ! -L "$ngx_en" ]]; then
+        pkg_warnings=$((pkg_warnings + 1))
+    fi
     for pair in "nginx:$ngx_av" "nginx:$ngx_en" "logrotate:$lr" "sudoers:$sudoers"; do
         local svc="${pair%%:*}" path="${pair#*:}" st="missing"
         [[ -e "$path" || -L "$path" ]] && st="ok"
@@ -1065,6 +1094,11 @@ _json_collect_pkg() {
     printf '"api":{"url":"%s","status_code":%s,"status":"%s"}' \
         "$(_json_esc "$api_url")" "${api_code:-0}" "$(_json_esc "$api_status")"
     printf '}'
+    # WARNINGS++ здесь не доходит до вызывающего кода — _json_collect_pkg()
+    # всегда запускается в сабшелле через $(...) (см. комментарий у места
+    # вызова в build_health_json). Копим счётчик в сайд-файл в _JSON_TMP —
+    # тот же паттерн, что certs_json/svc_uptime_json уже используют.
+    [[ "$pkg_warnings" -gt 0 ]] && printf '%s\n' "$pkg_warnings" >> "${_JSON_TMP}/pkg_warnings.count" 2>/dev/null
     return 0
 }
 
@@ -1366,6 +1400,12 @@ build_health_json() {
         printf '{"name":"%s","packages":%s}' "$(_json_esc "$p")" "$packages_json"
     done
     printf '],'
+
+    if [[ -f "${_JSON_TMP}/pkg_warnings.count" ]]; then
+        local pkg_warnings_total
+        pkg_warnings_total=$(awk '{s+=$1} END{print s+0}' "${_JSON_TMP}/pkg_warnings.count" 2>/dev/null)
+        [[ "$pkg_warnings_total" =~ ^[0-9]+$ ]] && WARNINGS=$((WARNINGS + pkg_warnings_total))
+    fi
 
     infra_json=$(_json_collect_infra)
     repos_json='[]'
