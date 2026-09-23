@@ -1,5 +1,6 @@
 #!/bin/bash
-# Примеры ручного запуска агента (из корня репо или после установки).
+# Примеры ручного запуска flat_check.sh (из корня репо или после установки).
+# Не про agent/flat_check_agent.sh — у него нет argv, см. agent/README.md.
 
 set -euo pipefail
 FLAT_CHECK="${FLAT_CHECK:-./flat_check.sh}"

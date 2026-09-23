@@ -816,14 +816,14 @@ _json_load_config() {
 #   каталог $_JSON_TMP (сертификаты передаются через файл, не через subshell —
 #   иначе терялись бы вместе с состоянием CPU-дельты, см. комментарий ниже)
 #
-# Источник: перенесено без изменений логики из agent/json_report.inc.sh
+# Источник: перенесено без изменений логики из json_report.inc.sh
 #   (строки 87-465 и 468-574 — build_health_json; _json_print — строки 656-666,
 #   вынесен сюда, а не в 03_push.sh, т.к. используется и при простом --json
 #   без --push).
 #
 # ОБНАРУЖЕННОЕ РАСХОЖДЕНИЕ (найдено при сверке --json со старым flat_check.sh,
 # не исправлено в оригиналах в рамках этой задачи — см. CONTEXT.md/README для
-# отдельного тикета): agent/json_report.inc.sh отстал от копий, вшитых в
+# отдельного тикета): json_report.inc.sh отстал от копий, вшитых в
 # flat_check.sh/flat_check_2.sh, в блоке directories внутри _json_collect_pkg —
 # он не пропускал через _is_infrastructure_pkg() и показывал бы для
 # nginx/postgresql/mariadb выдуманные пути /opt/flat/<pkg> со статусом

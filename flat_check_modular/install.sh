@@ -1,6 +1,7 @@
 #!/bin/bash
 # Установка flat_check_modular на ноду: всё дерево (flat_check + lib/ + conf/),
-# конфиг, cron. Идиома взята из agent/install_flat_check.sh (die/info/warn,
+# конфиг, cron. Идиома взята из прежнего agent/install_flat_check.sh (удалён,
+# теперь установка через deb/rpm) — die/info/warn,
 # --dry-run, безопасная подстановка в conf, само-починка +x) — отличие только
 # в том, ЧТО ставится: не один файл, а целое дерево модулей.
 #

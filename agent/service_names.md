@@ -46,9 +46,6 @@ SERVICE_NAME="fss-backend"
 
 # или CLI
 ./flat_check.sh --service-name fss-backend --json
-
-# или установщик
-sudo ./agent/install_flat_check.sh --service-name fss-backend ...
 ```
 
 Если не задано: подставится `SINGLE_PKG` (при `--pkg`) или `unknown`.
