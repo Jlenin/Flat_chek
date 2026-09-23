@@ -40,15 +40,10 @@
 
 ## Как задать
 
+В `flat_check_agent.conf` (рядом со скриптом) или переменной окружения:
+
 ```bash
-# в конфиге
 SERVICE_NAME="fss-backend"
-
-# или CLI
-./flat_check.sh --service-name fss-backend --json
-
-# или установщик
-sudo ./agent/install_flat_check.sh --service-name fss-backend ...
 ```
 
-Если не задано: подставится `SINGLE_PKG` (при `--pkg`) или `unknown`.
+Если не задано: подставится `SINGLE_PKG` (если задан) или `unknown`.

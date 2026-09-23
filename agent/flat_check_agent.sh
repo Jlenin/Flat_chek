@@ -816,14 +816,14 @@ _json_load_config() {
 #   каталог $_JSON_TMP (сертификаты передаются через файл, не через subshell —
 #   иначе терялись бы вместе с состоянием CPU-дельты, см. комментарий ниже)
 #
-# Источник: перенесено без изменений логики из agent/json_report.inc.sh
+# Источник: перенесено без изменений логики из json_report.inc.sh
 #   (строки 87-465 и 468-574 — build_health_json; _json_print — строки 656-666,
 #   вынесен сюда, а не в 03_push.sh, т.к. используется и при простом --json
 #   без --push).
 #
 # ОБНАРУЖЕННОЕ РАСХОЖДЕНИЕ (найдено при сверке --json со старым flat_check.sh,
 # не исправлено в оригиналах в рамках этой задачи — см. CONTEXT.md/README для
-# отдельного тикета): agent/json_report.inc.sh отстал от копий, вшитых в
+# отдельного тикета): json_report.inc.sh отстал от копий, вшитых в
 # flat_check.sh/flat_check_2.sh, в блоке directories внутри _json_collect_pkg —
 # он не пропускал через _is_infrastructure_pkg() и показывал бы для
 # nginx/postgresql/mariadb выдуманные пути /opt/flat/<pkg> со статусом
@@ -873,11 +873,25 @@ _json_arr_from_csv() {
     printf ']'
 }
 
+# Пишет одну находку (WARN/ERROR) в сайд-файл $_JSON_TMP/pkg_issues.ndjson —
+# по той же причине, что certs_json/svc_uptime_json уже используют такой
+# side-channel: _json_collect_pkg() всегда выполняется в сабшелле $(...)
+# (см. комментарий у места её вызова в build_health_json), поэтому обычное
+# WARNINGS++/ERRORS++ здесь никогда не долетело бы до вызывающего кода.
+# build_health_json() читает файл обратно, считает severity и собирает
+# summary.errors/summary.warnings и issues[] из одного и того же источника.
+_json_pkg_issue() {
+    local severity="$1" code="$2" message="$3"
+    printf '{"severity":"%s","package":"%s","product":"%s","code":"%s","message":"%s"}\n' \
+        "$(_json_esc "$severity")" "$(_json_esc "$pkg")" "$(_json_esc "${PKG_PRODUCT[$pkg]:-}")" \
+        "$(_json_esc "$code")" "$(_json_esc "$message")" >> "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null
+}
+
 # Собрать JSON-объект одного пакета (без печати human-output).
 _json_collect_pkg() {
     local pkg="$1"
     local legacy="${PKG_LEGACY[$pkg]:-}"
-    local is_infra=0 pkg_warnings=0
+    local is_infra=0
     _is_infrastructure_pkg "$pkg" && is_infra=1
     local status="not_installed" ver="" unit="${pkg}.service"
     local unit_path="" active="unknown" enabled="unknown"
@@ -927,15 +941,18 @@ _json_collect_pkg() {
         active=$(systemctl is-active "$unit" 2>/dev/null || echo unknown)
         enabled=$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)
     fi
-    # Как в текстовом режиме (check_systemd_unit): юнит не найден на диске,
-    # либо найден, но не active — отдельная WARN-причина на каждый случай.
-    # Для Infrastructure-пакетов этот путь вообще не считается — в текстовом
-    # режиме для них вызывается check_infrastructure_pkg с другими правилами.
+    # Как в текстовом режиме (check_systemd_unit): юнит не найден на диске —
+    # WARN (конфигурационная аномалия). Юнит найден, но не active и/или не
+    # enabled — ERROR: служба реально не работает / не переживёт перезагрузку,
+    # это инцидент, а не предупреждение. Для Infrastructure-пакетов этот путь
+    # вообще не считается — в текстовом режиме для них вызывается
+    # check_infrastructure_pkg с другими правилами.
     if [[ $is_infra -eq 0 ]]; then
         if [[ -z "$unit_path" ]]; then
-            pkg_warnings=$((pkg_warnings + 1))
-        elif [[ "$active" != "active" ]]; then
-            pkg_warnings=$((pkg_warnings + 1))
+            _json_pkg_issue warning systemd_unit_missing "systemd unit: $unit not found"
+        else
+            [[ "$active" != "active" ]] && _json_pkg_issue error systemd_inactive "systemd: $unit is $active"
+            [[ "$enabled" != "enabled" ]] && _json_pkg_issue error systemd_disabled "systemd: $unit is $enabled"
         fi
     fi
 
@@ -952,7 +969,7 @@ _json_collect_pkg() {
         else
             # check_opt_directory() в текстовом режиме тоже безусловно WARN'ит
             # на отсутствующий /opt/flat/<pkg>.
-            pkg_warnings=$((pkg_warnings + 1))
+            _json_pkg_issue warning opt_dir_missing "dir: $opt_path missing"
         fi
         if [[ -d "$log_path" ]]; then
             log_status="ok"
@@ -979,7 +996,7 @@ _json_collect_pkg() {
     # check_log_directory(): текстовый режим WARN'ит на отсутствующую
     # лог-директорию только пока процесс активен (иначе это просто INFO) —
     # повторяем то же условие здесь.
-    [[ "$log_status" == "missing" && -n "$pids" ]] && pkg_warnings=$((pkg_warnings + 1))
+    [[ "$log_status" == "missing" && -n "$pids" ]] && _json_pkg_issue warning log_dir_missing "logdir: $log_path missing (process active)"
 
     # ports
     ports_json="["
@@ -996,7 +1013,7 @@ _json_collect_pkg() {
                 open="listening"
             fi
         fi
-        [[ "$open" == "not listening" && $is_infra -eq 0 ]] && pkg_warnings=$((pkg_warnings + 1))
+        [[ "$open" == "not listening" && $is_infra -eq 0 ]] && _json_pkg_issue warning port_not_listening "port: $port_spec not listening"
         [[ $first_port -eq 1 ]] || ports_json+=","
         first_port=0
         ports_json+=$(printf '{"number":"%s","status":"%s"}' "$(_json_esc "$port_spec")" "$(_json_esc "$open")")
@@ -1022,7 +1039,7 @@ _json_collect_pkg() {
             api_code=0
             api_status="curl_not_found"
         fi
-        [[ "$api_status" != "ok" && $is_infra -eq 0 ]] && pkg_warnings=$((pkg_warnings + 1))
+        [[ "$api_status" != "ok" && $is_infra -eq 0 ]] && _json_pkg_issue warning api_unhealthy "api: $api_url => $api_status"
     fi
 
     # configs
@@ -1037,7 +1054,7 @@ _json_collect_pkg() {
     # но не включён в sites-enabled (logrotate/sudoers в текстовом режиме
     # никогда не WARN'ят на отсутствие).
     if [[ $is_infra -eq 0 && -f "$ngx_av" && ! -e "$ngx_en" && ! -L "$ngx_en" ]]; then
-        pkg_warnings=$((pkg_warnings + 1))
+        _json_pkg_issue warning nginx_not_enabled "nginx: $ngx_en not enabled"
     fi
     for pair in "nginx:$ngx_av" "nginx:$ngx_en" "logrotate:$lr" "sudoers:$sudoers"; do
         local svc="${pair%%:*}" path="${pair#*:}" st="missing"
@@ -1094,11 +1111,6 @@ _json_collect_pkg() {
     printf '"api":{"url":"%s","status_code":%s,"status":"%s"}' \
         "$(_json_esc "$api_url")" "${api_code:-0}" "$(_json_esc "$api_status")"
     printf '}'
-    # WARNINGS++ здесь не доходит до вызывающего кода — _json_collect_pkg()
-    # всегда запускается в сабшелле через $(...) (см. комментарий у места
-    # вызова в build_health_json). Копим счётчик в сайд-файл в _JSON_TMP —
-    # тот же паттерн, что certs_json/svc_uptime_json уже используют.
-    [[ "$pkg_warnings" -gt 0 ]] && printf '%s\n' "$pkg_warnings" >> "${_JSON_TMP}/pkg_warnings.count" 2>/dev/null
     return 0
 }
 
@@ -1312,7 +1324,7 @@ _json_collect_repos() {
 build_health_json() {
     local products_list=()
     local p pkg product_json packages_json first_prod=1 first_pkg
-    local ts system_json infra_json repos_json certs_json uptime_services_json
+    local ts system_json infra_json repos_json certs_json uptime_services_json issues_json
     local pkg_filter="${PACKAGES:-}"
 
     _JSON_TMP=$(mktemp -d "${TMPDIR:-/tmp}/flat_json.XXXXXX") || return 1
@@ -1401,10 +1413,18 @@ build_health_json() {
     done
     printf '],'
 
-    if [[ -f "${_JSON_TMP}/pkg_warnings.count" ]]; then
-        local pkg_warnings_total
-        pkg_warnings_total=$(awk '{s+=$1} END{print s+0}' "${_JSON_TMP}/pkg_warnings.count" 2>/dev/null)
-        [[ "$pkg_warnings_total" =~ ^[0-9]+$ ]] && WARNINGS=$((WARNINGS + pkg_warnings_total))
+    # issues[]: сайд-файл собран построчно в _json_pkg_issue() (см. её
+    # комментарий) — здесь читаем обратно, считаем severity и заодно
+    # получаем summary.errors/summary.warnings из того же источника, что и
+    # сам список находок (единый источник правды вместо двух параллельных).
+    issues_json='[]'
+    if [[ -f "${_JSON_TMP}/pkg_issues.ndjson" ]]; then
+        issues_json="[$(paste -sd',' "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null)]"
+        local issue_warnings issue_errors
+        issue_warnings=$(grep -c '"severity":"warning"' "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null) || issue_warnings=0
+        issue_errors=$(grep -c '"severity":"error"' "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null) || issue_errors=0
+        WARNINGS=$((WARNINGS + issue_warnings))
+        ERRORS=$((ERRORS + issue_errors))
     fi
 
     infra_json=$(_json_collect_infra)
@@ -1418,7 +1438,8 @@ build_health_json() {
         "${INSTALLED:-0}" "${ERRORS:-0}" "${WARNINGS:-0}"
     printf '"system":%s,' "$system_json"
     printf '"certificates":%s,' "$certs_json"
-    printf '"uptime_services":%s' "$uptime_services_json"
+    printf '"uptime_services":%s,' "$uptime_services_json"
+    printf '"issues":%s' "$issues_json"
     printf '}\n'
 
     rm -rf -- "$_JSON_TMP" 2>/dev/null
@@ -1530,6 +1551,12 @@ if ! body=$(build_health_json); then
     fail "flat_check_agent: не удалось собрать JSON"
     exit 1
 fi
+
+# Бэк (Partner ingest) принимает конверт {"hosts":[...]}, не голый объект —
+# HostSnapshot.Raw хранит весь элемент как есть, парсит только host_id/
+# service_name/timestamp/summary внутри hosts[]. Оборачиваем один раз здесь,
+# ДО печати — stdout и то, что реально уходит push'ем, остаются идентичны.
+body="{\"hosts\":[${body}]}"
 
 # stdout — ТОЛЬКО это. Ничего больше сюда не печатать.
 printf '%s\n' "$body"
