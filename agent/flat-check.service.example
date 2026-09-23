@@ -19,8 +19,9 @@ LimitNOFILE=65536
 
 # stdout — поток JSON (по одному объекту на каждый push каждого слоя),
 # stderr — info/warn/fail; оба идут в journalctl -u flat-check по умолчанию.
-# Явные файлы логов — только если в организации принято писать логи в
-# файл, а не в journal.
+# Плюс тот же info/warn/fail — построчно в файл LOG_FILE (по умолчанию
+# /var/log/flat/flat-check/flat_check_agent.log, см. agent/README.md,
+# "Логирование") — не нужно ничего включать отдельно, работает из коробки.
 SyslogIdentifier=flat-check
 
 WorkingDirectory=/opt/flat/flat-check

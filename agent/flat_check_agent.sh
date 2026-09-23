@@ -65,9 +65,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 # Источник: подмножество lib/core.sh (раздел 00_globals) + lib/agent.sh
 # (раздел 01_config) из flat_check_modular — взяты только переменные,
 # реально читаемые кодом ниже (проверено построчным grep по каждой).
-# LOG_FILE сознательно НЕ инициализируется (никогда не вызываем
-# init_logging) — сессионный лог этому агенту не нужен; _log_line() при
-# пустом LOG_FILE и так тихо ничего не делает (см. её тело ниже).
+# LOG_FILE: по тому же образцу, что flat_check.sh/flat_check_2.sh — файл
+# рядом с рабочим каталогом продукта, а не встроенный в код путь. У тех
+# двух это "${SCRIPT_DIR}/${SCRIPT_NAME}.log" (рядом со скриптом, т.к. это
+# разовый прогон); здесь демон долгоживущий, а деплой — /opt/flat/flat-check
+# (см. flat-check.service.example), поэтому файл — в соседний с /opt/flat/
+# каталог /var/log/flat/flat-check/ (тот же путь, что раньше был жёстко
+# прописан в flat-check.service.example как StandardOutput/StandardError).
+# _log_line()/_daemon_init_logging() ниже: не удалось создать/писать файл —
+# тихо деградирует до LOG_FILE="" (без файла, только stderr) — как и
+# init_logging() у flat_check.sh/flat_check_2.sh, без падений.
 
 # Цвета для info/warn/fail на экране (актуально только при ручном запуске
 # в терминале — эти сообщения идут в stderr, см. шапку файла).
@@ -78,7 +85,7 @@ C_B='\033[0;34m'
 C_C='\033[0;36m'
 C_N='\033[0m'
 
-LOG_FILE=""
+LOG_FILE="${LOG_FILE:-/var/log/flat/flat-check/flat_check_agent.log}"
 DEBUG_MODE="${DEBUG_MODE:-0}"
 
 # Идентификация хоста / агента push (приоритет: env > conf-файл > пусто).
@@ -791,6 +798,11 @@ _json_load_config() {
                     [[ "$val" =~ ^[1-9][0-9]*$ ]] && printf -v "$key" '%s' "$val"
                     ;;
                 CACHE_FILE) [[ -n "$val" ]] && CACHE_FILE="$val" ;;
+                # Без guard'а [[ -z ]], в отличие от остальных ключей выше:
+                # LOG_FILE уже непустой по дефолту (см. секцию 0), поэтому
+                # guard никогда бы не сработал и конфиг не мог бы ни сменить
+                # путь, ни явно отключить файловый лог (LOG_FILE="" в конфиге).
+                LOG_FILE) LOG_FILE="$val" ;;
                 COLLECTOR_JOBS|JOBS)
                     if [[ "$val" =~ ^[0-9]+$ && "${COLLECTOR_JOBS:-0}" -eq 0 ]]; then
                         COLLECTOR_JOBS="$val"
@@ -1995,6 +2007,28 @@ _daemon_run_metrics() {
 
 # --- планировщик ----------------------------------------------------------
 
+# Тот же приём, что init_logging() у flat_check.sh/flat_check_2.sh: создаёт
+# каталог лога (mkdir -p — соседний с /opt/flat/<продукт>, см. секцию 0),
+# один раз усекает файл ("=== сессия начата ===", т.е. один раз за запуск/
+# перезапуск демона — не за каждый тик, в отличие от разовых flat_check.sh/
+# flat_check_2.sh, где "сессия" = один вызов). Не получилось создать
+# каталог/писать файл (нет прав, /var/log/flat не существует и т.п.) —
+# LOG_FILE="" и тихая деградация до "только stderr", как и у них: файловое
+# логирование — удобство, а не то, от чего должен падать запуск демона.
+_daemon_init_logging() {
+    [[ -n "$LOG_FILE" ]] || return 0
+    local dir
+    dir="$(dirname "$LOG_FILE")"
+    mkdir -p "$dir" 2>/dev/null
+    if ! { : > "$LOG_FILE"; } 2>/dev/null; then
+        warn "не удалось писать лог-файл $LOG_FILE — файловое логирование выключено, дальше только stderr (переопределить путь: LOG_FILE в конфиге/env)"
+        LOG_FILE=""
+        return 1
+    fi
+    _log_line "INFO" "=== flat_check_agent (демон) — сессия начата ==="
+    return 0
+}
+
 _daemon_init() {
     _daemon_metrics_init
     DAEMON_INSTALLED_PKGS=()
@@ -2065,6 +2099,7 @@ daemon_main() {
 # нашёлся из-за несовпадения имени файла, и push тихо не запускался).
 FLAT_AGENT_CONF="${FLAT_AGENT_CONF:-$SCRIPT_DIR/flat_check_agent.conf}"
 _json_load_config "$FLAT_AGENT_CONF"
+_daemon_init_logging
 
 if [[ -z "$PUSH_URLS" ]]; then
     # PUSH_URLS пуст — демон всё равно работает и печатает JSON в stdout на

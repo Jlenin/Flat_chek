@@ -1,0 +1,22 @@
+# /etc/logrotate.d/flat-check
+#
+# flat_check_agent.sh — демон, работает непрерывно (не разовый прогон, как
+# flat_check.sh/flat_check_2.sh, у которых лог усекается на каждом запуске
+# сам по себе) — без ротации LOG_FILE рос бы неограниченно. journalctl
+# (если запущен как systemd-сервис) ротирует свой журнал сам; этот файл —
+# только для LOG_FILE (см. agent/README.md, "Логирование").
+#
+# Установка: cp agent/flat-check.logrotate.example /etc/logrotate.d/flat-check
+
+/var/log/flat/flat-check/flat_check_agent.log {
+    weekly
+    rotate 8
+    missingok
+    notifempty
+    compress
+    delaycompress
+    # Без copytruncate: агент открывает LOG_FILE по пути на каждую строку
+    # (append+close), а не держит один файловый descriptor всю жизнь
+    # процесса — обычный rename+create новой пустышки подхватывается сам,
+    # без сигнала/restart сервиса.
+}

@@ -65,3 +65,11 @@ PUSH_INSECURE=1
 
 # Путь к файлу кеша между слоями (по умолчанию — рядом со скриптом).
 # CACHE_FILE="/opt/flat/flat_check_agent.cache"
+
+# Файловый лог демона (info/warn/fail — то же, что в stderr, но построчно с
+# таймстампом, тот же формат, что у flat_check.sh/flat_check_2.sh). Каталог
+# создаётся сам при старте (mkdir -p); нет прав/каталог не создать — тихо
+# работает без файла, только на stderr. Пусто ("") — файловый лог явно
+# отключить. См. agent/flat-check.logrotate.example — сам лог не ротируется,
+# демон долгоживущий, в отличие от разовых flat_check.sh/flat_check_2.sh.
+# LOG_FILE="/var/log/flat/flat-check/flat_check_agent.log"    # дефолт, можно не указывать
