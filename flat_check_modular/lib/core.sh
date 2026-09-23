@@ -1970,7 +1970,8 @@ check_systemd_unit() {
             if [[ "$active" == "active" ]]; then
                 print_ok "systemd: $unit is active"
             else
-                print_warn "systemd: $unit is $active"
+                # Служба не работает — это инцидент, а не предупреждение.
+                print_fail "systemd: $unit is $active"
             fi
 
             local enabled
@@ -1978,7 +1979,8 @@ check_systemd_unit() {
             if [[ "$enabled" == "enabled" ]]; then
                 print_ok "systemd: $unit is enabled"
             else
-                print_warn "systemd: $unit is $enabled"
+                # Не переживёт перезагрузку — тоже инцидент, не просто WARN.
+                print_fail "systemd: $unit is $enabled"
             fi
         fi
     else
