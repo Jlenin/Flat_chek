@@ -94,6 +94,13 @@ PUSH_MAX_TIME="${PUSH_MAX_TIME:-30}"
 PUSH_RETRIES="${PUSH_RETRIES:-2}"
 PUSH_INSECURE="${PUSH_INSECURE:-0}"
 
+# Демон: три слоя на разных интервалах (секунды) + путь кеша между ними.
+# Смысл слоёв и дефолты — см. "## Планы" в agent/README.md.
+FULL_INTERVAL="${FULL_INTERVAL:-3600}"
+SERVICES_INTERVAL="${SERVICES_INTERVAL:-60}"
+METRICS_INTERVAL="${METRICS_INTERVAL:-5}"
+CACHE_FILE="${CACHE_FILE:-$SCRIPT_DIR/flat_check_agent.cache}"
+
 # Фильтры содержимого JSON (необязательные; пусто = без фильтра, все продукты).
 SINGLE_PKG="${SINGLE_PKG:-}"
 FILTER_PRODUCT="${FILTER_PRODUCT:-}"
@@ -780,6 +787,10 @@ _json_load_config() {
                 PUSH_INSECURE)
                     [[ "$val" =~ ^[01]$ ]] && PUSH_INSECURE="$val"
                     ;;
+                FULL_INTERVAL|SERVICES_INTERVAL|METRICS_INTERVAL)
+                    [[ "$val" =~ ^[1-9][0-9]*$ ]] && printf -v "$key" '%s' "$val"
+                    ;;
+                CACHE_FILE) [[ -n "$val" ]] && CACHE_FILE="$val" ;;
                 COLLECTOR_JOBS|JOBS)
                     if [[ "$val" =~ ^[0-9]+$ && "${COLLECTOR_JOBS:-0}" -eq 0 ]]; then
                         COLLECTOR_JOBS="$val"
@@ -1531,6 +1542,517 @@ push_health_json() {
 
 
 # ==========================================================================
+# Демон: три слоя (full/services/metrics) на своих интервалах + сайд-кеш
+# ==========================================================================
+# Принцип: медленно меняющееся (что установлено) обнаруживаем редко (full)
+# и кешируем; быстро меняющееся (статусы, метрики) — снимаем часто, только
+# по кешу, без повторного полного обхода каталога.
+#
+# full (FULL_INTERVAL, по умолч. 3600с): единственный слой, который
+#   действительно сканирует ВЕСЬ каталог (is_pkg_installed_tiny по каждой
+#   записи PKG_PRODUCT — это и есть тот самый "поиск установленных пакетов",
+#   ради которого весь механизм затеян). Результат — полный
+#   build_health_json(), как раньше (products/infrastructure/system/
+#   certificates/uptime_services/issues), плюс список реально установленных
+#   пакетов в кеш — для services.
+# services (SERVICES_INTERVAL, по умолч. 60с): каталог НЕ сканирует — берёт
+#   список установленных пакетов из кеша (записан full) и обновляет статус
+#   только по НИМ (systemd/process/ports/api — тем же _json_collect_pkg(),
+#   который на кешированном десятке пакетов вместо ~сотни записей каталога
+#   уже достаточно дёшев). Заодно кладёт их PID'ы в кеш — для metrics.
+# metrics (METRICS_INTERVAL, по умолч. 5с): PID'ы берёт только из кеша (от
+#   services), никакого pgrep/systemctl/ss/curl — CPU/RAM/сеть читаются
+#   напрямую из /proc, дельтой между тиками, в памяти процесса, без единого
+#   форка на метрику.
+#
+# Слои не блокируют друг друга: full и services запускаются в фоне (&) с
+# pid-lock файлом рядом с кешем — чтобы двум одновременным запускам одного
+# и того же слоя не наложиться друг на друга, если предыдущий не успел
+# закончиться; metrics всегда выполняется прямо в основном цикле — он
+# обязан быть быстрым (задача: ≤1-2с, без sleep внутри).
+#
+# Сабшеллы — постоянная тема этого файла (см. комментарии у _json_pkg_issue/
+# certs_json выше: _json_collect_pkg()/build_health_json() всегда вызываются
+# через $(...), поэтому их WARNINGS++/массивы не долетают до вызывающего).
+# Здесь та же ловушка, но с более высокой ставкой: full/services запускаются
+# в &-фоне (тоже сабшелл) — единственный канал передачи их результата наружу
+# это файл (кеш на диске), не переменные. А вот функции сборки JSON слоёв
+# (_daemon_build_services_json/_daemon_build_metrics_json) вызываются НЕ
+# через $(...), а через `> файл` — перенаправление вывода функции не создаёт
+# сабшелл, в отличие от подстановки команды, так что DAEMON_PIDS/дельты
+# CPU/сети, которые они выставляют как глобальные переменные, корректно
+# долетают до вызывающего в том же процессе (проверено: см. историю сессии).
+
+# --- Кеш: bash-исходуемый файл, не JSON — metrics читает его каждые 5с, а
+# дёргать jq/python на каждый тик недопустимо ("минимум форков"); `source`
+# файла с declare/присваиваниями не требует парсинга вообще. Запись
+# атомарная (tmp+mv), чтобы читатель никогда не увидел наполовину
+# написанный файл.
+_daemon_cache_load() {
+    DAEMON_INSTALLED_PKGS=()
+    declare -gA DAEMON_PIDS=()
+    DAEMON_SUMMARY_INSTALLED=0
+    DAEMON_SUMMARY_ERRORS=0
+    DAEMON_SUMMARY_WARNINGS=0
+    DAEMON_CACHE_TS=0
+    [[ -f "$CACHE_FILE" ]] || return 1
+    # shellcheck disable=SC1090
+    source "$CACHE_FILE" 2>/dev/null || return 1
+    return 0
+}
+
+_daemon_cache_write() {
+    local tmp="${CACHE_FILE}.tmp.$$" pkg
+    {
+        printf 'DAEMON_CACHE_TS=%s\n' "$(date +%s)"
+        printf 'DAEMON_SUMMARY_INSTALLED=%s\n' "${DAEMON_SUMMARY_INSTALLED:-0}"
+        printf 'DAEMON_SUMMARY_ERRORS=%s\n' "${DAEMON_SUMMARY_ERRORS:-0}"
+        printf 'DAEMON_SUMMARY_WARNINGS=%s\n' "${DAEMON_SUMMARY_WARNINGS:-0}"
+        printf 'DAEMON_INSTALLED_PKGS=('
+        for pkg in "${DAEMON_INSTALLED_PKGS[@]}"; do
+            printf '%q ' "$pkg"
+        done
+        printf ')\n'
+        printf 'declare -gA DAEMON_PIDS=()\n'
+        for pkg in "${!DAEMON_PIDS[@]}"; do
+            printf 'DAEMON_PIDS[%q]=%q\n' "$pkg" "${DAEMON_PIDS[$pkg]}"
+        done
+    } > "$tmp" 2>/dev/null
+    mv -f "$tmp" "$CACHE_FILE" 2>/dev/null
+}
+
+# Лок на слой (full|services): 0 и создаёт лок-файл, если слой свободен;
+# 1 — если PID в существующем лок-файле ещё жив (предыдущий запуск того же
+# слоя не успел закончиться до следующего тика) — тогда тик просто
+# пропускается, а не наслаивается поверх работающего.
+_daemon_lock_acquire() {
+    local layer="$1" lockfile="${CACHE_FILE}.${1}.lock" pid
+    if [[ -f "$lockfile" ]]; then
+        pid=$(cat "$lockfile" 2>/dev/null)
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            return 1
+        fi
+    fi
+    echo "$$" > "$lockfile" 2>/dev/null
+    return 0
+}
+
+_daemon_lock_release() {
+    rm -f "${CACHE_FILE}.${1}.lock" 2>/dev/null
+}
+
+# Достаёт целое число по ключу верхнего уровня внутри summary из уже
+# собранного тела JSON — тот же приём, что вызывающий build_health_json()
+# уже использует для INSTALLED (см. её комментарий): "installed"/"errors"/
+# "warnings" как ключи встречаются только внутри summary, так что вытащить
+# подстрокой безопасно, без jq/python.
+_daemon_json_int() {
+    local body="$1" key="$2" m
+    m=$(grep -oE "\"${key}\":[0-9]+" <<<"$body" | head -1)
+    m="${m##*:}"
+    [[ "$m" =~ ^[0-9]+$ ]] && echo "$m" || echo 0
+}
+
+# --- full -------------------------------------------------------------------
+
+_daemon_scan_installed() {
+    DAEMON_INSTALLED_PKGS=()
+    local pkg
+    for pkg in "${!PKG_PRODUCT[@]}"; do
+        is_pkg_installed_tiny "$pkg" "${PKG_LEGACY[$pkg]:-}" && DAEMON_INSTALLED_PKGS+=("$pkg")
+    done
+}
+
+_daemon_run_full() {
+    _daemon_lock_acquire full || { info "daemon: full — предыдущий запуск ещё не завершился, пропуск"; return 0; }
+    info "daemon: full — старт"
+    detect_os >/dev/null 2>&1 || detect_os
+    # Читаем текущий кеш первым делом — full не должен затирать PID'ы,
+    # которые для metrics только что положил services.
+    _daemon_cache_load
+    _daemon_scan_installed
+    local body
+    if ! body=$(build_health_json); then
+        fail "daemon: full — build_health_json упал"
+        _daemon_lock_release full
+        return 1
+    fi
+    body="{\"hosts\":[${body}]}"
+    printf '%s\n' "$body"
+    DAEMON_SUMMARY_INSTALLED=$(_daemon_json_int "$body" installed)
+    DAEMON_SUMMARY_ERRORS=$(_daemon_json_int "$body" errors)
+    DAEMON_SUMMARY_WARNINGS=$(_daemon_json_int "$body" warnings)
+    [[ -n "$PUSH_URLS" ]] && push_health_json "$body"
+    _daemon_cache_write
+    info "daemon: full — готово (${#DAEMON_INSTALLED_PKGS[@]} установлено)"
+    _daemon_lock_release full
+}
+
+# --- services -----------------------------------------------------------------
+
+# Собирает JSON статус-слоя. ВАЖНО: вызывается через `>` (см. комментарий
+# в шапке раздела), не через $(...) — иначе DAEMON_PIDS/DAEMON_SUMMARY_*
+# ниже не долетели бы до _daemon_run_services().
+_daemon_build_services_json() {
+    local ts pkg pj packages_json="[" first=1 installed=0
+    _JSON_TMP=$(mktemp -d "${TMPDIR:-/tmp}/flat_agent_svc.XXXXXX") || return 1
+    _json_ensure_identity
+    # _json_collect_pkg() трогает глобальные INSTALLED/NOT_INSTALLED (обычно
+    # инициализируются в build_health_json(), который здесь не вызывается) —
+    # под set -u без этого падает "INSTALLED: unbound variable" (поймано
+    # именно так — тихим падением services на реальном прогоне демона,
+    # не по чтению кода: try/catch тут нет, `pj=$(...) || continue` просто
+    # молча пропускал бы каждый пакет).
+    INSTALLED=0
+    NOT_INSTALLED=0
+    declare -gA ALL_DEPENDS=()
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    DAEMON_PIDS=()
+    for pkg in "${DAEMON_INSTALLED_PKGS[@]}"; do
+        pj=$(_json_collect_pkg "$pkg") || continue
+        installed=$((installed + 1))
+        _register_pkg_deps "$pkg" 2>/dev/null || true
+        [[ $first -eq 1 ]] || packages_json+=","
+        first=0
+        packages_json+="$pj"
+        local pids
+        pids=$(grep -oE '"pids":\[[0-9,]*\]' <<<"$pj" | head -1 | sed -E 's/"pids":\[//; s/\]//')
+        [[ -n "$pids" ]] && DAEMON_PIDS["$pkg"]="$pids"
+    done
+    packages_json+="]"
+
+    local infra_json issues_json='[]' err=0 wrn=0
+    infra_json=$(_json_collect_infra)
+    if [[ -f "${_JSON_TMP}/pkg_issues.ndjson" ]]; then
+        issues_json="[$(paste -sd',' "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null)]"
+        err=$(grep -c '"severity":"error"' "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null) || err=0
+        wrn=$(grep -c '"severity":"warning"' "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null) || wrn=0
+    fi
+    DAEMON_SUMMARY_INSTALLED=$installed
+    DAEMON_SUMMARY_ERRORS=$err
+    DAEMON_SUMMARY_WARNINGS=$wrn
+
+    printf '{'
+    printf '"layer":"services",'
+    printf '"timestamp":"%s",' "$(_json_esc "$ts")"
+    printf '"host_id":"%s",' "$(_json_esc "$HOST_ID")"
+    printf '"host_ip":"%s",' "$(_json_esc "$HOST_IP")"
+    printf '"service_name":"%s",' "$(_json_esc "$SERVICE_NAME")"
+    printf '"summary":{"installed":%s,"errors":%s,"warnings":%s},' "$installed" "$err" "$wrn"
+    printf '"issues":%s,' "$issues_json"
+    printf '"infrastructure":%s,' "$infra_json"
+    printf '"packages":%s' "$packages_json"
+    printf '}\n'
+    rm -rf -- "$_JSON_TMP" 2>/dev/null
+}
+
+_daemon_run_services() {
+    _daemon_lock_acquire services || { info "daemon: services — предыдущий запуск ещё не завершился, пропуск"; return 0; }
+    _daemon_cache_load
+    if [[ ${#DAEMON_INSTALLED_PKGS[@]} -eq 0 ]]; then
+        warn "daemon: services — кеш пуст, пропуск (ждём full)"
+        _daemon_lock_release services
+        return 1
+    fi
+    local body bodyfile="${CACHE_FILE}.services_body.tmp.$$"
+    _daemon_build_services_json > "$bodyfile" 2>/dev/null
+    body=$(<"$bodyfile")
+    rm -f "$bodyfile" 2>/dev/null
+    if [[ -z "$body" ]]; then
+        warn "daemon: services — сборка не удалась"
+        _daemon_lock_release services
+        return 1
+    fi
+    body="{\"hosts\":[${body}]}"
+    printf '%s\n' "$body"
+    [[ -n "$PUSH_URLS" ]] && push_health_json "$body"
+    _daemon_cache_write
+    _daemon_lock_release services
+}
+
+# --- metrics ------------------------------------------------------------------
+# Требование: читать /proc напрямую, PID'ы только из кеша, минимум форков
+# (без цепочек grep|awk|sed на метрику), CPU% — дельта между тиками,
+# хранимая в памяти процесса ($_DAEMON_*), без sleep внутри цикла.
+
+_daemon_metrics_init() {
+    _DAEMON_CLK_TCK=$(getconf CLK_TCK 2>/dev/null)
+    [[ "$_DAEMON_CLK_TCK" =~ ^[0-9]+$ && "$_DAEMON_CLK_TCK" -gt 0 ]] || _DAEMON_CLK_TCK=100
+    declare -gA _DAEMON_PID_JIFFIES=()
+    _DAEMON_CPU_PREV_TOTAL=0
+    _DAEMON_CPU_PREV_IDLE=0
+    _DAEMON_NET_PREV_BYTES=0
+    _DAEMON_METRICS_PREV_EPOCH=0
+    # Сеем базовые значения ДО первого реального тика — иначе первый вызов
+    # _daemon_net_mbps()/_daemon_cpu_total_pct() посчитал бы дельту от нуля,
+    # то есть весь трафик/CPU-время с момента загрузки хоста за пару секунд
+    # (поймано так: первый metrics-тик в реальном запуске показал 60 Mbps
+    # на практически простаивающем хосте — это и был весь rx+tx с boot).
+    # Результат первого вызова осознанно отбрасываем, нужен только побочный
+    # эффект — заполнение _DAEMON_*_PREV_*.
+    _daemon_cpu_total_pct >/dev/null
+    _daemon_net_mbps 1 >/dev/null
+}
+
+# Системный CPU% — первая строка /proc/stat, дельта total/idle с прошлого
+# тика. Без sleep (в отличие от _sys_cpu_via_procstat/_get_cpu_usage_percent
+# выше, которые для разового --json спят 1.5с между двумя замерами — здесь
+# "прошлый замер" это прошлый тик демона, а не sleep внутри вызова).
+_daemon_cpu_total_pct() {
+    local line
+    read -r line < /proc/stat 2>/dev/null || { echo 0; return; }
+    local -a f
+    read -ra f <<<"$line"
+    local total=0 i
+    for ((i = 1; i < ${#f[@]}; i++)); do
+        total=$((total + ${f[i]:-0}))
+    done
+    local idle=$(( ${f[4]:-0} + ${f[5]:-0} ))
+    local d_total=$((total - _DAEMON_CPU_PREV_TOTAL))
+    local d_idle=$((idle - _DAEMON_CPU_PREV_IDLE))
+    _DAEMON_CPU_PREV_TOTAL=$total
+    _DAEMON_CPU_PREV_IDLE=$idle
+    if [[ "$d_total" -le 0 ]]; then
+        echo 0
+        return
+    fi
+    echo $(( (d_total - d_idle) * 100 / d_total ))
+}
+
+_daemon_read_meminfo() {
+    DAEMON_MEM_TOTAL_KB=0
+    DAEMON_MEM_AVAIL_KB=0
+    local key val
+    while IFS=':' read -r key val; do
+        val="${val//[^0-9]/}"
+        [[ -z "$val" ]] && continue
+        case "$key" in
+            MemTotal) DAEMON_MEM_TOTAL_KB="$val" ;;
+            MemAvailable) DAEMON_MEM_AVAIL_KB="$val" ;;
+        esac
+        [[ "$DAEMON_MEM_TOTAL_KB" != 0 && "$DAEMON_MEM_AVAIL_KB" != 0 ]] && break
+    done < /proc/meminfo
+}
+
+# utime(14-е поле)+stime(15-е) из /proc/<pid>/stat, в тактах — сырое число
+# без нормализации на CLK_TCK (это делает вызывающий, дельтой между тиками).
+# comm (2-е поле, в скобках) может содержать пробелы/скобки — режем по
+# ПОСЛЕДНЕЙ ") " в строке, это стандартный безопасный приём для этого файла.
+_daemon_pid_jiffies() {
+    local pid="$1" line after
+    read -r line < "/proc/$pid/stat" 2>/dev/null || return 1
+    after="${line##*) }"
+    local -a f
+    read -ra f <<<"$after"
+    # после "pid (comm) " поля идут с state=0; utime/stime — 14-е/15-е поля
+    # строки целиком, т.е. индексы 11/12 здесь.
+    echo $(( ${f[11]:-0} + ${f[12]:-0} ))
+}
+
+# VmRSS (КБ) из /proc/<pid>/status, без форка (grep) — построчным read.
+_daemon_pid_rss_kb() {
+    local pid="$1" line
+    while IFS= read -r line; do
+        if [[ "$line" == VmRSS:* ]]; then
+            line="${line#VmRSS:}"
+            line="${line//[^0-9]/}"
+            echo "${line:-0}"
+            return 0
+        fi
+    done < "/proc/$pid/status" 2>/dev/null
+    return 1
+}
+
+# cpu_services/memory_services по кешированным PID'ам ($DAEMON_PIDS, слой
+# services). Пишет результат в глобальные DAEMON_CPU_SERVICES_JSON/
+# DAEMON_MEM_SERVICES_JSON через printf -v (без сабшелла/форка). Имена
+# пакетов — из каталога PKG_PRODUCT (только [a-z0-9-], без спецсимволов
+# JSON), поэтому здесь сознательно не экранируем их через _json_esc() —
+# лишний $(...) на каждый пакет на этом горячем пути того не стоит.
+_daemon_collect_service_metrics() {
+    local elapsed="${1:-1}" pkg pids pid cur prev delta x10
+    [[ "$elapsed" -gt 0 ]] || elapsed=1
+    DAEMON_CPU_SERVICES_JSON="["
+    DAEMON_MEM_SERVICES_JSON="["
+    local first_cpu=1 first_mem=1 frag
+    for pkg in "${!DAEMON_PIDS[@]}"; do
+        pids="${DAEMON_PIDS[$pkg]:-}"
+        [[ -z "$pids" ]] && continue
+        local total_cpu_x10=0 total_rss=0 have_cpu=0
+        local -a pidlist
+        IFS=',' read -ra pidlist <<<"$pids"
+        for pid in "${pidlist[@]}"; do
+            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            [[ -d "/proc/$pid" ]] || continue
+            cur=$(_daemon_pid_jiffies "$pid") || cur=""
+            if [[ -n "$cur" ]]; then
+                prev="${_DAEMON_PID_JIFFIES[$pid]:-}"
+                _DAEMON_PID_JIFFIES[$pid]="$cur"
+                if [[ -n "$prev" ]]; then
+                    delta=$((cur - prev))
+                    if [[ "$delta" -ge 0 ]]; then
+                        x10=$(( delta * 1000 / (_DAEMON_CLK_TCK * elapsed) ))
+                        total_cpu_x10=$((total_cpu_x10 + x10))
+                        have_cpu=1
+                    fi
+                fi
+            fi
+            local rss
+            rss=$(_daemon_pid_rss_kb "$pid") || rss=""
+            [[ -n "$rss" ]] && total_rss=$((total_rss + rss))
+        done
+        if [[ "$have_cpu" -eq 1 && "$total_cpu_x10" -gt 0 ]]; then
+            printf -v frag '{"service_name":"%s","usage_percent":%d.%d}' \
+                "$pkg" "$((total_cpu_x10 / 10))" "$((total_cpu_x10 % 10))"
+            [[ $first_cpu -eq 1 ]] || DAEMON_CPU_SERVICES_JSON+=","
+            first_cpu=0
+            DAEMON_CPU_SERVICES_JSON+="$frag"
+        fi
+        if [[ "$total_rss" -gt 0 && "${DAEMON_MEM_TOTAL_KB:-0}" -gt 0 ]]; then
+            local mem_x10=$(( total_rss * 1000 / DAEMON_MEM_TOTAL_KB ))
+            printf -v frag '{"service_name":"%s","usage_percent":%d.%d}' \
+                "$pkg" "$((mem_x10 / 10))" "$((mem_x10 % 10))"
+            [[ $first_mem -eq 1 ]] || DAEMON_MEM_SERVICES_JSON+=","
+            first_mem=0
+            DAEMON_MEM_SERVICES_JSON+="$frag"
+        fi
+    done
+    DAEMON_CPU_SERVICES_JSON+="]"
+    DAEMON_MEM_SERVICES_JSON+="]"
+}
+
+# rx+tx по всем интерфейсам кроме lo из /proc/net/dev, дельта с прошлого
+# тика → Мбит/с (умножение на 80 = *8 бит * 10 (для одного знака после
+# запятой), затем единое целочисленное деление — меньше потерь точности,
+# чем последовательные /1000000 и /elapsed).
+_daemon_net_mbps() {
+    local elapsed="${1:-1}" line iface rest rx tx total=0
+    [[ "$elapsed" -gt 0 ]] || elapsed=1
+    while IFS= read -r line; do
+        [[ "$line" == *:* ]] || continue
+        iface="${line%%:*}"
+        iface="${iface// /}"
+        [[ "$iface" == "lo" || -z "$iface" ]] && continue
+        rest="${line#*:}"
+        local -a f
+        read -ra f <<<"$rest"
+        rx="${f[0]:-0}"
+        tx="${f[8]:-0}"
+        total=$((total + rx + tx))
+    done < /proc/net/dev
+    local delta=$((total - _DAEMON_NET_PREV_BYTES))
+    _DAEMON_NET_PREV_BYTES=$total
+    [[ "$delta" -lt 0 ]] && delta=0
+    local mbps_x10=$(( delta * 80 / (1000000 * elapsed) ))
+    printf '%d.%d' "$((mbps_x10 / 10))" "$((mbps_x10 % 10))"
+}
+
+# Собирает JSON metrics-слоя. Как и _daemon_build_services_json — вызывать
+# через `>`, не через $(...): иначе дельты CPU/сети/PID'ов из этого тика не
+# долетели бы до следующего, и каждый тик считал бы дельту от нуля.
+_daemon_build_metrics_json() {
+    local ts cpu_pct net_mbps now elapsed
+    now=$(date +%s)
+    elapsed=$((now - _DAEMON_METRICS_PREV_EPOCH))
+    [[ "$elapsed" -gt 0 ]] || elapsed=1
+    _DAEMON_METRICS_PREV_EPOCH=$now
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    cpu_pct=$(_daemon_cpu_total_pct)
+    _daemon_read_meminfo
+    _daemon_collect_service_metrics "$elapsed"
+    net_mbps=$(_daemon_net_mbps "$elapsed")
+    _json_ensure_identity
+
+    printf '{'
+    printf '"layer":"metrics",'
+    printf '"timestamp":"%s",' "$(_json_esc "$ts")"
+    printf '"host_id":"%s",' "$(_json_esc "$HOST_ID")"
+    printf '"host_ip":"%s",' "$(_json_esc "$HOST_IP")"
+    printf '"service_name":"%s",' "$(_json_esc "$SERVICE_NAME")"
+    printf '"summary":{"installed":%s,"errors":%s,"warnings":%s},' \
+        "${DAEMON_SUMMARY_INSTALLED:-0}" "${DAEMON_SUMMARY_ERRORS:-0}" "${DAEMON_SUMMARY_WARNINGS:-0}"
+    printf '"cpu":{"usage_percent":%s},' "${cpu_pct:-0}"
+    printf '"cpu_services":%s,' "${DAEMON_CPU_SERVICES_JSON:-[]}"
+    printf '"memory":{"total_mb":%s,"used_mb":%s,"available_mb":%s},' \
+        "$((${DAEMON_MEM_TOTAL_KB:-0} / 1024))" \
+        "$(( (${DAEMON_MEM_TOTAL_KB:-0} - ${DAEMON_MEM_AVAIL_KB:-0}) / 1024 ))" \
+        "$((${DAEMON_MEM_AVAIL_KB:-0} / 1024))"
+    printf '"memory_services":%s,' "${DAEMON_MEM_SERVICES_JSON:-[]}"
+    printf '"network":{"mbps":%s}' "${net_mbps:-0.0}"
+    printf '}\n'
+}
+
+_daemon_run_metrics() {
+    local bodyfile="${CACHE_FILE}.metrics_body.tmp.$$" body
+    _daemon_build_metrics_json > "$bodyfile" 2>/dev/null
+    body=$(<"$bodyfile")
+    rm -f "$bodyfile" 2>/dev/null
+    [[ -z "$body" ]] && return 1
+    body="{\"hosts\":[${body}]}"
+    printf '%s\n' "$body"
+    [[ -n "$PUSH_URLS" ]] && push_health_json "$body"
+}
+
+# --- планировщик ----------------------------------------------------------
+
+_daemon_init() {
+    _daemon_metrics_init
+    DAEMON_INSTALLED_PKGS=()
+    declare -gA DAEMON_PIDS=()
+    DAEMON_SUMMARY_INSTALLED=0
+    DAEMON_SUMMARY_ERRORS=0
+    DAEMON_SUMMARY_WARNINGS=0
+    _DAEMON_NEXT_FULL=0
+    _DAEMON_NEXT_SERVICES=0
+    _DAEMON_NEXT_METRICS=0
+    _DAEMON_STOP=0
+    trap '_DAEMON_STOP=1' TERM INT
+    detect_os >/dev/null 2>&1 || detect_os
+    # Нет кеша или он битый/пустой → сначала full, синхронно, до входа в
+    # основной цикл — иначе services/metrics стартуют без единого пакета.
+    if ! _daemon_cache_load || [[ ${#DAEMON_INSTALLED_PKGS[@]} -eq 0 ]]; then
+        info "daemon: кеш пуст/битый — стартовый full перед основным циклом"
+        _daemon_run_full
+        # Иначе первая же итерация цикла ниже (now >= _DAEMON_NEXT_FULL=0)
+        # тут же запустила бы ЕЩЁ один full в фоне — параллельно с этим
+        # только что завершившимся синхронным и с services/metrics первой
+        # итерации: конкурентные dpkg-запросы по тем же пакетам сбивали счёт
+        # installed в services (поймано именно так — запуском, не по коду).
+        _DAEMON_NEXT_FULL=$(( $(date +%s) + FULL_INTERVAL ))
+    fi
+}
+
+daemon_main() {
+    _daemon_init
+    info "daemon: старт (full=${FULL_INTERVAL}s services=${SERVICES_INTERVAL}s metrics=${METRICS_INTERVAL}s, кеш=$CACHE_FILE)"
+    while [[ "$_DAEMON_STOP" -eq 0 ]]; do
+        local now
+        now=$(date +%s)
+        if [[ $now -ge $_DAEMON_NEXT_FULL ]]; then
+            _DAEMON_NEXT_FULL=$((now + FULL_INTERVAL))
+            ( _daemon_run_full ) &
+        fi
+        if [[ $now -ge $_DAEMON_NEXT_SERVICES ]]; then
+            _DAEMON_NEXT_SERVICES=$((now + SERVICES_INTERVAL))
+            ( _daemon_run_services ) &
+        fi
+        if [[ $now -ge $_DAEMON_NEXT_METRICS ]]; then
+            _DAEMON_NEXT_METRICS=$((now + METRICS_INTERVAL))
+            # Свежие PID'ы/summary от services (если подоспели) — перед
+            # каждым тиком metrics, дёшево (source маленького файла, без
+            # форка), но гарантирует, что metrics не работает по PID'ам
+            # часовой давности.
+            _daemon_cache_load
+            _daemon_run_metrics
+        fi
+        sleep 1
+    done
+    info "daemon: остановлен (сигнал)"
+    wait 2>/dev/null
+}
+
+
+# ==========================================================================
 # Точка входа: без argv — всё поведение определяется env/конфигом выше.
 # ==========================================================================
 # Конфиг-файл: рядом со скриптом по умолчанию ("всё в одном месте"),
@@ -1544,39 +2066,20 @@ push_health_json() {
 FLAT_AGENT_CONF="${FLAT_AGENT_CONF:-$SCRIPT_DIR/flat_check_agent.conf}"
 _json_load_config "$FLAT_AGENT_CONF"
 
-# _json_ensure_identity() вызывается внутри build_health_json() ниже —
-# отдельно здесь не нужна.
-body=""
-if ! body=$(build_health_json); then
-    fail "flat_check_agent: не удалось собрать JSON"
-    exit 1
+if [[ -z "$PUSH_URLS" ]]; then
+    # PUSH_URLS пуст — демон всё равно работает и печатает JSON в stdout на
+    # каждом тике (штатный режим "только JSON", см. шапку файла), просто
+    # ничего никуда не отправляет. Стоит явно подсветить разницу между двумя
+    # причинами, почему он пуст:
+    #   - ожидаемый конфиг-файл не нашёлся вообще (вероятная ошибка деплоя —
+    #     например неверное имя файла или путь) — WARN;
+    #   - конфиг нашёлся и загрузился, просто PUSH_URLS в нём не задан
+    #     (вероятно осознанный выбор — не отправлять) — тихий INFO.
+    if [[ ! -f "$FLAT_AGENT_CONF" ]]; then
+        warn "конфиг не найден: $FLAT_AGENT_CONF — PUSH_URLS пуст, push пропущен (используются только переменные окружения/встроенные дефолты; переопределить путь можно через FLAT_AGENT_CONF)"
+    else
+        info "PUSH_URLS не задан — push пропущен, в stdout только JSON"
+    fi
 fi
 
-# Бэк (Partner ingest) принимает конверт {"hosts":[...]}, не голый объект —
-# HostSnapshot.Raw хранит весь элемент как есть, парсит только host_id/
-# service_name/timestamp/summary внутри hosts[]. Оборачиваем один раз здесь,
-# ДО печати — stdout и то, что реально уходит push'ем, остаются идентичны.
-body="{\"hosts\":[${body}]}"
-
-# stdout — ТОЛЬКО это. Ничего больше сюда не печатать.
-printf '%s\n' "$body"
-
-if [[ -n "$PUSH_URLS" ]]; then
-    push_health_json "$body"
-    exit $?
-fi
-
-# PUSH_URLS пуст — push осознанно пропущен, сам по себе это не ошибка
-# (штатный режим "только JSON в stdout", см. шапку файла). Но стоит явно
-# подсветить разницу между двумя причинами, почему он пуст:
-#   - ожидаемый конфиг-файл не нашёлся вообще (вероятная ошибка деплоя —
-#     например неверное имя файла или путь) — WARN;
-#   - конфиг нашёлся и загрузился, просто PUSH_URLS в нём не задан
-#     (вероятно осознанный выбор — не отправлять) — тихий INFO.
-if [[ ! -f "$FLAT_AGENT_CONF" ]]; then
-    warn "конфиг не найден: $FLAT_AGENT_CONF — PUSH_URLS пуст, push пропущен (используются только переменные окружения/встроенные дефолты; переопределить путь можно через FLAT_AGENT_CONF)"
-else
-    info "PUSH_URLS не задан — push пропущен, в stdout только JSON"
-fi
-
-exit 0
+daemon_main

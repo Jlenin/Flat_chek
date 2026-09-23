@@ -3,12 +3,18 @@
 `flat_check_agent.sh` — отдельный продукт, не привязанный к
 `flat_check.sh`/`flat_check_2.sh` (те устанавливаются отдельно, теперь через
 deb/rpm-пакет — см. корневой [`README.md`](../README.md)). Полностью
-самостоятельный скрипт для прямой интеграции в мониторинг (Zabbix external
-check, systemd timer/timer + HTTP-пуш и т.п.), когда не нужны ни `--help`,
-ни интерактивный мастер, ни сессионные логи — только JSON-снимок здоровья
-хоста. У него нет установщика и не нужен: один файл, скопировать и
-`chmod +x`. Эта папка содержит только его самого, его конфиги и примеры —
-больше в ней ничего не осталось.
+самостоятельный скрипт-демон для прямой интеграции в мониторинг (HTTP-пуш
+health/статусов/метрик), когда не нужны ни `--help`, ни интерактивный
+мастер, ни сессионные логи. У него нет установщика и не нужен: один файл,
+скопировать и `chmod +x`. Эта папка содержит только его самого, его конфиги
+и примеры — больше в ней ничего не осталось.
+
+Без аргументов командной строки — единственный режим работы: долгоживущий
+процесс с тремя внутренними слоями на разных интервалах (полное
+обнаружение установленных пакетов раз в час, статусы раз в минуту,
+лёгкие метрики из `/proc` каждые 5с) — см. «Слои» ниже. Обычно запускается
+как systemd-сервис (`Type=simple`, см. `flat-check.service.example`) и
+работает, пока сервис не остановят.
 
 ## Состав
 
@@ -24,29 +30,56 @@ check, systemd timer/timer + HTTP-пуш и т.п.), когда не нужны 
 | `backend-token.example.yaml` | пример настройки приёма токена на стороне backend (ingest) |
 | `service_names.md` | что такое `SERVICE_NAME` и какие значения приняты |
 
+## Слои
+
+Принцип: медленно меняющееся (что установлено) обнаруживаем редко и
+кешируем; быстро меняющееся (статусы, метрики) — снимаем часто, только по
+кешу, без повторного полного обхода каталога пакетов. Кеш — файл рядом со
+скриптом (`CACHE_FILE`, по умолчанию `flat_check_agent.cache`), общий между
+слоями; демон не хранит между ними ничего критичного в памяти одного
+процесса — full/services выполняются в фоне и обмениваются данными только
+через этот файл.
+
+| Слой | Интервал (по умолч.) | Что делает |
+|------|----------------------|------------|
+| `full` | `FULL_INTERVAL=3600` | Полное обнаружение: сканирует весь каталог пакетов (`is_pkg_installed_tiny` по каждой записи — самая медленная часть), собирает полный снимок (products/infrastructure/system/certificates/uptime_services/issues), пушит его и кладёт список установленных пакетов в кеш. |
+| `services` | `SERVICES_INTERVAL=60` | Каталог НЕ сканирует — берёт список установленных пакетов из кеша и обновляет только их статус (systemd/process/ports/api). Пушит облегчённый снимок (`packages`/`infrastructure`/`issues`, без `system`/`certificates`) и кладёт их PID'ы в кеш. |
+| `metrics` | `METRICS_INTERVAL=5` | PID'ы — только из кеша (от `services`), без единого `pgrep`/`systemctl`/`ss`/`curl`. CPU/RAM/сеть читаются прямо из `/proc/stat`, `/proc/meminfo`, `/proc/net/dev`, `/proc/<pid>/stat`, `/proc/<pid>/status`, дельтой между тиками (состояние — в памяти процесса), без единого форка на метрику. Пушит `cpu`/`cpu_services`/`memory`/`memory_services`/`network` + последний известный `summary`. |
+
+Слои не блокируют друг друга: `full` и `services` запускаются в фоне
+(с lock-файлом рядом с кешем — предыдущий незавершённый запуск того же
+слоя не даёт наложиться новому); `metrics` всегда выполняется в основном
+цикле демона и обязан быть быстрым. Пустого/битого кеша при старте
+(первый запуск, либо файл кеша удалили) — сначала синхронный `full`, до
+входа в основной цикл, иначе `services`/`metrics` стартовали бы без
+единого пакета.
+
+Каждый слой — свой push: за час это один `full`-снимок, 60 `services`,
+720 `metrics` (при интервалах по умолчанию). Все три конверта — одна и та
+же форма `{"hosts":[{...}]}`, различаются набором полей внутри (`system`
+только у `full`, `cpu`/`network` только у `metrics`).
+
 ## Особенности
 
-- **Не подключает** `json_report.inc.sh`/`flat_check.sh`/`flat_check_2.sh` —
-  весь нужный код скопирован внутрь одного файла.
 - **Без аргументов командной строки.** Поведение — только через переменные
   окружения и/или конфиг-файл `flat_check_agent.conf` рядом со скриптом
-  (переопределяется `FLAT_AGENT_CONF`). Это даёт одну строку для cron/timer.
-- **Вывод:** в stdout — всегда только JSON, одной строкой, конвертом
-  `{"hosts":[<снимок>]}` (так ждёт Partner ingest — см.
-  `health-payload.example.json`; в единственном элементе `hosts[]` всегда
-  есть `host_id`/`service_name`/`timestamp`/`summary`, плюс `issues[]` —
-  плоский список конкретных находок с `severity`/`package`/`code`/`message`,
-  а не только агрегат в `summary.errors`/`summary.warnings`). Безопасно
-  парсить как есть, даже если настроен push. Диагностика push (`curl`
-  ошибки, `push: OK/FAIL`) — в stderr. При ручном запуске в терминале видно
-  оба потока сразу, то есть видно и снимок, и что именно отправилось.
-- **Код возврата:** `0` — JSON собран (и push, если был настроен, прошёл
-  успешно); ненулевой — сбой сборки JSON или сбой хотя бы одного push.
-  Содержимое JSON (какие пакеты не установлены и т.п.) на код возврата не
-  влияет — это для дашборда, не признак поломки самого агента.
+  (переопределяется `FLAT_AGENT_CONF`).
+- **Вывод:** в stdout — непрерывный поток JSON, по одной строке на каждый
+  push каждого слоя, конвертом `{"hosts":[<снимок>]}` (так ждёт Partner
+  ingest — см. `health-payload.example.json`; в единственном элементе
+  `hosts[]` всегда есть `host_id`/`service_name`/`timestamp`/`summary`,
+  плюс `issues[]` — плоский список конкретных находок с
+  `severity`/`package`/`code`/`message`, а не только агрегат в
+  `summary.errors`/`summary.warnings`). Безопасно парсить построчно, даже
+  если настроен push — `| jq .` в терминале покажет ровно то, что уходит.
+  Диагностика push (`curl` ошибки, `push: OK/FAIL`) и события слоёв
+  (старт/пропуск тика/ошибка сборки) — в stderr.
+- **Останов:** `SIGTERM`/`SIGINT` — демон завершает текущий цикл и
+  дожидается фоновых `full`/`services`, если те как раз выполнялись, вместо
+  обрыва push на середине.
 - **Права доступа:** рассчитан на обычного пользователя, не root. Почти
   все проверки (dpkg/rpm/pacman/apk, systemctl, слушающие порты, curl к
-  локальным API, чтение сертификатов) прав не требуют. Единственное
+  локальным API, чтение сертификатов, `/proc`) прав не требуют. Единственное
   известное исключение — `configs[].status="sudoers"` (не может проверить
   файл внутри `/etc/sudoers.d`, если у каталога нет `x` для остальных):
   без доп. прав деградирует до `"missing"`, без падений. Подробности и
@@ -54,73 +87,33 @@ check, systemd timer/timer + HTTP-пуш и т.п.), когда не нужны 
 
 ## Быстрый старт
 
+Через systemd (обычный способ, см. `flat-check.service.example`):
+
 ```bash
-cp agent/flat_check_agent.sh agent/flat_check_agent.conf.example /opt/flat/
-mv /opt/flat/flat_check_agent.conf.example /opt/flat/flat_check_agent.conf
-chmod +x /opt/flat/flat_check_agent.sh
+cp agent/flat_check_agent.sh agent/flat_check_agent.conf.example /opt/flat/flat-check/
+mv /opt/flat/flat-check/flat_check_agent.conf.example /opt/flat/flat-check/flat_check_agent.conf
+chmod +x /opt/flat/flat-check/flat_check_agent.sh
 # по умолчанию в конфиге PUSH_URLS указывает на 127.0.0.1 — это эталонный
 # пример для локальной проверки; впишите свой реальный приёмник и токен
-/opt/flat/flat_check_agent.sh | jq .
+
+cp agent/flat-check.service.example /etc/systemd/system/flat-check.service
+systemctl daemon-reload
+systemctl enable --now flat-check.service
+journalctl -u flat-check -f
 ```
 
-Пример cron-строки (всё через env, без конфиг-файла):
-
-```cron
-*/5 * * * * PUSH_URLS=https://partner.example/api/v1/health/ingest \
-            PUSH_TOKEN=*** HOST_ID=ss-n1 SERVICE_NAME=fss-backend \
-            /opt/flat/flat_check_agent.sh >/dev/null
-```
-
-Или с конфиг-файлом рядом со скриптом (командная строка ещё короче):
-
-```cron
-*/5 * * * * /opt/flat/flat_check_agent.sh >/dev/null
-```
-
-Пример systemd timer + service (та же логика, если в организации принят
-timer, а не cron):
-
-```ini
-# /etc/systemd/system/flat-check-agent.service
-[Unit]
-Description=flat_check_agent health snapshot + push
-
-[Service]
-Type=oneshot
-User=flat-agent
-ExecStart=/opt/flat/flat_check_agent.sh
-```
-
-```ini
-# /etc/systemd/system/flat-check-agent.timer
-[Unit]
-Description=Run flat-check-agent.service every 5 minutes
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=5min
-
-[Install]
-WantedBy=timers.target
-```
+Вручную, на переднем плане (для проверки конфига перед деплоем — `Ctrl+C`
+для останова):
 
 ```bash
-systemctl enable --now flat-check-agent.timer
+FULL_INTERVAL=3600 SERVICES_INTERVAL=60 METRICS_INTERVAL=5 \
+  /opt/flat/flat-check/flat_check_agent.sh | jq .
 ```
 
 ## Сопровождение
 
-`flat_check_agent.sh` — самостоятельная копия JSON/push-логики из
-корневого [`json_report.inc.sh`](../json_report.inc.sh) (см. заголовок
-файла). При правке `json_report.inc.sh`, `flat_check.sh`/`flat_check_2.sh`
-или каталога пакетов (`flat_check.packages.conf`) проверить, нужна ли та же
-правка и в `flat_check_agent.sh` — синхронизация ручная, скрипт её не
-подключает.
-
-## Планы
-
-Сейчас агент — разовый снимок по вызову (cron/systemd timer, см. «Быстрый
-старт» выше). В работе — переход на долгоживущий процесс (systemd-сервис)
-с тремя слоями на разных интервалах (полное обнаружение пакетов раз в час,
-статусы раз в минуту, лёгкие метрики раз в 5с из `/proc` без форков) —
-когда будет готово, этот README и `flat-check.service.example` обновятся.
+`flat_check_agent.sh` — полностью самостоятельный файл: ничего не
+подключает и ни от чего в остальном репозитории не зависит (ни от
+`flat_check.sh`/`flat_check_2.sh`, ни от общего каталога пакетов). Меняете
+логику проверок или каталог продуктов здесь — правьте прямо в этом файле,
+синхронизировать больше не с чем.
