@@ -11,24 +11,15 @@
 Оба скрипта только читают состояние системы и пакетов. Конфиги служб не меняют.  
 Для полного сбора логов в `_2` обычно нужен root или sudo.
 
-Периодическая отправка health JSON в Flat Partner (conf, cron, push) — см.
-«Push в Flat Partner» ниже. Установка `flat_check.sh`/`flat_check_2.sh` —
-через deb/rpm-пакет; `flat_check.conf.example`/`cron.example` в корне репо —
-шаблоны для тех, кто ставит вручную.
+Оба скрипта — только текстовая проверка (`[OK]`/`[WARN]`/`[FAIL]`/`[INFO]`
+в stdout, опционально в лог сессии). Никакого JSON, никакого push, никакого
+конфиг-файла — только argv. Установка — через deb/rpm-пакет.
 
-Отдельно от этого — `agent/flat_check_agent.sh`: самостоятельный продукт,
-не связанный с `flat_check.sh`/`flat_check_2.sh` — скрипт-агент для прямой
-интеграции в мониторинг (Zabbix external check, systemd timer). Функционально
-похож на `flat_check.sh` (тот же набор проверок), но живёт полностью
-независимо — без установщика (копируется одним файлом), без argv, без
-сессионного лога. Ставится отдельным deb/rpm-пакетом (`flat-check`).
-Документация — [`agent/README.md`](agent/README.md).
-
-Модульная версия того же функционала (health + JSON-агент + сборщик логов +
-мастер, но код разложен по слоям вместо двух монолитов) — в каталоге
-[`flat_check_modular/`](flat_check_modular/). Оба варианта независимы и
-поддерживаются параллельно; `flat_check.sh`/`flat_check_2.sh` никуда не
-делись и продолжают работать как раньше.
+JSON-снимок здоровья хоста и его периодическая отправка в мониторинг —
+`agent/flat_check_agent.sh`: отдельный, не связанный с `flat_check.sh`/
+`flat_check_2.sh` продукт. Живёт полностью независимо — копируется одним
+файлом, без argv, без сессионного лога, ставится своим deb/rpm-пакетом
+(`flat-check`). Документация — [`agent/README.md`](agent/README.md).
 
 ---
 
@@ -46,7 +37,7 @@
 ./flat_check_2.sh -log -off -t 4d
 ```
 
-Health-путь у обоих совпадает (`PKG_*`, System, пакеты, infrastructure, resource-gate, JSON/push).  
+Health-путь у обоих совпадает (`PKG_*`, System, пакеты, infrastructure, resource-gate).  
 `-i` есть только в `flat_check_2.sh` (мастер). В `flat_check.sh` не используется.
 
 ---
@@ -131,8 +122,6 @@ _pkg_set "other-pkg" "Product Name" "old-name"
 | `--dev` | = `--selftest extended` (VERBOSE health по всем пакетам) |
 | `--debug` | дублировать DEBUG-строки сессионного лога на экран (диагностика) |
 | `-v` / `--version` | версия |
-
-Дополнительно оба понимают `--json` / `--push` / `--config` (см. «Push в Flat Partner» ниже).
 
 Только в `flat_check_2.sh`: `-i` (мастер), `-log` и связанные флаги сбора логов.
 
@@ -222,8 +211,6 @@ _pkg_set "other-pkg" "Product Name" "old-name"
 
 Health: `systemctl`, `dpkg`/`rpm`, `ss`/`netstat`, `curl`, `openssl`, при необходимости `psql` / `top` / `free` / `df`.
 
-`--json` в интерактивном терминале печатается с отступами через `jq` (если есть) или `python3 -m json.tool`; при пайпе/редиректе (cron, `| jq`, `> file`) — как раньше, компактно одной строкой. Ни `jq`, ни `python3` не обязательны — без них просто компактный вывод везде.
-
 Сбор логов (`_2`): `tail`, `gzip` или `pigz`; опционально `tcpdump`, `zcat`.
 
 ---
@@ -234,139 +221,9 @@ Health: `systemctl`, `dpkg`/`rpm`, `ss`/`netstat`, `curl`, `openssl`, при н�
 0 6 * * * /opt/flat/scripts/flat_check.sh >> /var/log/flat/health_check.log 2>&1
 ```
 
-Для JSON-отправки в Partner (installer, конфиг, push) — см. следующий раздел.
-
----
-
-## Push в Flat Partner
-
-Периодическая отправка health JSON с ноды продукта на ingest Flat Partner.
-
-```text
-нода ── cron ──► flat_check --config … --push
-                      │
-                      ▼  POST JSON (token)
-                 Partner ingest (1…N URL)
-                      │
-                      ▼
-                 GET /health → UI
-```
-
-### Установка
-
-`flat_check.sh`/`flat_check_2.sh` ставятся deb/rpm-пакетом (бинарь, конфиг,
-каталог пакетов, cron/timer — всё несёт пакет). Прежний ручной установщик
-(`agent/install_flat_check.sh` и обёртки `reinstall_flat_check.sh`/
-`uninstall_flat_check.sh`) удалён из репозитория — он больше не
-поддерживается.
-
-Без пакета, вручную — см. «Установка вручную» ниже: скопировать сам скрипт,
-`flat_check.conf.example` (в корне репозитория) как шаблон конфига,
-`cron.example` как шаблон периодического запуска.
-
-### Конфиг push
-
-Минимальный рабочий набор:
-
-```bash
-PUSH_URLS="https://partner.example.local/api/v1/health/ingest"
-PUSH_TOKEN="SECRET"
-HOST_ID="ss-n1"
-SERVICE_NAME="fss-backend"
-```
-
-| Ключ | Нужен | Описание |
-|------|-------|----------|
-| `PUSH_URLS` | для push | URL через запятую/пробел (`http`/`https`) |
-| `PUSH_TOKEN` | обычно да | токен стенда |
-| `HOST_ID` | да | id хоста в UI |
-| `SERVICE_NAME` | да | имя сервиса CI/CD, см. `agent/service_names.md` |
-| `HOST_IP` | нет | иначе определяется автоматически |
-| `PACKAGES` / `PRODUCT` | нет | сузить набор проверок |
-| `PUSH_CONNECT_TIMEOUT` / `PUSH_MAX_TIME` / `PUSH_RETRIES` | нет | таймауты curl |
-| `PUSH_INSECURE` | нет | `1` = не проверять TLS-сертификат приёмника (`curl -k`); нужно при self-signed на https, иначе push падает с `FAIL (last http=000)` |
-
-Приоритет значений: **CLI → переменные окружения → conf → автоопределение**.
-
-Полный шаблон: `flat_check.conf.example` (в корне репозитория).
-
-### Запуск push
-
-```bash
-# снимок в stdout
-flat_check --config /etc/flat/flat_check.conf --json
-
-# отправка на все PUSH_URLS (без печати JSON)
-flat_check --config /etc/flat/flat_check.conf --push
-
-# снимок + отправка
-flat_check --config /etc/flat/flat_check.conf --json --push
-
-# один пакет / явная идентичность
-flat_check --pkg fss-server --json
-flat_check --json --host-id ss-n1 --host-ip 10.0.1.5 --service-name fss-backend
-```
-
-Те же флаги есть в `flat_check_2.sh`. Режим `-log` с `--json`/`--push` в одном запуске не комбинируется: JSON-путь завершает процесс раньше.
-
-Cron по умолчанию вызывает `--push` без `--json`, чтобы лог не раздувался телом снимка.
-
-Если `flat_check.packages.conf` не лежит рядом с бинарём — скрипт использует
-встроенный каталог.
-
-### Формат JSON и push-заголовки
-
-Тело push (и то, что печатает `--json`) — конверт `{"hosts":[<снимок>]}`:
-Partner ingest парсит `host_id`/`service_name`/`timestamp`/`summary` внутри
-единственного элемента `hosts[]`, остальное хранит как есть. Обязательные
-поля идентичности внутри `hosts[0]`: `host_id`, `host_ip`, `service_name`.
-Далее: `timestamp`, `script_version`, `os`, `package_manager`, `products`,
-`infrastructure`, `summary`, `issues` (плоский список конкретных находок —
-`severity`/`package`/`product`/`code`/`message`, отдельно от агрегата в
-`summary.errors`/`summary.warnings`), `system`, `certificates`, …
-
-Примеры: `agent/health-payload.example.json`, `agent/ingest-request.example.http`.
-
-Заголовки при push:
-
-```http
-Content-Type: application/json
-Authorization: Bearer <PUSH_TOKEN>
-X-Flat-Host-Id: <HOST_ID>
-X-Flat-Service-Name: <SERVICE_NAME>
-```
-
-Настройка приёма токена на стороне backend: `agent/backend-token.example.yaml`.
-
-### Проверка push
-
-```bash
-flat_check -v
-flat_check --selftest simple
-flat_check --config /etc/flat/flat_check.conf --json | jq '.hosts[0] | .host_id, .service_name, .summary, .issues'
-flat_check --config /etc/flat/flat_check.conf --push
-tail -f /var/log/flat/flat_check_push.log
-```
-
-| Симптом | Что проверить |
-|---------|----------------|
-| `PUSH_URLS пуст` | conf / env |
-| `curl не найден` | пакет `curl` |
-| `http=401/403` | токен, `PUSH_AUTH_HEADER` |
-| `http=000` | DNS, firewall, TLS; если приёмник на self-signed https — `PUSH_INSECURE=1`. Точную причину curl (connection refused / timed out / …) смотрите в `flat_check_push.log` или `--push --debug` — строка `push: curl → URL: ...` |
-| `service_name: unknown` | `SERVICE_NAME` в conf или `--service-name` |
-
-### Установка вручную
-
-```bash
-install -m 0755 flat_check.sh /usr/local/bin/flat_check
-install -d -m 0755 /etc/flat /var/log/flat
-cp flat_check.conf.example /etc/flat/flat_check.conf
-# заполнить PUSH_URLS, PUSH_TOKEN, HOST_ID, SERVICE_NAME
-chmod 0640 /etc/flat/flat_check.conf
-cp cron.example /etc/cron.d/flat-check
-chmod 0644 /etc/cron.d/flat-check
-```
+Периодический JSON-снимок и отправка в мониторинг — не здесь, это
+`agent/flat_check_agent.sh` (отдельный продукт, свой deb/rpm-пакет,
+своя документация — [`agent/README.md`](agent/README.md)).
 
 ---
 
