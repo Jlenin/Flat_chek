@@ -1016,6 +1016,8 @@ _proc_cmdline_to() {
     while IFS= read -r -d '' a || [[ -n "$a" ]]; do
         s+="${s:+ }$a"
     done 2>/dev/null < "/proc/$pid/cmdline"
+    # node и подобные переписывают argv своим именем, добивая пробелами.
+    s="${s%"${s##*[![:space:]]}"}"
     if [[ -z "$s" ]]; then
         read -r s 2>/dev/null < "/proc/$pid/comm"
         s="[$s]"
