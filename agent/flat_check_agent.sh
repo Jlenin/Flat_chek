@@ -75,6 +75,10 @@ PUSH_CONNECT_TIMEOUT="${PUSH_CONNECT_TIMEOUT:-2}"
 PUSH_MAX_TIME="${PUSH_MAX_TIME:-4}"
 PUSH_RETRIES="${PUSH_RETRIES:-0}"
 PUSH_INSECURE="${PUSH_INSECURE:-0}"
+# URL, который ответил 404/405 (приём не настроен) или 401/403 (токен), не
+# дёргаем каждый тик, а пробуем раз в столько секунд; ответит 2xx — сам
+# возвращается к обычной отправке.
+PUSH_UNCONFIGURED_RETRY="${PUSH_UNCONFIGURED_RETRY:-300}"
 
 # Демон: интервалы слоёв (секунды). Курьер отправляет с интервалом metrics.
 FULL_INTERVAL="${FULL_INTERVAL:-3600}"
@@ -730,7 +734,7 @@ _json_load_config() {
                 PUSH_INSECURE)
                     [[ "$val" =~ ^[01]$ ]] && PUSH_INSECURE="$val"
                     ;;
-                FULL_INTERVAL|SERVICES_INTERVAL|METRICS_INTERVAL)
+                FULL_INTERVAL|SERVICES_INTERVAL|METRICS_INTERVAL|PUSH_UNCONFIGURED_RETRY)
                     [[ "$val" =~ ^[1-9][0-9]*$ ]] && printf -v "$key" '%s' "$val"
                     ;;
                 PRINT_JSON)
@@ -1890,12 +1894,42 @@ _courier_send() {
 # Тело — из файла (curl --data-binary @file). Шлёт каждые METRICS_INTERVAL
 # секунд, поэтому по умолчанию без повторов и с коротким --max-time: зависший
 # приёмник не должен задерживать следующий тик, а следующая попытка и так
-# через несколько секунд. В лог — только смена состояния URL (OK → FAIL и
-# обратно), иначе это тысячи строк в час; каждая попытка — в DEBUG.
-declare -A _PUSH_STATE=() _PUSH_FAILS=()
+# через несколько секунд. В лог — только смена состояния URL, иначе это
+# тысячи строк в час; каждая попытка — в DEBUG.
+#   2xx       — ok
+#   404/405   — unconfigured: на этом бэке приём не настроен (бэков на хосте
+#               много, set-push-urls добавляет все) → раз в PUSH_UNCONFIGURED_RETRY
+#   401/403   — auth: токен не принят → раз в PUSH_UNCONFIGURED_RETRY
+#   прочее    — fail: временный сбой (5xx, нет соединения) → каждый тик
+declare -A _PUSH_STATE=() _PUSH_FAILS=() _PUSH_NEXT=()
+
+_push_state_set() {   # $1 url, $2 новое состояние, $3 http-код
+    local url="$1" st="$2" code="$3" prev="${_PUSH_STATE[$1]:-}"
+    if [[ "$st" == "ok" ]]; then
+        if [[ "$prev" != "ok" ]]; then
+            if [[ -n "$prev" ]]; then
+                info "push: снова OK $code → $url (было: $prev, неудачных попыток: ${_PUSH_FAILS[$url]:-0})"
+            else
+                info "push: OK $code → $url"
+            fi
+        fi
+        _PUSH_FAILS[$url]=0
+        _PUSH_NEXT[$url]=0
+    else
+        _PUSH_FAILS[$url]=$(( ${_PUSH_FAILS[$url]:-0} + 1 ))
+        if [[ "$prev" != "$st" ]]; then
+            case "$st" in
+                unconfigured) info "push: $url — приём не настроен (http=$code), пробую раз в ${PUSH_UNCONFIGURED_RETRY} с" ;;
+                auth) warn "push: $url — токен не принят (http=$code), проверьте PUSH_TOKEN; пробую раз в ${PUSH_UNCONFIGURED_RETRY} с" ;;
+                *) warn "push: FAIL → $url (http=$code) — дальше в лог только восстановление; каждая попытка — при DEBUG_MODE=1" ;;
+            esac
+        fi
+    fi
+    _PUSH_STATE[$url]="$st"
+}
 
 push_health_json() {
-    local file="$1" url token i=0 rc=0 http_code attempt ok errf="$CACHE_DIR/.push_err" err
+    local file="$1" url token i=0 rc=0 http_code attempt st now errf="$CACHE_DIR/.push_err" err
     local -a urls tokens curl_insecure=()
     local auth_hdr="${PUSH_AUTH_HEADER:-Authorization: Bearer}"
     [[ "${PUSH_INSECURE:-0}" == "1" ]] && curl_insecure=(-k)
@@ -1916,8 +1950,13 @@ push_health_json() {
         [[ -n "${tokens[$i]:-}" ]] && token="${tokens[$i]}"
         i=$((i + 1))
 
+        _epoch_to now
+        if [[ ${_PUSH_NEXT[$url]:-0} -gt $now ]]; then
+            rc=1
+            continue
+        fi
         attempt=0
-        ok=0
+        st="fail"
         while [[ $attempt -le ${PUSH_RETRIES:-0} ]]; do
             attempt=$((attempt + 1))
             http_code=$(curl -sS -o /dev/null -w '%{http_code}' \
@@ -1931,10 +1970,13 @@ push_health_json() {
                 ${token:+-H "$auth_hdr $token"} \
                 --data-binary "@$file" 2>"$errf") || true
             [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code="000"
-            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-                ok=1
-                break
-            fi
+            case "$http_code" in
+                2??) st="ok" ;;
+                404|405) st="unconfigured" ;;
+                401|403) st="auth" ;;
+                *) st="fail" ;;
+            esac
+            [[ "$st" == "fail" ]] || break
             if [[ "${DEBUG_MODE:-0}" -eq 1 ]]; then
                 err=""
                 IFS= read -r -d '' err 2>/dev/null < "$errf"
@@ -1942,23 +1984,10 @@ push_health_json() {
             fi
             [[ $attempt -le ${PUSH_RETRIES:-0} ]] && _wait_seconds 1
         done
-        if [[ $ok -eq 1 ]]; then
-            if [[ "${_PUSH_STATE[$url]:-}" != "ok" ]]; then
-                if [[ "${_PUSH_STATE[$url]:-}" == "fail" ]]; then
-                    info "push: снова OK $http_code → $url (после ${_PUSH_FAILS[$url]:-0} неудачных)"
-                else
-                    info "push: OK $http_code → $url"
-                fi
-            fi
-            _PUSH_STATE[$url]="ok"
-            _PUSH_FAILS[$url]=0
-        else
-            if [[ "${_PUSH_STATE[$url]:-}" != "fail" ]]; then
-                warn "push: FAIL → $url (http=$http_code) — дальше в лог только восстановление; каждая попытка — при DEBUG_MODE=1"
-            fi
-            _PUSH_STATE[$url]="fail"
-            _PUSH_FAILS[$url]=$(( ${_PUSH_FAILS[$url]:-0} + 1 ))
+        _push_state_set "$url" "$st" "$http_code"
+        if [[ "$st" != "ok" ]]; then
             rc=1
+            [[ "$st" == "fail" ]] || _PUSH_NEXT[$url]=$(( now + PUSH_UNCONFIGURED_RETRY ))
         fi
     done
     return "$rc"
