@@ -20,7 +20,7 @@ deb/rpm-пакет — см. корневой [`README.md`](../README.md)). Од
 | `flat-check-set-push-urls.sh` | вызывается из postinst deb/rpm-пакета `flat-check` — заполняет `PUSH_URLS`/`SERVICE_NAME` в конфиге по реально установленным `*-backend` пакетам и их портам |
 | `flat-check.service.example` | пример systemd-юнита (`Type=simple`) |
 | `flat-check.logrotate.example` | ротация `LOG_FILE` (см. «Логирование») |
-| `health-payload.example.json` | пример полного тела, которое агент шлёт в push (конверт `{"hosts":[...]}`) |
+| `health-payload.example.json` | пример полного тела, которое агент шлёт в push (голый объект хоста, без конверта) |
 | `ingest-request.example.http` | пример HTTP-запроса push целиком (заголовки + тело) |
 | `backend-token.example.yaml` | пример настройки приёма токена на стороне backend (ingest) |
 | `service_names.md` | что такое `SERVICE_NAME` и какие значения приняты |

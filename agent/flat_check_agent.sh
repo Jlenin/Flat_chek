@@ -1822,7 +1822,10 @@ _courier_send() {
     _layer_json_to l_met "$m_ts" "$m_src" "$METRICS_INTERVAL" "$now" \
         '"system.cpu","system.cpu_services","system.memory","system.memory_services","system.network"'
 
-    j="{\"hosts\":[{\"timestamp\":\"$ts\",\"host_id\":\"$_ID_HOST\",\"host_ip\":\"$_ID_IP\",\"service_name\":\"$_ID_SVC\","
+    # Тело — ГОЛЫЙ объект хоста, без конверта {"hosts":[...]}: приёмник сам
+    # раскладывает снимки по host_id/service_name, а конверт он сохранял как
+    # один "хост" с вложенным hosts[], и фронт не находил в нём summary.
+    j="{\"timestamp\":\"$ts\",\"host_id\":\"$_ID_HOST\",\"host_ip\":\"$_ID_IP\",\"service_name\":\"$_ID_SVC\","
     j+="\"script_version\":${_F[script_version]:-\"\"},\"os\":${_F[os]:-\"\"},\"package_manager\":${_F[package_manager]:-\"\"},"
     j+="\"layers\":{\"full\":$l_full,\"services\":$l_svc,\"metrics\":$l_met},"
 
@@ -1873,7 +1876,7 @@ _courier_send() {
     iss_s="${_F[issues.static]:-}"
     _cget_to iss_d issues.dynamic ''
     j+="\"issues\":[${iss_s}${iss_s:+${iss_d:+,}}${iss_d}]"
-    j+="}]}"
+    j+="}"
 
     # Сначала на диск (last_sent.json — что именно ушло, для разбора после
     # падения), потом push из этого же файла.
