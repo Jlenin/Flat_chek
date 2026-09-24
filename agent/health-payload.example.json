@@ -66,16 +66,17 @@
   ],
   "system": {
     "cpu": {
-      "usage_percent": 17
+      "usage_percent": 17,
+      "cores": 8
     },
     "cpu_services": [
       {
         "service_name": "fss-server",
-        "usage_percent": 9
+        "usage_percent": 1.13
       },
       {
         "service_name": "fss-srclient",
-        "usage_percent": 2
+        "usage_percent": 0.25
       }
     ],
     "memory": {

@@ -84,6 +84,11 @@ deb/rpm-пакет — см. корневой [`README.md`](../README.md)). Од
   у services ещё ничего нет.
 - `age_seconds` больше пары `interval_seconds` — слой не обновляется
   (завис/падает), дашборд может это подсветить.
+- CPU: `system.cpu.usage_percent` — загрузка всего хоста (все ядра, 0–100),
+  `system.cpu.cores` — число ядер. `system.cpu_services[].usage_percent` —
+  доля **от всего хоста** (не от одного ядра, как `%CPU` в `top`), два знака
+  после запятой: сумма по сервисам сопоставима с общим CPU, как у памяти.
+  Сравнить с `top`: `%CPU` процесса ÷ `cores`.
 - `issues[]` — находки `full` (unit-файл, `is-enabled`, каталоги, nginx)
   плюс находки `services` (`is-active`, порты, API); `summary.errors`/
   `summary.warnings` — по обоим спискам.

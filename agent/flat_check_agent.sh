@@ -1162,6 +1162,18 @@ _meminfo_read() {   # → _MEM_TOTAL_KB, _MEM_AVAIL_KB
 }
 
 _x10_fmt_to() { printf -v "$1" '%d.%d' "$(( $2 / 10 ))" "$(( $2 % 10 ))"; }
+_x100_fmt_to() { printf -v "$1" '%d.%02d' "$(( $2 / 100 ))" "$(( $2 % 100 ))"; }
+
+# Число ядер — по строкам cpuN в /proc/stat (те же ядра, из которых
+# складывается общий CPU хоста).
+_cpu_cores_detect() {
+    local line n=0
+    while read -r line _; do
+        [[ "$line" == cpu[0-9]* ]] && n=$((n + 1))
+    done 2>/dev/null < /proc/stat
+    [[ $n -gt 0 ]] || n=1
+    _CPU_CORES=$n
+}
 
 _json_collect_repos() {
     local out="[" first=1 line
@@ -1336,7 +1348,7 @@ _full_collect_system() {
 
     cpu=$(_sys_cpu_via_procstat 2>/dev/null) || cpu=0
     [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
-    _W[system.cpu]="{\"usage_percent\":$cpu}"
+    _W[system.cpu]="{\"usage_percent\":$cpu,\"cores\":${_CPU_CORES:-1}}"
 
     _meminfo_read
     mem_total=$(( _MEM_TOTAL_KB / 1024 ))
@@ -1349,9 +1361,10 @@ _full_collect_system() {
     [[ "$up_sec" =~ ^[0-9]+$ ]] || up_sec=0
     _W[system.uptime_seconds]="$up_sec"
 
-    # CPU/RAM по сервисам: среднее с момента старта процесса (как ps pcpu) —
-    # через /proc без ps. Через METRICS_INTERVAL их заменит реальная нагрузка
-    # от metrics.
+    # CPU/RAM по сервисам: среднее с момента старта процесса — через /proc без
+    # ps. CPU — доля от ВСЕГО хоста (все ядра), как system.cpu и память, а не
+    # от одного ядра, как %CPU в top. Через METRICS_INTERVAL их заменит
+    # реальная нагрузка от metrics.
     local cpu_s="" mem_s="" j tot start_ticks up_ticks=$(( up_sec * ${_DAEMON_CLK_TCK:-100} )) cx mx rss v
     for pkg in "${_FULL_PKGS[@]}"; do
         IFS=',' read -ra arr <<< "${_W[pkg.$pkg.pids]:-}"
@@ -1362,11 +1375,11 @@ _full_collect_system() {
             j=$_PJ
             start_ticks=$_PSTART
             tot=$(( up_ticks - start_ticks ))
-            [[ $tot -gt 0 ]] && cx=$(( cx + j * 1000 / tot ))
+            [[ $tot -gt 0 ]] && cx=$(( cx + j * 10000 / (tot * ${_CPU_CORES:-1}) ))
             _pid_rss_to "$pid" && rss=$(( rss + _PRSS ))
         done
         if [[ $cx -gt 0 ]]; then
-            _x10_fmt_to v "$cx"
+            _x100_fmt_to v "$cx"
             cpu_s+="${cpu_s:+,}{\"service_name\":\"$pkg\",\"usage_percent\":$v}"
         fi
         mx=0
@@ -1628,19 +1641,24 @@ _services_run() {
 _metrics_init() {
     _DAEMON_CLK_TCK=$(getconf CLK_TCK 2>/dev/null)
     [[ "$_DAEMON_CLK_TCK" =~ ^[0-9]+$ && "$_DAEMON_CLK_TCK" -gt 0 ]] || _DAEMON_CLK_TCK=100
+    _cpu_cores_detect
     declare -gA _MET_PID_J=() _MET_NET_PREV=()
     _MET_CPU_PREV_TOTAL=0
     _MET_CPU_PREV_IDLE=0
     # Первый замер — только база для разниц, его результат не используется.
     _met_cpu_total
-    _met_network 1
+    _met_network
     _epoch_to _MET_PREV_EPOCH
 }
 
-_met_cpu_total() {   # → _MET_CPU (%), разница /proc/stat с прошлого вызова
+# Время между тиками берётся из самого /proc/stat (_MET_DT — сумма тактов
+# всех ядер), как у top: целые секунды часов дают при интервале 2–5 с
+# погрешность в десятки процентов.
+_met_cpu_total() {   # → _MET_CPU (%), _MET_DT (такты всех ядер с прошлого вызова)
     local line total=0 i idle dt di
     local -a f
     _MET_CPU=0
+    _MET_DT=0
     read -r line 2>/dev/null < /proc/stat || return 0
     read -ra f <<< "$line"
     for ((i = 1; i < ${#f[@]}; i++)); do
@@ -1651,13 +1669,16 @@ _met_cpu_total() {   # → _MET_CPU (%), разница /proc/stat с прошл
     di=$(( idle - _MET_CPU_PREV_IDLE ))
     _MET_CPU_PREV_TOTAL=$total
     _MET_CPU_PREV_IDLE=$idle
-    [[ $dt -gt 0 ]] && _MET_CPU=$(( (dt - di) * 100 / dt ))
+    [[ $dt -gt 0 ]] || return 0
+    _MET_DT=$dt
+    _MET_CPU=$(( (dt - di) * 100 / dt ))
 }
 
-_met_network() {   # $1 elapsed → _MET_NET: [{"interface","mbps"}] по каждому интерфейсу кроме lo
-    local elapsed="${1:-1}" line iface total prev x10 v e out=""
+_met_network() {   # → _MET_NET: [{"interface","mbps"}] по каждому интерфейсу кроме lo
+    local line iface total prev x10 v e out="" dt="${_MET_DT:-0}"
     local -a f
-    [[ $elapsed -gt 0 ]] || elapsed=1
+    # Время тика в тактах одного ядра × ядра = _MET_DT; нет его — 1 с.
+    [[ $dt -gt 0 ]] || dt=$(( _DAEMON_CLK_TCK * _CPU_CORES ))
     while IFS= read -r line; do
         [[ "$line" == *:* ]] || continue
         iface="${line%%:*}"
@@ -1668,7 +1689,7 @@ _met_network() {   # $1 elapsed → _MET_NET: [{"interface","mbps"}] по каж
         prev="${_MET_NET_PREV[$iface]:-}"
         _MET_NET_PREV[$iface]=$total
         x10=0
-        [[ -n "$prev" && $total -ge $prev ]] && x10=$(( (total - prev) * 80 / (1000000 * elapsed) ))
+        [[ -n "$prev" && $total -ge $prev ]] && x10=$(( (total - prev) * 80 * _DAEMON_CLK_TCK * _CPU_CORES / (1000000 * dt) ))
         _x10_fmt_to v "$x10"
         _json_esc_to e "$iface"
         out+="${out:+,}{\"interface\":\"$e\",\"mbps\":$v}"
@@ -1677,23 +1698,21 @@ _met_network() {   # $1 elapsed → _MET_NET: [{"interface","mbps"}] по каж
 }
 
 _metrics_run() {
-    local now elapsed pkg pid prev cx rss mx v cpu_s="" mem_s="" pids have
+    local now pkg pid prev cx dj rss mx v cpu_s="" mem_s="" pids have
     local -a pkgs arr
     local -A newj=()
     _epoch_to now
-    elapsed=$(( now - _MET_PREV_EPOCH ))
-    [[ $elapsed -gt 0 ]] || elapsed=1
     _MET_PREV_EPOCH=$now
 
     _met_cpu_total
     _meminfo_read
-    _met_network "$elapsed"
+    _met_network
 
     read -ra pkgs <<< "${_F[pkgs]:-}"
     for pkg in "${pkgs[@]}"; do
         _cget_to pids "pkg.$pkg.pids"
         IFS=',' read -ra arr <<< "$pids"
-        cx=0
+        dj=0
         rss=0
         have=0
         for pid in "${arr[@]}"; do
@@ -1702,13 +1721,17 @@ _metrics_run() {
             newj[$pid]=$_PJ
             prev="${_MET_PID_J[$pid]:-}"
             if [[ -n "$prev" && $_PJ -ge $prev ]]; then
-                cx=$(( cx + (_PJ - prev) * 1000 / (_DAEMON_CLK_TCK * elapsed) ))
+                dj=$(( dj + _PJ - prev ))
                 have=1
             fi
             _pid_rss_to "$pid" && rss=$(( rss + _PRSS ))
         done
+        # Доля от ВСЕГО хоста (все ядра), в сотых процента: сумма по сервисам
+        # сопоставима с system.cpu, как у памяти.
+        cx=0
+        [[ $_MET_DT -gt 0 ]] && cx=$(( dj * 10000 / _MET_DT ))
         if [[ $have -eq 1 && $cx -gt 0 ]]; then
-            _x10_fmt_to v "$cx"
+            _x100_fmt_to v "$cx"
             cpu_s+="${cpu_s:+,}{\"service_name\":\"$pkg\",\"usage_percent\":$v}"
         fi
         mx=0
@@ -1726,7 +1749,7 @@ _metrics_run() {
 
     declare -gA _W=()
     _W[updated_at]="$now"
-    _W[system.cpu]="{\"usage_percent\":$_MET_CPU}"
+    _W[system.cpu]="{\"usage_percent\":$_MET_CPU,\"cores\":$_CPU_CORES}"
     _W[system.memory]="{\"total_mb\":$(( _MEM_TOTAL_KB / 1024 )),\"used_mb\":$(( (_MEM_TOTAL_KB - _MEM_AVAIL_KB) / 1024 )),\"available_mb\":$(( _MEM_AVAIL_KB / 1024 ))}"
     _W[system.cpu_services]="[$cpu_s]"
     _W[system.memory_services]="[$mem_s]"
