@@ -136,7 +136,7 @@ deb/rpm-пакет — см. корневой [`README.md`](../README.md)). Од
 cp agent/flat_check_agent.sh agent/flat_check_agent.conf.example /opt/flat/flat-check/
 mv /opt/flat/flat-check/flat_check_agent.conf.example /opt/flat/flat-check/flat_check_agent.conf
 chmod +x /opt/flat/flat-check/flat_check_agent.sh
-chown -R flat-service:flat-service /opt/flat/flat-check   # запись в cache/
+chown -R flat-service:flat-group /opt/flat/flat-check     # запись в cache/
 # впишите реальный PUSH_URLS и токен в flat_check_agent.conf
 
 cp agent/flat-check.service.example /etc/systemd/system/flat-check.service

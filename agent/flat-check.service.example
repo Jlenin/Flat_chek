@@ -13,7 +13,7 @@ After=nss-lookup.target
 # нужна запись в /opt/flat/flat-check/cache (кеш) и в каталог LOG_FILE.
 Type=simple
 User=flat-service
-Group=flat-service
+Group=flat-group
 
 LimitCORE=infinity
 LimitNOFILE=65536
