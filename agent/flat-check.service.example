@@ -7,9 +7,10 @@ Wants=nss-lookup.target
 After=nss-lookup.target
 
 [Service]
-# Долгоживущий процесс: сам планирует full/services/metrics внутренними
-# таймерами (см. FULL_INTERVAL/SERVICES_INTERVAL/METRICS_INTERVAL в
-# flat_check_agent.conf) — никакого cron/timer рядом не нужно.
+# Долгоживущий процесс: сам планирует full/services/metrics и отправку
+# внутренними таймерами (см. FULL_INTERVAL/SERVICES_INTERVAL/METRICS_INTERVAL
+# в flat_check_agent.conf) — никакого cron/timer рядом не нужно. Пользователю
+# нужна запись в /opt/flat/flat-check/cache (кеш) и в каталог LOG_FILE.
 Type=simple
 User=flat-service
 Group=flat-service
@@ -17,19 +18,18 @@ Group=flat-service
 LimitCORE=infinity
 LimitNOFILE=65536
 
-# stdout — поток JSON (по одному объекту на каждый push каждого слоя),
-# stderr — info/warn/fail; оба идут в journalctl -u flat-check по умолчанию.
-# Плюс тот же info/warn/fail — построчно в файл LOG_FILE (по умолчанию
-# /var/log/flat/flat-check/flat_check_agent.log, см. agent/README.md,
-# "Логирование") — не нужно ничего включать отдельно, работает из коробки.
+# stderr — события демона (они же — в LOG_FILE, по умолчанию
+# /var/log/flat/flat-check/flat_check_agent.log, см. agent/README.md).
+# JSON в stdout под systemd не печатается (только PRINT_JSON=1) — что ушло
+# последним push'ем, лежит в /opt/flat/flat-check/cache/last_sent.json.
 SyslogIdentifier=flat-check
 
 WorkingDirectory=/opt/flat/flat-check
 ExecStart=/opt/flat/flat-check/flat_check_agent.sh
 
-# SIGTERM — демон сам ловит его (trap) и завершает цикл после текущего тика,
-# не обрывая push на середине; TimeoutStopSec — на случай, если тик full
-# (самый долгий слой) как раз идёт в момент останова.
+# SIGTERM — демон сам ловит его (trap) и выходит после текущей паузы (не
+# дольше METRICS_INTERVAL), дождавшись фоновых full/services; TimeoutStopSec
+# — на случай, если full (самый долгий слой) как раз идёт в момент останова.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 Restart=on-failure

@@ -6,6 +6,52 @@
       "host_ip": "10.0.1.5",
       "service_name": "fss-backend",
       "script_version": "3.7.0",
+      "layers": {
+        "full": {
+          "updated_at": "2026-08-03T07:16:02Z",
+          "age_seconds": 3538,
+          "interval_seconds": 3600,
+          "source": "full",
+          "sections": [
+            "script_version",
+            "os",
+            "package_manager",
+            "repositories",
+            "products[].packages[].version/depends/directories/configs",
+            "infrastructure[].version",
+            "system.disk",
+            "system.database",
+            "system.uptime_seconds",
+            "certificates",
+            "uptime_services",
+            "issues(static)"
+          ]
+        },
+        "services": {
+          "updated_at": "2026-08-03T08:14:01Z",
+          "age_seconds": 59,
+          "interval_seconds": 60,
+          "source": "services",
+          "sections": [
+            "products[].packages[].systemd/process/ports/api",
+            "infrastructure[].status",
+            "issues(dynamic)"
+          ]
+        },
+        "metrics": {
+          "updated_at": "2026-08-03T08:14:58Z",
+          "age_seconds": 2,
+          "interval_seconds": 5,
+          "source": "metrics",
+          "sections": [
+            "system.cpu",
+            "system.cpu_services",
+            "system.memory",
+            "system.memory_services",
+            "system.network"
+          ]
+        }
+      },
       "summary": {
         "installed": 3,
         "warnings": 1,
