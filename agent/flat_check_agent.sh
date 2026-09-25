@@ -1,56 +1,32 @@
 #!/bin/bash
-# flat_check_agent.sh — автономный health-check агент для мониторинга.
+# flat_check_agent.sh — автономный health/metrics-агент для мониторинга.
 #
-# Не интерактивный, без --help, без сессионного лога: считает состояние
-# хоста (те же продукты/пакеты/инфраструктура/сертификаты, что и полный
-# flat_check --json) и печатает JSON v2 в stdout; если задан PUSH_URLS —
-# ещё и отправляет его на все указанные http/https-адреса.
+# Долгоживущий процесс-демон (systemd, Type=simple), без аргументов командной
+# строки: всё поведение — переменные окружения и/или flat_check_agent.conf
+# рядом со скриптом (см. FLAT_AGENT_CONF ниже).
 #
-# ПОЛНОСТЬЮ САМОСТОЯТЕЛЬНЫЙ ФАЙЛ: не подключает (source) ничего из
-# flat_check_modular/ или корневых flat_check.sh/flat_check_2.sh — нужный
-# код скопирован сюда напрямую (см. "Источник:" в заголовке каждого блока
-# ниже), чтобы на хосте мониторинга было ровно ОДИН файл без внешних
-# зависимостей. Если меняете логику проверки в оригиналах — не забудьте
-# перенести правку и сюда (и наоборот).
+# Схема: три слоя обновляют кеш (каталог cache/ рядом со скриптом) каждый со
+# своей периодичностью, курьер раз в METRICS_INTERVAL секунд склеивает кеш в
+# полный JSON и отправляет его на PUSH_URLS. Бэку ничего не нужно собирать —
+# каждый push полный.
+#   full     (FULL_INTERVAL, 3600 с)  — полное обнаружение, пишет весь кеш
+#   services (SERVICES_INTERVAL, 60 с) — is-active, MainPID, порты, API
+#   metrics  (METRICS_INTERVAL, 5 с)   — CPU/RAM/сеть из /proc
+# Подробности — agent/README.md и комментарии у раздела «Кеш» ниже.
 #
-# БЕЗ АРГУМЕНТОВ КОМАНДНОЙ СТРОКИ. Конфигурация — только переменные
-# окружения и/или конфиг-файл рядом со скриптом (см. FLAT_AGENT_CONF ниже).
-# Это даёт «одну строку» для cron/systemd timer:
-#
-#   */5 * * * * PUSH_URLS=https://partner.example/api/v1/health/ingest \
-#               PUSH_TOKEN=*** HOST_ID=ss-n1 SERVICE_NAME=fss-backend \
-#               /opt/flat/flat_check_agent.sh >/dev/null
-#
-# Либо через конфиг-файл (см. flat_check_agent.conf.example) — тогда
-# командная строка ещё короче:
-#
-#   */5 * * * * /opt/flat/flat_check_agent.sh >/dev/null
-#
-# ПОТОКИ ВЫВОДА (важно для интеграции с мониторингом):
-#   stdout — ТОЛЬКО JSON, одной строкой, ничего больше. Безопасно парсить
-#            весь stdout как JSON, даже если настроен push.
-#   stderr — диагностика push (curl-ошибки, "push: OK/FAIL"), если такая
-#            была. При ручном запуске в терминале видно оба потока сразу —
-#            то есть видно и результат (JSON), и что именно запушилось.
-#
-# КОД ВОЗВРАТА: 0 — JSON успешно собран (и, если был push, все URL приняли
-# успешно); ненулевой — либо не удалось собрать JSON (редкость), либо хотя
-# бы один push не прошёл. Само по себе содержимое JSON (какие пакеты не
-# установлены и т.п.) на код возврата не влияет — это данные для дашборда,
-# а не признак "скрипт сломался".
+# ПОТОКИ ВЫВОДА:
+#   cache/last_sent.json — ровно то, что ушло последним push'ем;
+#   stdout — тот же JSON, но только при ручном запуске в терминале или при
+#            PRINT_JSON=1 (под systemd иначе это десятки МБ в journal в час);
+#   stderr и LOG_FILE — события демона и результат push.
 #
 # ПРАВА ДОСТУПА: рассчитан на запуск ОБЫЧНЫМ пользователем, не root.
-# Почти все проверки (dpkg/rpm/pacman/apk-запросы, systemctl status,
-# слушающие порты, curl к локальным API, чтение публичных сертификатов)
-# для этого прав не требуют. Единственное известное исключение — поле
-# configs[].status="sudoers": обычный пользователь не может даже
-# проверить существование файла внутри /etc/sudoers.d (там нет "x" для
-# остальных) — деградирует до "missing" без ошибок. Подробности и
-# необязательный ACL-пример — agent/flat_check_agent.sudoers.example.
+# Единственное известное исключение — configs[].status="sudoers" (нет "x" на
+# /etc/sudoers.d) — деградирует до "missing" без ошибок. Подробности —
+# agent/flat_check_agent.sudoers.example.
 #
-# Версии: значение SCRIPT_VERSION ниже — версия ЭТОГО standalone-агента,
-# отдельная от flat_check.sh/flat_check_2.sh/flat_check_modular (общая
-# логика копируется, но версионируется независимо).
+# SCRIPT_VERSION ниже — версия ЭТОГО агента, отдельная от flat_check.sh/
+# flat_check_2.sh.
 
 set -uo pipefail
 
@@ -62,12 +38,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 # ==========================================================================
 # Глобальные переменные и дефолты
 # ==========================================================================
-# Источник: подмножество lib/core.sh (раздел 00_globals) + lib/agent.sh
-# (раздел 01_config) из flat_check_modular — взяты только переменные,
-# реально читаемые кодом ниже (проверено построчным grep по каждой).
-# LOG_FILE сознательно НЕ инициализируется (никогда не вызываем
-# init_logging) — сессионный лог этому агенту не нужен; _log_line() при
-# пустом LOG_FILE и так тихо ничего не делает (см. её тело ниже).
+# LOG_FILE: по тому же образцу, что flat_check.sh/flat_check_2.sh — файл
+# рядом с рабочим каталогом продукта, а не встроенный в код путь. У тех
+# двух это "${SCRIPT_DIR}/${SCRIPT_NAME}.log" (рядом со скриптом, т.к. это
+# разовый прогон); здесь демон долгоживущий, а деплой — /opt/flat/flat-check
+# (см. flat-check.service.example), поэтому файл — в соседний с /opt/flat/
+# каталог /var/log/flat/flat-check/ (тот же путь, что раньше был жёстко
+# прописан в flat-check.service.example как StandardOutput/StandardError).
+# _log_line()/_daemon_init_logging() ниже: не удалось создать/писать файл —
+# тихо деградирует до LOG_FILE="" (без файла, только stderr) — как и
+# init_logging() у flat_check.sh/flat_check_2.sh, без падений.
 
 # Цвета для info/warn/fail на экране (актуально только при ручном запуске
 # в терминале — эти сообщения идут в stderr, см. шапку файла).
@@ -78,7 +58,7 @@ C_B='\033[0;34m'
 C_C='\033[0;36m'
 C_N='\033[0m'
 
-LOG_FILE=""
+LOG_FILE="${LOG_FILE:-/var/log/flat/flat-check/flat_check_agent.log}"
 DEBUG_MODE="${DEBUG_MODE:-0}"
 
 # Идентификация хоста / агента push (приоритет: env > conf-файл > пусто).
@@ -89,10 +69,24 @@ PUSH_URLS="${PUSH_URLS:-${PUSH_URL:-}}"
 PUSH_TOKEN="${PUSH_TOKEN:-}"
 PUSH_TOKENS="${PUSH_TOKENS:-}"
 PUSH_AUTH_HEADER="${PUSH_AUTH_HEADER:-Authorization: Bearer}"
-PUSH_CONNECT_TIMEOUT="${PUSH_CONNECT_TIMEOUT:-5}"
-PUSH_MAX_TIME="${PUSH_MAX_TIME:-30}"
-PUSH_RETRIES="${PUSH_RETRIES:-2}"
+# push уходит каждые METRICS_INTERVAL секунд: короткие таймауты и без
+# повторов — следующая попытка и так через несколько секунд.
+PUSH_CONNECT_TIMEOUT="${PUSH_CONNECT_TIMEOUT:-2}"
+PUSH_MAX_TIME="${PUSH_MAX_TIME:-4}"
+PUSH_RETRIES="${PUSH_RETRIES:-0}"
 PUSH_INSECURE="${PUSH_INSECURE:-0}"
+# URL, который ответил 404/405 (приём не настроен) или 401/403 (токен), не
+# дёргаем каждый тик, а пробуем раз в столько секунд; ответит 2xx — сам
+# возвращается к обычной отправке.
+PUSH_UNCONFIGURED_RETRY="${PUSH_UNCONFIGURED_RETRY:-300}"
+
+# Демон: интервалы слоёв (секунды). Курьер отправляет с интервалом metrics.
+FULL_INTERVAL="${FULL_INTERVAL:-3600}"
+SERVICES_INTERVAL="${SERVICES_INTERVAL:-60}"
+METRICS_INTERVAL="${METRICS_INTERVAL:-5}"
+# 1 — печатать отправляемый JSON в stdout и под systemd (по умолчанию только
+# при запуске в терминале).
+PRINT_JSON="${PRINT_JSON:-0}"
 
 # Фильтры содержимого JSON (необязательные; пусто = без фильтра, все продукты).
 SINGLE_PKG="${SINGLE_PKG:-}"
@@ -122,10 +116,8 @@ fail() { echo -e "${C_R}[FAIL]${C_N} $1" >&2; _log_line "FAIL" "$1"; }
 # ==========================================================================
 # Каталог продуктов/пакетов (_pkg_set/_pkg_catalog_builtin/_load_pkg_catalog)
 # ==========================================================================
-# Источник: перенесено без изменений логики из flat_check_modular/lib/core.sh
-# (раздел 01_catalog). Единственная правка: каталог ищется РЯДОМ со скриптом
-# (flat_check.packages.conf), а не в подпапке conf/ — "всё в одном месте".
-# Данные каталога (кто от чего зависит) НЕ менялись.
+# Каталог ищется РЯДОМ со скриптом (flat_check.packages.conf), иначе —
+# встроенный ниже. Данные каталога те же, что у flat_check.sh/flat_check_2.sh.
 
 # --- 1. Метаданные продуктов PKG_* (каталог) ---------------------------------
 # Каталог: flat_check.packages.conf рядом со скриптом (предпочтительно).
@@ -297,8 +289,6 @@ FLAT_PKG_CATALOG_EOF
 }
 
 _load_pkg_catalog() {
-    # В модульной раскладке каталог лежит в conf/, а не рядом со скриптом
-    # (как в оригинальных flat_check.sh/flat_check_2.sh) — см. ARCHITECTURE.md.
     local conf="${SCRIPT_DIR:-.}/flat_check.packages.conf"
     unset PKG_PRODUCT PKG_LEGACY PKG_PORTS PKG_API PKG_DEPS 2>/dev/null || true
     declare -gA PKG_PRODUCT PKG_LEGACY PKG_PORTS PKG_API PKG_DEPS
@@ -320,11 +310,7 @@ _load_pkg_catalog
 # ==========================================================================
 # Низкоуровневые примитивы: вывод/лог, ОС-детект, CPU/PID, PM-запросы
 # ==========================================================================
-# Источник: перенесено без изменений логики из flat_check_modular/lib/core.sh
-# (разделы 02_output/04_os_detect/05_system_metrics/06_resource_gate/
-# 07_pkg_checks/08_infra_checks) — только функции, реально нужные
-# build_health_json()/push_health_json() ниже (проверено построчным
-# грепом call-graph, не на глаз).
+# Логика проверок — та же, что у flat_check.sh/flat_check_2.sh.
 
 _log_line() {
     [[ -n "${LOG_FILE:-}" ]] || return 0
@@ -332,18 +318,16 @@ _log_line() {
     # только что заархивировал и удалил WORK_DIR), сам bash печатает "No such
     # file or directory" в свой stderr при настройке редиректа >> — до того,
     # как успевает сработать 2>/dev/null самой команды printf.
-    { printf '%s [%-5s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG_FILE"; } 2>/dev/null
+    local ts
+    printf -v ts '%(%Y-%m-%d %H:%M:%S)T' -1
+    { printf '%s [%-5s] %s\n' "$ts" "$1" "$2" >> "$LOG_FILE"; } 2>/dev/null
 }
 
+# DEBUG — только при DEBUG_MODE=1 (и в файл, и на экран).
 log_debug() {
+    [[ "${DEBUG_MODE:-0}" -eq 1 ]] || return 0
     _log_line "DEBUG" "$1"
-    [[ "${DEBUG_MODE:-0}" -eq 1 ]] && echo -e "${C_C}[DEBUG]${C_N} $1" >&2
-}
-
-print_info() {
-    # В stderr (не stdout): stdout зарезервирован строго под JSON-ответ.
-    echo -e "${C_B}[INFO]${C_N}  $1" >&2
-    _log_line "INFO" "$1"
+    echo -e "${C_C}[DEBUG]${C_N} $1" >&2
 }
 
 detect_os() {
@@ -406,10 +390,6 @@ detect_os() {
     else
         PM="unknown"
     fi
-
-    print_info "OS: $OS_FULL_VER"
-    print_info "Package manager: $PM"
-    echo ""
 }
 
 _sys_regex_escape() {
@@ -557,8 +537,6 @@ _pkg_version() {
 
 get_dep_version() { _pkg_version "$1"; }
 
-get_pkg_version() { _pkg_version "$1"; }
-
 _dep_installed_dpkg() {
     dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -q 'install ok installed'
 }
@@ -656,7 +634,8 @@ is_pkg_installed_tiny() {
 register_dep() {
     local dep="$1"
     local pkg="$2"
-    dep=$(echo "$dep" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    dep="${dep#"${dep%%[![:space:]]*}"}"
+    dep="${dep%"${dep##*[![:space:]]}"}"
     [[ -z "$dep" ]] && return
 
     # Пропускаем непакетные зависимости (файлы, пути, версионные строки, сам пакет, config, RPM capabilities)
@@ -683,41 +662,16 @@ register_dep() {
     fi
 }
 
-_register_pkg_deps() {
-    local pkg="$1"
-    local deps_meta="${PKG_DEPS[$pkg]:-}"
-    local deps_real dep
-
-    if [[ -n "$deps_meta" ]]; then
-        for dep in $(echo "$deps_meta" | tr ',' ' '); do
-            register_dep "$dep" "$pkg"
-        done
-    fi
-    deps_real=$(get_pkg_depends "$pkg" 2>/dev/null)
-    if [[ -n "$deps_real" ]]; then
-        for dep in $(echo "$deps_real" | tr ',' ' '); do
-            register_dep "$dep" "$pkg"
-        done
-    fi
-}
-
 _is_infrastructure_pkg() {
     [[ "${PKG_PRODUCT[$1]:-}" == "Infrastructure" ]]
 }
 
 # ==========================================================================
-# Конфиг агента + сборка health JSON v2
+# Конфиг агента
 # ==========================================================================
-# Источник: перенесено без изменений логики из
-# flat_check_modular/lib/agent.sh (разделы 01_config/02_json_build).
-# _json_print() НЕ перенесена — она выбирает pretty/compact по TTY, а этому
-# агенту всегда нужен компактный однострочный JSON (как при пайпе/cron).
 
 # Дефолты (не затираем значения из section 0 / окружения)
 
-: "${OUTPUT_JSON:=0}"
-: "${DO_PUSH:=0}"
-: "${CONFIG_FILE:=}"
 : "${SINGLE_PKG:=}"
 : "${FILTER_PRODUCT:=}"
 : "${HOST_ID:=}"
@@ -727,9 +681,9 @@ _is_infrastructure_pkg() {
 : "${PUSH_TOKEN:=}"
 : "${PUSH_TOKENS:=}"
 : "${PUSH_AUTH_HEADER:=Authorization: Bearer}"
-: "${PUSH_CONNECT_TIMEOUT:=5}"
-: "${PUSH_MAX_TIME:=30}"
-: "${PUSH_RETRIES:=2}"
+: "${PUSH_CONNECT_TIMEOUT:=2}"
+: "${PUSH_MAX_TIME:=4}"
+: "${PUSH_RETRIES:=0}"
 : "${PUSH_INSECURE:=0}"
 : "${SHOW_REPOS_JSON:=0}"
 
@@ -780,11 +734,17 @@ _json_load_config() {
                 PUSH_INSECURE)
                     [[ "$val" =~ ^[01]$ ]] && PUSH_INSECURE="$val"
                     ;;
-                COLLECTOR_JOBS|JOBS)
-                    if [[ "$val" =~ ^[0-9]+$ && "${COLLECTOR_JOBS:-0}" -eq 0 ]]; then
-                        COLLECTOR_JOBS="$val"
-                    fi
+                FULL_INTERVAL|SERVICES_INTERVAL|METRICS_INTERVAL|PUSH_UNCONFIGURED_RETRY)
+                    [[ "$val" =~ ^[1-9][0-9]*$ ]] && printf -v "$key" '%s' "$val"
                     ;;
+                PRINT_JSON)
+                    [[ "$val" =~ ^[01]$ ]] && PRINT_JSON="$val"
+                    ;;
+                # Без guard'а [[ -z ]], в отличие от остальных ключей выше:
+                # LOG_FILE уже непустой по дефолту (см. секцию 0), поэтому
+                # guard никогда бы не сработал и конфиг не мог бы ни сменить
+                # путь, ни явно отключить файловый лог (LOG_FILE="" в конфиге).
+                LOG_FILE) LOG_FILE="$val" ;;
             esac
         fi
     done < "$f"
@@ -797,39 +757,68 @@ _json_load_config() {
 }
 
 # ==========================================================================
-# РАЗДЕЛ: 02_json_build
+# JSON-кирпичики и время — без подоболочек
 # ==========================================================================
-# Назначение: Сборка полного health JSON v2 (build_health_json) и его частей —
-#   идентификация хоста, экранирование строк, снимок одного пакета, снимок
-#   системных метрик, infrastructure/depends, список репозиториев.
-# Публичные функции: build_health_json(), _json_ensure_identity(),
-#   _json_detect_host_ip(), _json_esc(s), _json_arr_from_csv(csv),
-#   _json_collect_pkg(pkg), _json_collect_system(), _json_collect_infra(),
-#   _json_collect_repos(), _json_print(body)
-# Зависит от: 01_config.sh (переменные-дефолты), lib/core (_sys_cpu_via_procstat,
-#   _sys_pkg_pids, get_dep_version, get_pkg_depends, is_dep_installed,
-#   is_lib_available, is_pkg_installed_tiny, get_pkg_version, register_dep через
-#   _register_pkg_deps, detect_os, PKG_PRODUCT/PKG_LEGACY/PKG_PORTS/PKG_API/PKG_DEPS,
-#   ALL_DEPENDS, FLAT_PRODUCTS_ORDER)
-# Не зависит от: lib/logging — ничего из сборщика логов здесь не используется
-# Side effects: запускает systemctl/dpkg/rpm/ss/curl/openssl/df; пишет во временный
-#   каталог $_JSON_TMP (сертификаты передаются через файл, не через subshell —
-#   иначе терялись бы вместе с состоянием CPU-дельты, см. комментарий ниже)
-#
-# Источник: перенесено без изменений логики из json_report.inc.sh
-#   (строки 87-465 и 468-574 — build_health_json; _json_print — строки 656-666,
-#   вынесен сюда, а не в 03_push.sh, т.к. используется и при простом --json
-#   без --push).
-#
-# ОБНАРУЖЕННОЕ РАСХОЖДЕНИЕ (найдено при сверке --json со старым flat_check.sh,
-# не исправлено в оригиналах в рамках этой задачи — см. CONTEXT.md/README для
-# отдельного тикета): json_report.inc.sh отстал от копий, вшитых в
-# flat_check.sh/flat_check_2.sh, в блоке directories внутри _json_collect_pkg —
-# он не пропускал через _is_infrastructure_pkg() и показывал бы для
-# nginx/postgresql/mariadb выдуманные пути /opt/flat/<pkg> со статусом
-# "missing" вместо честного "n/a" (эти пакеты не живут под /opt/flat). Взята
-# исправленная версия из flat_check.sh/flat_check_2.sh (идентична в обоих).
+# Горячие пути (metrics, курьер — каждые METRICS_INTERVAL секунд) не должны
+# порождать процессы: `x=$(f)` — это fork всего bash ради одной строки
+# (замер: 1000 вызовов $(_json_esc) — 643 мс и 1000 процессов, тот же код
+# через printf -v — 16 мс и 0). Поэтому здесь функции пишут результат в
+# переменную, имя которой передано первым аргументом (printf -v), а время
+# берётся встроенным printf '%(...)T', а не внешним date.
 
+_json_esc_to() {
+    local s="${2:-}"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf -v "$1" '%s' "$s"
+}
+
+_json_esc() {
+    local _e
+    _json_esc_to _e "${1:-}"
+    printf '%s' "$_e"
+}
+
+_json_arr_from_csv() {
+    local csv="${1:-}" first=1 item e
+    local -a items
+    printf '['
+    IFS=',' read -ra items <<< "$csv"
+    for item in "${items[@]}"; do
+        item="${item#"${item%%[![:space:]]*}"}"
+        item="${item%"${item##*[![:space:]]}"}"
+        [[ -z "$item" ]] && continue
+        [[ $first -eq 1 ]] || printf ','
+        first=0
+        _json_esc_to e "$item"
+        printf '"%s"' "$e"
+    done
+    printf ']'
+}
+
+_epoch_to() { printf -v "$1" '%(%s)T' -1; }
+
+_iso_utc_to() {
+    # -x обязателен: bash перечитывает часовой пояс только при смене
+    # ЭКСПОРТИРОВАННОГО TZ. Без него на хосте с МСК время уходило местным
+    # с суффиксом Z (на 3 часа "в будущем").
+    local -x TZ=UTC0
+    printf -v "$1" '%(%Y-%m-%dT%H:%M:%SZ)T' "$2"
+}
+
+# Пауза без внешнего sleep: read с таймаутом на пустом канале, который
+# никто никогда не пишет. Сигнал (SIGTERM) такое ожидание не прерывает —
+# останов демона наступает по истечении текущей паузы (не дольше
+# METRICS_INTERVAL секунд).
+_WAIT_FD=""
+_wait_seconds() {
+    [[ -n "$_WAIT_FD" ]] || exec {_WAIT_FD}<> <(:)
+    read -r -t "$1" -u "$_WAIT_FD" _ 2>/dev/null
+    return 0
+}
 
 _json_detect_host_ip() {
     local ip
@@ -845,458 +834,345 @@ _json_ensure_identity() {
     [[ -n "$SERVICE_NAME" ]] || SERVICE_NAME="${SINGLE_PKG:-unknown}"
 }
 
-# Экранирование строки для JSON (без внешних зависимостей).
-_json_esc() {
-    local s="${1:-}"
-    s=${s//\\/\\\\}
-    s=${s//\"/\\\"}
-    s=${s//$'\n'/\\n}
-    s=${s//$'\r'/\\r}
-    s=${s//$'\t'/\\t}
-    printf '%s' "$s"
-}
+# ==========================================================================
+# Кеш: каталог cache/ рядом со скриптом, у каждого файла ОДИН писатель
+# ==========================================================================
+#   full.cache      — пишет только слой full (раз в FULL_INTERVAL): всё,
+#                     включая начальные значения services- и metrics-частей
+#   services.cache  — пишет только слой services (раз в SERVICES_INTERVAL)
+#   metrics.cache   — пишет только слой metrics (раз в METRICS_INTERVAL)
+#   last_sent.json  — пишет только курьер: ровно то, что ушло последним
+#                     push'ем (для разбора «что отправилось перед падением»)
+#
+# Один писатель на файл — блокировки не нужны. full/services пишут во
+# временный файл и переименовывают его поверх старого (rename(2) атомарен:
+# читатель видит либо целую старую версию, либо целую новую). metrics пишет
+# на месте: его единственный читатель — курьер в том же процессе, строго
+# после записи.
+#
+# Формат файлов слоёв — не JSON, а строки "ключ<TAB>значение", где значение —
+# готовый JSON-фрагмент. Первая строка всегда updated_at<TAB><epoch>,
+# последняя — end<TAB>1 (без неё файл считается битым/недописанным). Так
+# курьер собирает итоговый JSON склейкой строк, без разбора JSON и без
+# единого внешнего процесса.
+#
+# Кто главнее при склейке: для каждой части берётся слой, чей updated_at
+# новее. updated_at у full — момент СТАРТА прогона (данные не моложе его),
+# поэтому свежие services/metrics, записанные за время долгого full, не
+# откатываются назад его результатом.
 
-_json_arr_from_csv() {
-    local csv="${1:-}" first=1 item
-    printf '['
-    if [[ -n "$csv" ]]; then
-        IFS=',' read -ra _items <<< "$csv"
-        for item in "${_items[@]}"; do
-            item="${item#"${item%%[![:space:]]*}"}"
-            item="${item%"${item##*[![:space:]]}"}"
-            [[ -z "$item" ]] && continue
-            [[ $first -eq 1 ]] || printf ','
-            first=0
-            printf '"%s"' "$(_json_esc "$item")"
+CACHE_DIR="$SCRIPT_DIR/cache"
+_CACHE_FULL="$CACHE_DIR/full.cache"
+_CACHE_SERVICES="$CACHE_DIR/services.cache"
+_CACHE_METRICS="$CACHE_DIR/metrics.cache"
+_CACHE_SENT="$CACHE_DIR/last_sent.json"
+
+# Пишет глобальный массив _W в файл. $2=1 — атомарно (tmp + mv).
+_cache_write() {
+    local path="$1" atomic="${2:-1}" tmp="$1" k
+    [[ "$atomic" == 1 ]] && tmp="${path}.tmp.${BASHPID}"
+    {
+        printf 'updated_at\t%s\n' "${_W[updated_at]}"
+        for k in "${!_W[@]}"; do
+            [[ "$k" == updated_at ]] && continue
+            printf '%s\t%s\n' "$k" "${_W[$k]}"
         done
+        printf 'end\t1\n'
+    } > "$tmp" 2>/dev/null || return 1
+    if [[ "$atomic" == 1 ]]; then
+        mv -f "$tmp" "$path" 2>/dev/null || return 1
     fi
-    printf ']'
-}
-
-# Пишет одну находку (WARN/ERROR) в сайд-файл $_JSON_TMP/pkg_issues.ndjson —
-# по той же причине, что certs_json/svc_uptime_json уже используют такой
-# side-channel: _json_collect_pkg() всегда выполняется в сабшелле $(...)
-# (см. комментарий у места её вызова в build_health_json), поэтому обычное
-# WARNINGS++/ERRORS++ здесь никогда не долетело бы до вызывающего кода.
-# build_health_json() читает файл обратно, считает severity и собирает
-# summary.errors/summary.warnings и issues[] из одного и того же источника.
-_json_pkg_issue() {
-    local severity="$1" code="$2" message="$3"
-    printf '{"severity":"%s","package":"%s","product":"%s","code":"%s","message":"%s"}\n' \
-        "$(_json_esc "$severity")" "$(_json_esc "$pkg")" "$(_json_esc "${PKG_PRODUCT[$pkg]:-}")" \
-        "$(_json_esc "$code")" "$(_json_esc "$message")" >> "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null
-}
-
-# Собрать JSON-объект одного пакета (без печати human-output).
-_json_collect_pkg() {
-    local pkg="$1"
-    local legacy="${PKG_LEGACY[$pkg]:-}"
-    local is_infra=0
-    _is_infrastructure_pkg "$pkg" && is_infra=1
-    local status="not_installed" ver="" unit="${pkg}.service"
-    local unit_path="" active="unknown" enabled="unknown"
-    local opt_path="/opt/flat/$pkg" opt_owner="" opt_status="missing"
-    local log_path="/var/log/flat/$pkg" log_owner="" log_status="missing"
-    local deps_meta="${PKG_DEPS[$pkg]:-}" deps_pm=""
-    local pids="" ps_lines="" proc_status="not running"
-    local ports_json="" api_url="" api_code=0 api_status="n/a"
-    local configs_json="" port_spec port open
-    local ngx_av ngx_en lr sudoers
-
-    FOUND_PKG_VER=""
-    if is_pkg_installed_tiny "$pkg" "$legacy"; then
-        # тихий сбор версии без print_*
-        case "$PM" in
-            dpkg)
-                ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
-                [[ -z "$ver" && -n "$legacy" ]] && ver=$(dpkg-query -W -f='${Version}' $(echo "$legacy" | tr ',' ' ' | awk '{print $1}') 2>/dev/null)
-                ;;
-            rpm)
-                ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null) || true
-                ;;
-            *)
-                ver=$(get_pkg_version "$pkg" 2>/dev/null || true)
-                ;;
-        esac
-        status="installed"
-        INSTALLED=$((INSTALLED + 1))
-    else
-        if [[ $VERBOSE -eq 1 ]] || [[ -n "$SINGLE_PKG" ]]; then
-            NOT_INSTALLED=$((NOT_INSTALLED + 1))
-        else
-            # в обычном JSON-снимке не включаем не установленные
-            return 1
-        fi
-    fi
-
-    # systemd
-    if [[ -f "/usr/lib/systemd/system/$unit" ]]; then
-        unit_path="/usr/lib/systemd/system/$unit"
-    elif [[ -f "/lib/systemd/system/$unit" ]]; then
-        unit_path="/lib/systemd/system/$unit"
-    elif [[ -f "/etc/systemd/system/$unit" ]]; then
-        unit_path="/etc/systemd/system/$unit"
-    fi
-    if command -v systemctl >/dev/null 2>&1; then
-        active=$(systemctl is-active "$unit" 2>/dev/null || echo unknown)
-        enabled=$(systemctl is-enabled "$unit" 2>/dev/null || echo unknown)
-    fi
-    # Как в текстовом режиме (check_systemd_unit): юнит не найден на диске —
-    # WARN (конфигурационная аномалия). Юнит найден, но не active и/или не
-    # enabled — ERROR: служба реально не работает / не переживёт перезагрузку,
-    # это инцидент, а не предупреждение. Для Infrastructure-пакетов этот путь
-    # вообще не считается — в текстовом режиме для них вызывается
-    # check_infrastructure_pkg с другими правилами.
-    if [[ $is_infra -eq 0 ]]; then
-        if [[ -z "$unit_path" ]]; then
-            _json_pkg_issue warning systemd_unit_missing "systemd unit: $unit not found"
-        else
-            [[ "$active" != "active" ]] && _json_pkg_issue error systemd_inactive "systemd: $unit is $active"
-            [[ "$enabled" != "enabled" ]] && _json_pkg_issue error systemd_disabled "systemd: $unit is $enabled"
-        fi
-    fi
-
-    # directories (FLAT layout; Infrastructure — системные пакеты без /opt/flat)
-    if _is_infrastructure_pkg "$pkg"; then
-        opt_status="n/a"
-        log_status="n/a"
-        opt_path=""
-        log_path=""
-    else
-        if [[ -d "$opt_path" ]]; then
-            opt_status="ok"
-            opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null || echo "")
-        else
-            # check_opt_directory() в текстовом режиме тоже безусловно WARN'ит
-            # на отсутствующий /opt/flat/<pkg>.
-            _json_pkg_issue warning opt_dir_missing "dir: $opt_path missing"
-        fi
-        if [[ -d "$log_path" ]]; then
-            log_status="ok"
-            log_owner=$(stat -c '%U:%G' "$log_path" 2>/dev/null || echo "")
-        elif [[ "$status" == "installed" ]]; then
-            log_status="missing"
-        fi
-    fi
-
-    deps_pm=$(get_pkg_depends "$pkg" 2>/dev/null || true)
-
-    # process
-    # _sys_pkg_pids() (не голый pgrep по имени пакета) — иначе пакеты вроде
-    # fss-capagent, которые запускают сторонний бинарь другим именем (heplify,
-    # без "fss-capagent" где-либо в argv), всегда виделись бы как "not running",
-    # хотя systemd честно показывает unit активным. _sys_pkg_pids добавляет
-    # запасной путь через `systemctl show -p MainPID`, который от имени
-    # процесса не зависит.
-    pids=$(_sys_pkg_pids "$pkg" 2>/dev/null | paste -sd',' - 2>/dev/null)
-    if [[ -n "$pids" ]]; then
-        proc_status="running"
-        ps_lines=$(ps -o pid=,args= -p "${pids//,/ }" 2>/dev/null | head -5 | sed 's/"/\\"/g' || true)
-    fi
-    # check_log_directory(): текстовый режим WARN'ит на отсутствующую
-    # лог-директорию только пока процесс активен (иначе это просто INFO) —
-    # повторяем то же условие здесь.
-    [[ "$log_status" == "missing" && -n "$pids" ]] && _json_pkg_issue warning log_dir_missing "logdir: $log_path missing (process active)"
-
-    # ports
-    ports_json="["
-    local first_port=1
-    for port_spec in $(echo "${PKG_PORTS[$pkg]:-}" | tr ',' ' '); do
-        [[ -z "$port_spec" ]] && continue
-        open="not listening"
-        if command -v ss >/dev/null 2>&1; then
-            if ss -lntu 2>/dev/null | grep -qE ":${port_spec%%-*}\\b"; then
-                open="listening"
-            fi
-        elif command -v netstat >/dev/null 2>&1; then
-            if netstat -lntu 2>/dev/null | grep -qE ":${port_spec%%-*}\\b"; then
-                open="listening"
-            fi
-        fi
-        [[ "$open" == "not listening" && $is_infra -eq 0 ]] && _json_pkg_issue warning port_not_listening "port: $port_spec not listening"
-        [[ $first_port -eq 1 ]] || ports_json+=","
-        first_port=0
-        ports_json+=$(printf '{"number":"%s","status":"%s"}' "$(_json_esc "$port_spec")" "$(_json_esc "$open")")
-    done
-    ports_json+="]"
-
-    # api
-    local ep="${PKG_API[$pkg]:-}"
-    if [[ -n "$ep" ]]; then
-        if [[ "$ep" == http://* || "$ep" == https://* ]]; then
-            api_url="$ep"
-        else
-            api_url="http://localhost:${PKG_PORTS[$pkg]%%,*}$ep"
-            # если порт диапазон/пуст — оставим как path на localhost
-            [[ "${PKG_PORTS[$pkg]:-}" == *","* || "${PKG_PORTS[$pkg]:-}" == *"-"* || -z "${PKG_PORTS[$pkg]:-}" ]] && api_url="http://localhost$ep"
-        fi
-        if command -v curl >/dev/null 2>&1; then
-            api_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "$api_url" 2>/dev/null) || true
-            [[ "$api_code" =~ ^[0-9]{3}$ ]] || api_code=0
-            api_code=$((10#${api_code:-0}))
-            [[ "$api_code" -eq 200 || "$api_code" -eq 204 ]] && api_status="ok" || api_status="fail"
-        else
-            api_code=0
-            api_status="curl_not_found"
-        fi
-        [[ "$api_status" != "ok" && $is_infra -eq 0 ]] && _json_pkg_issue warning api_unhealthy "api: $api_url => $api_status"
-    fi
-
-    # configs
-    configs_json="["
-    local first_cfg=1
-    ngx_av="/etc/nginx/sites-available/$pkg"
-    ngx_en="/etc/nginx/sites-enabled/$pkg"
-    lr="/etc/logrotate.d/${pkg}.conf"
-    [[ -f "/etc/logrotate.d/$pkg" && ! -f "$lr" ]] && lr="/etc/logrotate.d/$pkg"
-    sudoers="/etc/sudoers.d/$pkg"
-    # check_configs(): WARN только когда nginx-конфиг есть в sites-available,
-    # но не включён в sites-enabled (logrotate/sudoers в текстовом режиме
-    # никогда не WARN'ят на отсутствие).
-    if [[ $is_infra -eq 0 && -f "$ngx_av" && ! -e "$ngx_en" && ! -L "$ngx_en" ]]; then
-        _json_pkg_issue warning nginx_not_enabled "nginx: $ngx_en not enabled"
-    fi
-    for pair in "nginx:$ngx_av" "nginx:$ngx_en" "logrotate:$lr" "sudoers:$sudoers"; do
-        local svc="${pair%%:*}" path="${pair#*:}" st="missing"
-        [[ -e "$path" || -L "$path" ]] && st="ok"
-        [[ "$path" == "$ngx_en" && ( -e "$path" || -L "$path" ) ]] && st="enabled"
-        [[ $first_cfg -eq 1 ]] || configs_json+=","
-        first_cfg=0
-        configs_json+=$(printf '{"service_name":"%s","path":"%s","status":"%s"}' \
-            "$(_json_esc "$svc")" "$(_json_esc "$path")" "$(_json_esc "$st")")
-    done
-    configs_json+="]"
-
-    # ps_lines → JSON array
-    local ps_json="[" pl first_ps=1
-    while IFS= read -r pl; do
-        [[ -z "$pl" ]] && continue
-        [[ $first_ps -eq 1 ]] || ps_json+=","
-        first_ps=0
-        ps_json+=$(printf '"%s"' "$(_json_esc "$pl")")
-    done <<< "$ps_lines"
-    ps_json+="]"
-
-    # pids → JSON array
-    local pids_json="[" first_pid=1 pid
-    if [[ -n "$pids" ]]; then
-        IFS=',' read -ra _pids <<< "$pids"
-        for pid in "${_pids[@]}"; do
-            [[ "$pid" =~ ^[0-9]+$ ]] || continue
-            [[ $first_pid -eq 1 ]] || pids_json+=","
-            first_pid=0
-            pids_json+="$pid"
-        done
-    fi
-    pids_json+="]"
-
-    printf '{'
-    printf '"name":"%s",' "$(_json_esc "$pkg")"
-    printf '"status":"%s",' "$(_json_esc "$status")"
-    printf '"version":"%s",' "$(_json_esc "$ver")"
-    printf '"depends_meta":%s,' "$(_json_arr_from_csv "$deps_meta")"
-    printf '"depends_pm":%s,' "$(_json_arr_from_csv "$deps_pm")"
-    printf '"systemd":{"unit_path":"%s","service_name":"%s","status":"%s"},' \
-        "$(_json_esc "$unit_path")" "$(_json_esc "$unit")" "$(_json_esc "$active")"
-    printf '"directories":['
-    printf '{"type":"opt","path":"%s","owner":"%s","status":"%s"},' \
-        "$(_json_esc "$opt_path")" "$(_json_esc "$opt_owner")" "$(_json_esc "$opt_status")"
-    printf '{"type":"log","path":"%s","owner":"%s","status":"%s"}' \
-        "$(_json_esc "$log_path")" "$(_json_esc "$log_owner")" "$(_json_esc "$log_status")"
-    printf '],'
-    printf '"configs":%s,' "$configs_json"
-    printf '"process":{"status":"%s","pids":%s,"ps_lines":%s},' \
-        "$(_json_esc "$proc_status")" "$pids_json" "$ps_json"
-    printf '"ports":%s,' "$ports_json"
-    printf '"api":{"url":"%s","status_code":%s,"status":"%s"}' \
-        "$(_json_esc "$api_url")" "${api_code:-0}" "$(_json_esc "$api_status")"
-    printf '}'
     return 0
 }
 
-_json_collect_system() {
-    local cpu_pct=0 mem_total=0 mem_used=0 mem_avail=0
-    local up_sec=0
-    # _sys_cpu_via_procstat() сама делает init-вызов без $(...) (иначе дельта
-    # /proc/stat теряется вместе с субшеллом, и результат всегда 0) — не дублируем
-    # эту логику здесь, а переиспользуем уже проверенный замер.
-    cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
-    [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
-    if [[ "$cpu_pct" -eq 0 ]]; then
-        # Один замер за 0.5s-окно может честно попасть на затишье между
-        # всплесками — берём соседнее окно ещё раз, прежде чем поверить в 0%.
-        cpu_pct=$(_sys_cpu_via_procstat 2>/dev/null) || cpu_pct=0
-        [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
-    fi
-
-    if [[ -r /proc/meminfo ]]; then
-        mem_total=$(awk '/MemTotal:/{printf "%d",$2/1024}' /proc/meminfo)
-        mem_avail=$(awk '/MemAvailable:/{printf "%d",$2/1024}' /proc/meminfo)
-        [[ -z "$mem_avail" || "$mem_avail" == "0" ]] && mem_avail=$(awk '/MemFree:/{printf "%d",$2/1024}' /proc/meminfo)
-        mem_used=$((mem_total - mem_avail))
-        [[ "$mem_used" -lt 0 ]] && mem_used=0
-    fi
-    up_sec=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
-
-    # disk
-    local disk_json="[" first=1 fs mount usep
-    while read -r fs _ _ _ usep mount; do
-        [[ "$fs" == Filesystem* || "$fs" == "tmpfs" || "$fs" == "devtmpfs" ]] && continue
-        [[ "$mount" == "/proc"* || "$mount" == "/sys"* || "$mount" == "/run"* ]] && continue
-        usep="${usep%%%}"
-        [[ "$usep" =~ ^[0-9]+$ ]] || continue
-        [[ $first -eq 1 ]] || disk_json+=","
-        first=0
-        disk_json+=$(printf '{"filesystem":"%s","mount":"%s","used_percent":%s}' \
-            "$(_json_esc "$fs")" "$(_json_esc "$mount")" "$usep")
-    done < <(df -P 2>/dev/null | awk 'NR>1{print $1,$2,$3,$4,$5,$6}')
-    disk_json+="]"
-
-    # network (упрощённо: интерфейсы без замера sleep — mbps=0.0; полный замер дорог для JSON-пути)
-    local net_json="[" first=1 iface
-    for iface in /sys/class/net/*; do
-        iface=$(basename "$iface")
-        [[ "$iface" == "lo" ]] && continue
-        [[ $first -eq 1 ]] || net_json+=","
-        first=0
-        net_json+=$(printf '{"interface":"%s","mbps":0.0}' "$(_json_esc "$iface")")
-    done
-    net_json+="]"
-
-    # database brief
-    local db_name="n/a" db_status="n/a" db_repl="none" db_nodes=0
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-active --quiet postgresql 2>/dev/null || systemctl is-active --quiet postgresql@* 2>/dev/null; then
-            db_name="postgresql"; db_status="active"; db_nodes=1
-        elif systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysqld 2>/dev/null; then
-            db_name="mariadb"; db_status="active"; db_nodes=1
+# Читает файл слоя в ассоциативный массив с именем $2 (должен быть объявлен
+# и пуст). 0 — файл целый: первая строка updated_at, последняя end.
+_cache_read() {
+    local path="$1" dst="$2" k v first=1 ok=0
+    [[ -s "$path" ]] || return 1
+    while IFS=$'\t' read -r k v; do
+        if [[ $first -eq 1 ]]; then
+            [[ "$k" == updated_at && "$v" =~ ^[0-9]+$ ]] || return 1
+            first=0
         fi
-    fi
-
-    # certificates (пути-кандидаты)
-    local certs_json="[" first=1 cert days subject
-    for cert in /etc/nginx/ssl/*.crt /etc/nginx/ssl/*.pem /opt/flat/cert/*/*.pem /etc/ssl/certs/flat*.pem; do
-        [[ -f "$cert" ]] || continue
-        days=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/notAfter=//' | xargs -I{} date -d {} +%s 2>/dev/null || echo "")
-        if [[ -n "$days" ]]; then
-            days=$(( (days - $(date +%s)) / 86400 ))
-        else
-            days=0
+        if [[ "$k" == end ]]; then
+            ok=1
+            continue
         fi
-        subject=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/subject=//' || echo "")
-        [[ $first -eq 1 ]] || certs_json+=","
-        first=0
-        certs_json+=$(printf '{"path":"%s","subject":"%s","days_left":%s}' \
-            "$(_json_esc "$cert")" "$(_json_esc "$subject")" "$days")
-        [[ $first -eq 0 && ${#certs_json} -gt 2000 ]] && break
-    done
-    certs_json+="]"
-
-    # per-service метрики (cpu/memory % по PID пакета, uptime по systemd-юниту).
-    # Тот же источник PID, что и в _json_collect_pkg()/_sys_pkg_pids(), но
-    # отдельный проход по ВСЕМ установленным пакетам (не зависит от фильтра
-    # --pkg/PACKAGES) — как и остальные системные метрики (disk/network) выше.
-    local svc_cpu_json="[" svc_mem_json="[" svc_uptime_json="["
-    local first_cpu=1 first_mem=1 first_up=1
-    local now_epoch svc_pkg svc_pids svc_pct svc_mem svc_enter svc_name svc_unit svc_ts svc_sec
-    now_epoch=$(date +%s 2>/dev/null)
-    for svc_pkg in "${!PKG_PRODUCT[@]}"; do
-        is_pkg_installed_tiny "$svc_pkg" "${PKG_LEGACY[$svc_pkg]:-}" || continue
-        svc_pids=$(_sys_pkg_pids "$svc_pkg" 2>/dev/null | paste -sd',' - 2>/dev/null)
-        if [[ -n "$svc_pids" ]]; then
-            svc_pct=$(ps -p "$svc_pids" -o pcpu= 2>/dev/null | awk '{s+=$1} END{if(NR) printf "%.1f", s}')
-            if [[ -n "$svc_pct" ]] && awk -v p="$svc_pct" 'BEGIN{exit !(p>0)}' 2>/dev/null; then
-                [[ $first_cpu -eq 1 ]] || svc_cpu_json+=","
-                first_cpu=0
-                svc_cpu_json+=$(printf '{"service_name":"%s","usage_percent":%s}' "$(_json_esc "$svc_pkg")" "$svc_pct")
-            fi
-            svc_mem=$(ps -p "$svc_pids" -o pmem= 2>/dev/null | awk '{s+=$1} END{if(NR) printf "%.1f", s}')
-            if [[ -n "$svc_mem" ]] && awk -v p="$svc_mem" 'BEGIN{exit !(p>0)}' 2>/dev/null; then
-                [[ $first_mem -eq 1 ]] || svc_mem_json+=","
-                first_mem=0
-                svc_mem_json+=$(printf '{"service_name":"%s","usage_percent":%s}' "$(_json_esc "$svc_pkg")" "$svc_mem")
-            fi
-        fi
-        if command -v systemctl >/dev/null 2>&1 && [[ -n "$now_epoch" ]]; then
-            svc_enter=""
-            while IFS= read -r svc_name; do
-                [[ -z "$svc_name" ]] && continue
-                svc_unit="${svc_name}.service"
-                systemctl is-active --quiet "$svc_unit" 2>/dev/null || continue
-                svc_enter=$(systemctl show "$svc_unit" -p ActiveEnterTimestamp --value 2>/dev/null)
-                [[ -n "$svc_enter" && "$svc_enter" != "n/a" && "$svc_enter" != "0" ]] && break
-            done < <(_sys_pkg_names "$svc_pkg")
-            if [[ -n "$svc_enter" && "$svc_enter" != "n/a" && "$svc_enter" != "0" ]]; then
-                svc_ts=$(date -d "$svc_enter" +%s 2>/dev/null)
-                if [[ -n "$svc_ts" ]]; then
-                    svc_sec=$((now_epoch - svc_ts))
-                    [[ "$svc_sec" -ge 0 ]] || svc_sec=""
-                    if [[ -n "$svc_sec" ]]; then
-                        [[ $first_up -eq 1 ]] || svc_uptime_json+=","
-                        first_up=0
-                        svc_uptime_json+=$(printf '{"service_name":"%s","uptime":%s}' "$(_json_esc "$svc_pkg")" "$svc_sec")
-                    fi
-                fi
-            fi
-        fi
-    done
-    svc_cpu_json+="]"
-    svc_mem_json+="]"
-    svc_uptime_json+="]"
-
-    printf '{'
-    printf '"cpu":{"usage_percent":%s},' "${cpu_pct:-0}"
-    printf '"cpu_services":%s,' "$svc_cpu_json"
-    printf '"memory":{"total_mb":%s,"used_mb":%s,"available_mb":%s},' \
-        "${mem_total:-0}" "${mem_used:-0}" "${mem_avail:-0}"
-    printf '"memory_services":%s,' "$svc_mem_json"
-    printf '"disk":%s,' "$disk_json"
-    printf '"database":{"name":"%s","status":"%s","replication":"%s","nodes":%s},' \
-        "$(_json_esc "$db_name")" "$(_json_esc "$db_status")" "$(_json_esc "$db_repl")" "${db_nodes:-0}"
-    printf '"network":%s,' "$net_json"
-    printf '"uptime_seconds":%s' "${up_sec:-0}"
-    printf '}'
-    # certificates/uptime_services возвращаются через side-file'ы в _JSON_TMP —
-    # тот же паттерн, что certs_json уже использовал: build_health_json() читает
-    # их обратно и печатает на верхнем уровне JSON (uptime_services — там, а не
-    # внутри system{}, как и certificates).
-    printf '%s' "$certs_json" > "${_JSON_TMP}/certificates.json"
-    printf '%s' "$svc_uptime_json" > "${_JSON_TMP}/uptime_services.json"
+        [[ -n "$k" ]] && printf -v "${dst}[$k]" '%s' "$v"
+    done 2>/dev/null < "$path"
+    [[ $ok -eq 1 ]]
 }
 
-_json_collect_infra() {
-    local out="[" first=1 dep status ver port req
-    # важно: не ${!ALL_DEPENDS[@]+...} — hyphen keys (fps-server)
-    for dep in "${!ALL_DEPENDS[@]}"; do
-        status="not_installed"; ver=""; port=""; req="${ALL_DEPENDS[$dep]}"
-        # Статус пакета/библиотеки — тот же источник истины, что и текстовый
-        # === Depends === (is_dep_installed/is_lib_available). Раньше здесь
-        # смотрели только на systemctl, поэтому все обычные пакеты и
-        # библиотеки (libc6, sudo, nodejs, …) всегда получали "unknown",
-        # даже будучи установленными — только реальные systemd-юниты (nginx,
-        # redis, …) когда-либо получали осмысленный статус.
-        if [[ "$dep" == *.so.* ]]; then
-            is_lib_available "$dep" 2>/dev/null && status="installed"
-        else
-            is_dep_installed "$dep" 2>/dev/null && status="installed"
-            ver=$(get_dep_version "$dep" 2>/dev/null || true)
-        fi
-        # Если это ещё и systemd-служба (nginx/mariadb/postgresql/redis/…) —
-        # уточняем состояние поверх "installed": активна она или нет.
-        if command -v systemctl >/dev/null 2>&1; then
-            if systemctl is-active --quiet "$dep" 2>/dev/null; then
-                status="active"
-            elif systemctl status "$dep" &>/dev/null; then
-                status=$(systemctl is-active "$dep" 2>/dev/null || echo inactive)
-            fi
-        fi
-        [[ $first -eq 1 ]] || out+=","
-        first=0
-        out+=$(printf '{"service_name":"%s","status":"%s","version":"%s","port_open":"%s","required_by":"%s"}' \
-            "$(_json_esc "$dep")" "$(_json_esc "$status")" "$(_json_esc "$ver")" "$(_json_esc "$port")" "$(_json_esc "$req")")
+# ==========================================================================
+# Общие проверки (используют full и services)
+# ==========================================================================
+
+# issues[] копятся в строках _ISS_<kind> (JSON-объекты через запятую) и
+# счётчиках _ISS_<kind>_E/_W. kind: static — проверки слоя full (unit-файл,
+# is-enabled, каталоги, nginx), dynamic — проверки, которые обновляет
+# services (is-active, порты, API).
+_issues_reset() {
+    local k
+    for k in "$@"; do
+        printf -v "_ISS_$k" '%s' ''
+        printf -v "_ISS_${k}_E" '%s' 0
+        printf -v "_ISS_${k}_W" '%s' 0
     done
-    out+="]"
-    printf '%s' "$out"
+}
+
+_issue_add() {
+    local kind="$1" sev="$2" pkg="$3" code="$4" msg="$5"
+    local lst="_ISS_$1" cnt e_pkg e_prod e_msg obj
+    _json_esc_to e_pkg "$pkg"
+    _json_esc_to e_prod "${PKG_PRODUCT[$pkg]:-}"
+    _json_esc_to e_msg "$msg"
+    obj="{\"severity\":\"$sev\",\"package\":\"$e_pkg\",\"product\":\"$e_prod\",\"code\":\"$code\",\"message\":\"$e_msg\"}"
+    if [[ -n "${!lst}" ]]; then
+        printf -v "$lst" '%s,%s' "${!lst}" "$obj"
+    else
+        printf -v "$lst" '%s' "$obj"
+    fi
+    if [[ "$sev" == error ]]; then cnt="_ISS_${kind}_E"; else cnt="_ISS_${kind}_W"; fi
+    printf -v "$cnt" '%d' "$(( ${!cnt} + 1 ))"
+}
+
+# Состояние набора systemd-юнитов ОДНИМ вызовом systemctl show (вместо
+# is-active/is-enabled/show MainPID на каждый юнит) → _SD_LOAD/_SD_ACT/
+# _SD_EN/_SD_PID/_SD_ENTER[имя, как передано]. Блоки в выводе идут в том же
+# порядке, что имена в аргументах, через пустую строку. Если число блоков не
+# сошлось (systemctl отверг какое-то имя) — повторяем по одному юниту.
+_SD_PROPS=(-p LoadState -p ActiveState -p UnitFileState -p MainPID -p ActiveEnterTimestamp)
+
+_systemd_parse() {
+    local out="$1" line k v i=0 have=0
+    shift
+    local -a names=("$@")
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+            [[ $have -eq 1 ]] && { i=$((i + 1)); have=0; }
+            continue
+        fi
+        [[ $i -lt ${#names[@]} ]] || return 1
+        k="${line%%=*}"
+        v="${line#*=}"
+        case "$k" in
+            LoadState) _SD_LOAD["${names[i]}"]="$v" ;;
+            ActiveState) _SD_ACT["${names[i]}"]="$v" ;;
+            UnitFileState) _SD_EN["${names[i]}"]="$v" ;;
+            MainPID) _SD_PID["${names[i]}"]="$v" ;;
+            ActiveEnterTimestamp) _SD_ENTER["${names[i]}"]="$v" ;;
+        esac
+        have=1
+    done <<< "$out"
+    [[ $have -eq 1 ]] && i=$((i + 1))
+    [[ $i -eq ${#names[@]} ]]
+}
+
+_systemd_batch() {
+    declare -gA _SD_LOAD=() _SD_ACT=() _SD_EN=() _SD_PID=() _SD_ENTER=()
+    [[ $# -gt 0 ]] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 1
+    local out n
+    out=$(systemctl show "${_SD_PROPS[@]}" -- "$@" 2>/dev/null)
+    [[ -n "$out" ]] || return 1
+    _systemd_parse "$out" "$@" && return 0
+    declare -gA _SD_LOAD=() _SD_ACT=() _SD_EN=() _SD_PID=() _SD_ENTER=()
+    for n in "$@"; do
+        out=$(systemctl show "${_SD_PROPS[@]}" -- "$n" 2>/dev/null)
+        [[ -n "$out" ]] && _systemd_parse "$out" "$n"
+    done
+    return 0
+}
+
+# Слушающие порты — ОДИН вызов ss (или netstat) на весь прогон слоя.
+_ports_snapshot() {
+    _LISTEN=""
+    if command -v ss >/dev/null 2>&1; then
+        _LISTEN=$(ss -lntu 2>/dev/null)
+    elif command -v netstat >/dev/null 2>&1; then
+        _LISTEN=$(netstat -lntu 2>/dev/null)
+    fi
+    _LISTEN+=$'\n'
+}
+
+_port_listening() {
+    local p="${1%%-*}"
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    [[ "$_LISTEN" =~ :${p}[^0-9A-Za-z_] ]]
+}
+
+_unit_path_to() {
+    local d
+    printf -v "$1" '%s' ""
+    for d in /usr/lib/systemd/system /lib/systemd/system /etc/systemd/system; do
+        if [[ -f "$d/$2" ]]; then
+            printf -v "$1" '%s' "$d/$2"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# "PID аргументы" процесса из /proc/<pid>/cmdline — без ps.
+_proc_cmdline_to() {
+    local pid="$2" a s=""
+    while IFS= read -r -d '' a || [[ -n "$a" ]]; do
+        s+="${s:+ }$a"
+    done 2>/dev/null < "/proc/$pid/cmdline"
+    # node и подобные переписывают argv своим именем, добивая пробелами.
+    s="${s%"${s##*[![:space:]]}"}"
+    if [[ -z "$s" ]]; then
+        read -r s 2>/dev/null < "/proc/$pid/comm"
+        s="[$s]"
+    fi
+    printf -v "$1" '%s %s' "$pid" "$s"
+}
+
+# process пакета по списку PID'ов (через запятую): мёртвые и повторы
+# отбрасываются, ps_lines — до 5 строк → _W[pkg.<p>.process], _W[pkg.<p>.pids].
+_pkg_process() {
+    local pkg="$1" pid list="" pl="" n=0 line e st="not running"
+    local -a arr
+    local -A seen=()
+    IFS=',' read -ra arr <<< "$2"
+    for pid in "${arr[@]}"; do
+        [[ "$pid" =~ ^[1-9][0-9]*$ && -z "${seen[$pid]:-}" ]] || continue
+        seen[$pid]=1
+        # Нет процесса или зомби (завершился, но ещё не убран родителем) — не живой.
+        read -r line 2>/dev/null < "/proc/$pid/stat" || continue
+        [[ "${line##*) }" == Z* ]] && continue
+        list+="${list:+,}$pid"
+        if [[ $n -lt 5 ]]; then
+            _proc_cmdline_to line "$pid"
+            _json_esc_to e "$line"
+            pl+="${pl:+,}\"$e\""
+            n=$((n + 1))
+        fi
+    done
+    [[ -n "$list" ]] && st="running"
+    _W["pkg.$pkg.process"]="{\"status\":\"$st\",\"pids\":[$list],\"ps_lines\":[$pl]}"
+    _W["pkg.$pkg.pids"]="$list"
+}
+
+# API-эндпоинт пакета из каталога → _API_URL/_API_CODE/_API_STATUS.
+# 1 — у пакета нет API.
+_api_check() {
+    local pkg="$1" ep="${PKG_API[$1]:-}" ports="${PKG_PORTS[$1]:-}" code
+    _API_URL=""
+    _API_CODE=0
+    _API_STATUS="n/a"
+    [[ -n "$ep" ]] || return 1
+    if [[ "$ep" == http://* || "$ep" == https://* ]]; then
+        _API_URL="$ep"
+    elif [[ -z "$ports" || "$ports" == *","* || "$ports" == *"-"* ]]; then
+        _API_URL="http://localhost$ep"
+    else
+        _API_URL="http://localhost:${ports}$ep"
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "$_API_URL" 2>/dev/null) || true
+        [[ "$code" =~ ^[0-9]{3}$ ]] || code=0
+        _API_CODE=$((10#$code))
+        if [[ $_API_CODE -eq 200 || $_API_CODE -eq 204 ]]; then _API_STATUS="ok"; else _API_STATUS="fail"; fi
+    else
+        _API_STATUS="curl_not_found"
+    fi
+    return 0
+}
+
+# Живая часть пакета: systemd (is-active), порты, API + dynamic-issues →
+# _W[pkg.<p>.systemd|ports|api]. Одна и та же функция у full и services.
+_pkg_dynamic() {
+    local pkg="$1" active="${2:-}" unit="${1}.service" unit_path spec open ports="" e1 e2 e3 is_infra=0
+    local -a specs
+    _is_infrastructure_pkg "$pkg" && is_infra=1
+    [[ -n "$active" ]] || active="unknown"
+    _unit_path_to unit_path "$unit"
+    _json_esc_to e1 "$unit_path"
+    _json_esc_to e2 "$unit"
+    _json_esc_to e3 "$active"
+    _W["pkg.$pkg.systemd"]="{\"unit_path\":\"$e1\",\"service_name\":\"$e2\",\"status\":\"$e3\"}"
+    if [[ $is_infra -eq 0 && -n "$unit_path" && "$active" != "active" ]]; then
+        _issue_add dynamic error "$pkg" systemd_inactive "systemd: $unit is $active"
+    fi
+
+    IFS=',' read -ra specs <<< "${PKG_PORTS[$pkg]:-}"
+    for spec in "${specs[@]}"; do
+        [[ -z "$spec" ]] && continue
+        open="not listening"
+        _port_listening "$spec" && open="listening"
+        [[ "$open" == "not listening" && $is_infra -eq 0 ]] && _issue_add dynamic warning "$pkg" port_not_listening "port: $spec not listening"
+        _json_esc_to e1 "$spec"
+        ports+="${ports:+,}{\"number\":\"$e1\",\"status\":\"$open\"}"
+    done
+    _W["pkg.$pkg.ports"]="[$ports]"
+
+    if _api_check "$pkg"; then
+        [[ "$_API_STATUS" != "ok" && $is_infra -eq 0 ]] && _issue_add dynamic warning "$pkg" api_unhealthy "api: $_API_URL => $_API_STATUS"
+    fi
+    _json_esc_to e1 "$_API_URL"
+    _W["pkg.$pkg.api"]="{\"url\":\"$e1\",\"status_code\":${_API_CODE},\"status\":\"$_API_STATUS\"}"
+}
+
+# /proc-чтение без форков (metrics и системная часть full).
+_pid_stat_to() {   # $1 pid → _PJ (utime+stime, такты), _PSTART (starttime, такты)
+    local line after
+    local -a f
+    _PJ=""
+    _PSTART=0
+    read -r line 2>/dev/null < "/proc/$1/stat" || return 1
+    # comm (2-е поле, в скобках) может содержать пробелы/скобки — режем по
+    # ПОСЛЕДНЕЙ ") ": после неё state — индекс 0, utime/stime — 11/12,
+    # starttime — 19.
+    after="${line##*) }"
+    read -ra f <<< "$after"
+    _PJ=$(( ${f[11]:-0} + ${f[12]:-0} ))
+    _PSTART=${f[19]:-0}
+}
+
+_pid_rss_to() {   # $1 pid → _PRSS (КБ, VmRSS)
+    local line
+    _PRSS=0
+    while IFS= read -r line; do
+        if [[ "$line" == VmRSS:* ]]; then
+            line="${line#VmRSS:}"
+            _PRSS="${line//[^0-9]/}"
+            _PRSS="${_PRSS:-0}"
+            return 0
+        fi
+    done 2>/dev/null < "/proc/$1/status"
+    return 1
+}
+
+_meminfo_read() {   # → _MEM_TOTAL_KB, _MEM_AVAIL_KB
+    local key val free=0
+    _MEM_TOTAL_KB=0
+    _MEM_AVAIL_KB=0
+    while IFS=':' read -r key val; do
+        val="${val//[^0-9]/}"
+        [[ -z "$val" ]] && continue
+        case "$key" in
+            MemTotal) _MEM_TOTAL_KB="$val" ;;
+            MemFree) free="$val" ;;
+            MemAvailable) _MEM_AVAIL_KB="$val" ;;
+        esac
+    done 2>/dev/null < /proc/meminfo
+    [[ "$_MEM_AVAIL_KB" -gt 0 ]] || _MEM_AVAIL_KB=$free
+}
+
+_x10_fmt_to() { printf -v "$1" '%d.%d' "$(( $2 / 10 ))" "$(( $2 % 10 ))"; }
+_x100_fmt_to() { printf -v "$1" '%d.%02d' "$(( $2 / 100 ))" "$(( $2 % 100 ))"; }
+
+# Число ядер — по строкам cpuN в /proc/stat (те же ядра, из которых
+# складывается общий CPU хоста).
+_cpu_cores_detect() {
+    local line n=0
+    while read -r line _; do
+        [[ "$line" == cpu[0-9]* ]] && n=$((n + 1))
+    done 2>/dev/null < /proc/stat
+    [[ $n -gt 0 ]] || n=1
+    _CPU_CORES=$n
 }
 
 _json_collect_repos() {
@@ -1320,165 +1196,779 @@ _json_collect_repos() {
     printf '%s' "$out"
 }
 
-# Полный снимок JSON v2 → stdout
-build_health_json() {
-    local products_list=()
-    local p pkg product_json packages_json first_prod=1 first_pkg
-    local ts system_json infra_json repos_json certs_json uptime_services_json issues_json
-    local pkg_filter="${PACKAGES:-}"
+# ==========================================================================
+# Слой full — полное обнаружение, пишет ВЕСЬ кеш (full.cache)
+# ==========================================================================
+# Только здесь: какие пакеты установлены, версии, зависимости, поиск
+# процессов (pgrep), is-enabled, unit-файлы, каталоги, конфиги,
+# infrastructure (установлена ли, версия), диски, БД, сертификаты, uptime.
+# Заодно — начальные значения живых частей (is-active, порты, API, CPU/RAM),
+# чтобы кеш был полным сразу; дальше их обновляют services и metrics.
 
-    _JSON_TMP=$(mktemp -d "${TMPDIR:-/tmp}/flat_json.XXXXXX") || return 1
-    _json_ensure_identity
-    detect_os >/dev/null 2>&1 || detect_os
+# Все установленные в системе пакеты с версиями — ОДНИМ запросом к
+# пакетному менеджеру (вместо dpkg-query на каждую из ~100 записей каталога).
+_pm_snapshot() {
+    declare -gA _PM_VER=()
+    _PM_SNAP=0
+    local name st ver
+    case "$PM" in
+        dpkg)
+            while IFS=$'\t' read -r name st ver; do
+                [[ "$st" == "install ok installed" ]] && _PM_VER["$name"]="$ver"
+            done < <(dpkg-query -W -f='${Package}\t${Status}\t${Version}\n' 2>/dev/null)
+            ;;
+        rpm)
+            while IFS=$'\t' read -r name ver; do
+                [[ -n "$name" ]] && _PM_VER["$name"]="$ver"
+            done < <(rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n' 2>/dev/null)
+            ;;
+        pacman)
+            while read -r name ver; do
+                [[ -n "$name" ]] && _PM_VER["$name"]="$ver"
+            done < <(pacman -Q 2>/dev/null)
+            ;;
+        *) return 1 ;;
+    esac
+    _PM_SNAP=1
+}
 
-    ERRORS=0; WARNINGS=0; INSTALLED=0; NOT_INSTALLED=0
-    # -g обязателен: без него `declare -A` внутри функции создаёт ЛОКАЛЬНУЮ
-    # переменную, а глобальный ALL_DEPENDS (объявлен -A в разделе 0) остаётся
-    # unset после return — тогда register_dep() увидит его как обычный
-    # индексированный массив и попытается вычислить "$dep" арифметически
-    # (bash: arr[идентификатор] без -A трактуется как арифметика), что на
-    # дефисных именах вида "fss-frontend" падает под set -u: "fss: unbound variable".
-    declare -gA ALL_DEPENDS=()
-
-    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    system_json=$(_json_collect_system)
-    certs_json=$(cat "${_JSON_TMP}/certificates.json" 2>/dev/null || echo '[]')
-    uptime_services_json=$(cat "${_JSON_TMP}/uptime_services.json" 2>/dev/null || echo '[]')
-
-    if [[ -n "${FLAT_PRODUCTS_ORDER+x}" && ${#FLAT_PRODUCTS_ORDER[@]} -gt 0 ]]; then
-        products_list=("${FLAT_PRODUCTS_ORDER[@]}")
-    else
-        products_list=("AutoCallServer" "BSS" "Click to Call" "Contact Center" "Device Manager" "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS" "LDAP" "SBC" "Portal" "flat-file" "FVSC" "Infrastructure")
-    fi
-    if [[ -n "$FILTER_PRODUCT" ]]; then
-        products_list=("$FILTER_PRODUCT")
-    fi
-
-    printf '{'
-    printf '"timestamp":"%s",' "$(_json_esc "$ts")"
-    printf '"host_id":"%s",' "$(_json_esc "$HOST_ID")"
-    printf '"host_ip":"%s",' "$(_json_esc "$HOST_IP")"
-    printf '"service_name":"%s",' "$(_json_esc "$SERVICE_NAME")"
-    printf '"script_version":"%s",' "$(_json_esc "$SCRIPT_VERSION")"
-    printf '"os":"%s",' "$(_json_esc "${OS_FULL_VER:-${OS_NAME:-unknown}}")"
-    printf '"package_manager":"%s",' "$(_json_esc "${PM:-unknown}")"
-
-    printf '"products":['
-    first_prod=1
-    for p in "${products_list[@]}"; do
-        packages_json="["
-        first_pkg=1
-        local product_pkgs=()
-        for pkg in "${!PKG_PRODUCT[@]}"; do
-            [[ "${PKG_PRODUCT[$pkg]}" == "$p" ]] || continue
-            if [[ -n "$SINGLE_PKG" && "$pkg" != "$SINGLE_PKG" ]]; then
-                continue
-            fi
-            if [[ -n "$pkg_filter" ]]; then
-                [[ ",${pkg_filter}," == *",$pkg,"* ]] || continue
-            fi
-            product_pkgs+=("$pkg")
-        done
-        if ((${#product_pkgs[@]} > 0)); then
-            local sorted
-            sorted=$(printf '%s\n' "${product_pkgs[@]}" | sort)
-            product_pkgs=()
-            while IFS= read -r pkg; do
-                [[ -n "$pkg" ]] && product_pkgs+=("$pkg")
-            done <<< "$sorted"
+# Установлен ли пакет каталога (основное имя или legacy) → _PKGVER.
+# Как и раньше: нет в пакетном менеджере, но есть unit-файл — считается
+# установленным (has_any_trace), версия тогда пустая.
+_pkg_installed() {
+    local pkg="$1" old
+    local -a olds
+    _PKGVER=""
+    if [[ $_PM_SNAP -eq 1 ]]; then
+        if [[ -n "${_PM_VER[$pkg]+x}" ]]; then
+            _PKGVER="${_PM_VER[$pkg]}"
+            return 0
         fi
-        for pkg in ${product_pkgs[@]+"${product_pkgs[@]}"}; do
-            local pj
-            # $() - subshell: INSTALLED++ внутри _json_collect_pkg не доходит сюда
-            pj=$(_json_collect_pkg "$pkg") || continue
-            if [[ "$pj" == *'"status":"installed"'* ]]; then
-                INSTALLED=$((INSTALLED + 1))
+        IFS=',' read -ra olds <<< "${PKG_LEGACY[$pkg]:-}"
+        for old in "${olds[@]}"; do
+            old="${old// /}"
+            if [[ -n "$old" && -n "${_PM_VER[$old]+x}" ]]; then
+                _PKGVER="${_PM_VER[$old]}"
+                return 0
             fi
-            # Регистрация deps для infra: и meta (PKG_DEPS), и реальные PM-deps —
-            # как в текстовом пути (_register_pkg_deps/check_single_pkg), иначе
-            # "infrastructure" в JSON видит только явно прописанные в каталоге
-            # зависимости и пропускает всё, что реально тянет пакетный менеджер
-            # (libc6, libssl3, redis, sudo, …), которые есть в "=== Depends ===".
-            _register_pkg_deps "$pkg" 2>/dev/null || true
-            [[ $first_pkg -eq 1 ]] || packages_json+=","
-            first_pkg=0
-            packages_json+="$pj"
         done
-        packages_json+="]"
-        # пустые продукты в JSON не включаем (даже при --pkg)
-        [[ "$packages_json" == "[]" ]] && continue
-        [[ $first_prod -eq 1 ]] || printf ','
-        first_prod=0
-        printf '{"name":"%s","packages":%s}' "$(_json_esc "$p")" "$packages_json"
-    done
-    printf '],'
+        has_any_trace "$pkg"
+        return
+    fi
+    is_pkg_installed_tiny "$pkg" "${PKG_LEGACY[$pkg]:-}" || return 1
+    _PKGVER=$(_pkg_version "$pkg")
+    return 0
+}
 
-    # issues[]: сайд-файл собран построчно в _json_pkg_issue() (см. её
-    # комментарий) — здесь читаем обратно, считаем severity и заодно
-    # получаем summary.errors/summary.warnings из того же источника, что и
-    # сам список находок (единый источник правды вместо двух параллельных).
-    issues_json='[]'
-    if [[ -f "${_JSON_TMP}/pkg_issues.ndjson" ]]; then
-        issues_json="[$(paste -sd',' "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null)]"
-        local issue_warnings issue_errors
-        issue_warnings=$(grep -c '"severity":"warning"' "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null) || issue_warnings=0
-        issue_errors=$(grep -c '"severity":"error"' "${_JSON_TMP}/pkg_issues.ndjson" 2>/dev/null) || issue_errors=0
-        WARNINGS=$((WARNINGS + issue_warnings))
-        ERRORS=$((ERRORS + issue_errors))
+_full_collect_pkg() {
+    local pkg="$1" ver="$2" is_infra=0 unit="${1}.service" unit_path enabled
+    local e_pkg e_ver dm dp deps_pm d pids
+    local opt_path="/opt/flat/$1" log_path="/var/log/flat/$1"
+    local opt_owner="" log_owner="" opt_status="missing" log_status="missing"
+    local -a arr
+    _is_infrastructure_pkg "$pkg" && is_infra=1
+
+    deps_pm=$(get_pkg_depends "$pkg" 2>/dev/null)
+    dm=$(_json_arr_from_csv "${PKG_DEPS[$pkg]:-}")
+    dp=$(_json_arr_from_csv "$deps_pm")
+    _json_esc_to e_pkg "$pkg"
+    _json_esc_to e_ver "$ver"
+    _W["pkg.$pkg.static"]="\"name\":\"$e_pkg\",\"status\":\"installed\",\"version\":\"$e_ver\",\"depends_meta\":$dm,\"depends_pm\":$dp"
+    # Зависимости для infrastructure — те же данные, второй раз не считаем.
+    IFS=',' read -ra arr <<< "${PKG_DEPS[$pkg]:-},${deps_pm}"
+    for d in "${arr[@]}"; do
+        register_dep "$d" "$pkg"
+    done
+
+    # systemd: unit-файл и is-enabled — здесь; is-active — в _pkg_dynamic.
+    _unit_path_to unit_path "$unit"
+    enabled="${_SD_EN[$unit]:-}"
+    [[ -n "$enabled" ]] || enabled="unknown"
+    if [[ $is_infra -eq 0 ]]; then
+        if [[ -z "$unit_path" ]]; then
+            _issue_add static warning "$pkg" systemd_unit_missing "systemd unit: $unit not found"
+        elif [[ "$enabled" != "enabled" ]]; then
+            _issue_add static error "$pkg" systemd_disabled "systemd: $unit is $enabled"
+        fi
     fi
 
-    infra_json=$(_json_collect_infra)
-    repos_json='[]'
-    [[ $SHOW_REPO -eq 1 || $SHOW_REPOS_JSON -eq 1 ]] && repos_json=$(_json_collect_repos)
+    # Поиск процессов (pgrep + MainPID) — только в full.
+    pids=$(_sys_pkg_pids "$pkg" 2>/dev/null | paste -sd',' - 2>/dev/null)
+    _pkg_process "$pkg" "$pids"
 
-    printf '"infrastructure":%s,' "$infra_json"
-    printf '"repositories":%s,' "$repos_json"
-    printf '"apt_priorities":[],'
-    printf '"summary":{"installed":%s,"errors":%s,"warnings":%s},' \
-        "${INSTALLED:-0}" "${ERRORS:-0}" "${WARNINGS:-0}"
-    printf '"system":%s,' "$system_json"
-    printf '"certificates":%s,' "$certs_json"
-    printf '"uptime_services":%s,' "$uptime_services_json"
-    printf '"issues":%s' "$issues_json"
-    printf '}\n'
+    # Каталоги FLAT (у Infrastructure — системные пакеты без /opt/flat).
+    if [[ $is_infra -eq 1 ]]; then
+        opt_status="n/a"; log_status="n/a"; opt_path=""; log_path=""
+    else
+        if [[ -d "$opt_path" ]]; then
+            opt_status="ok"
+            opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null)
+        else
+            _issue_add static warning "$pkg" opt_dir_missing "dir: $opt_path missing"
+        fi
+        if [[ -d "$log_path" ]]; then
+            log_status="ok"
+            log_owner=$(stat -c '%U:%G' "$log_path" 2>/dev/null)
+        elif [[ -n "${_W[pkg.$pkg.pids]}" ]]; then
+            _issue_add static warning "$pkg" log_dir_missing "logdir: $log_path missing (process active)"
+        fi
+    fi
+    local e_op e_oo e_lp e_lo
+    _json_esc_to e_op "$opt_path"; _json_esc_to e_oo "$opt_owner"
+    _json_esc_to e_lp "$log_path"; _json_esc_to e_lo "$log_owner"
+    _W["pkg.$pkg.dirs"]="[{\"type\":\"opt\",\"path\":\"$e_op\",\"owner\":\"$e_oo\",\"status\":\"$opt_status\"},{\"type\":\"log\",\"path\":\"$e_lp\",\"owner\":\"$e_lo\",\"status\":\"$log_status\"}]"
 
-    rm -rf -- "$_JSON_TMP" 2>/dev/null
+    # Конфиги: WARN только когда nginx-конфиг есть в sites-available, но не
+    # включён в sites-enabled (logrotate/sudoers не WARN'ят на отсутствие).
+    local ngx_av="/etc/nginx/sites-available/$pkg" ngx_en="/etc/nginx/sites-enabled/$pkg"
+    local lr="/etc/logrotate.d/${pkg}.conf" sudoers="/etc/sudoers.d/$pkg" cfg="" pair svc path st e
+    [[ -f "/etc/logrotate.d/$pkg" && ! -f "$lr" ]] && lr="/etc/logrotate.d/$pkg"
+    if [[ $is_infra -eq 0 && -f "$ngx_av" && ! -e "$ngx_en" && ! -L "$ngx_en" ]]; then
+        _issue_add static warning "$pkg" nginx_not_enabled "nginx: $ngx_en not enabled"
+    fi
+    for pair in "nginx:$ngx_av" "nginx:$ngx_en" "logrotate:$lr" "sudoers:$sudoers"; do
+        svc="${pair%%:*}"
+        path="${pair#*:}"
+        st="missing"
+        [[ -e "$path" || -L "$path" ]] && st="ok"
+        [[ "$path" == "$ngx_en" && "$st" == "ok" ]] && st="enabled"
+        _json_esc_to e "$path"
+        cfg+="${cfg:+,}{\"service_name\":\"$svc\",\"path\":\"$e\",\"status\":\"$st\"}"
+    done
+    _W["pkg.$pkg.configs"]="[$cfg]"
+
+    _pkg_dynamic "$pkg" "${_SD_ACT[$unit]:-}"
+}
+
+# system (кроме того, что потом обновляет metrics — его начальные значения
+# тоже здесь), certificates, uptime_services.
+_full_collect_system() {
+    local now="$1" cpu mem_total mem_used mem_avail up_sec=0 line pkg pid e
+    local -a arr
+
+    cpu=$(_sys_cpu_via_procstat 2>/dev/null) || cpu=0
+    [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
+    _W[system.cpu]="{\"usage_percent\":$cpu,\"cores\":${_CPU_CORES:-1}}"
+
+    _meminfo_read
+    mem_total=$(( _MEM_TOTAL_KB / 1024 ))
+    mem_avail=$(( _MEM_AVAIL_KB / 1024 ))
+    mem_used=$(( mem_total - mem_avail ))
+    [[ $mem_used -lt 0 ]] && mem_used=0
+    _W[system.memory]="{\"total_mb\":$mem_total,\"used_mb\":$mem_used,\"available_mb\":$mem_avail}"
+
+    read -r line _ 2>/dev/null < /proc/uptime && up_sec="${line%%.*}"
+    [[ "$up_sec" =~ ^[0-9]+$ ]] || up_sec=0
+    _W[system.uptime_seconds]="$up_sec"
+
+    # CPU/RAM по сервисам: среднее с момента старта процесса — через /proc без
+    # ps. CPU — доля от ВСЕГО хоста (все ядра), как system.cpu и память, а не
+    # от одного ядра, как %CPU в top. Через METRICS_INTERVAL их заменит
+    # реальная нагрузка от metrics.
+    local cpu_s="" mem_s="" j tot start_ticks up_ticks=$(( up_sec * ${_DAEMON_CLK_TCK:-100} )) cx mx rss v
+    for pkg in "${_FULL_PKGS[@]}"; do
+        IFS=',' read -ra arr <<< "${_W[pkg.$pkg.pids]:-}"
+        cx=0
+        rss=0
+        for pid in "${arr[@]}"; do
+            _pid_stat_to "$pid" || continue
+            j=$_PJ
+            start_ticks=$_PSTART
+            tot=$(( up_ticks - start_ticks ))
+            [[ $tot -gt 0 ]] && cx=$(( cx + j * 10000 / (tot * ${_CPU_CORES:-1}) ))
+            _pid_rss_to "$pid" && rss=$(( rss + _PRSS ))
+        done
+        if [[ $cx -gt 0 ]]; then
+            _x100_fmt_to v "$cx"
+            cpu_s+="${cpu_s:+,}{\"service_name\":\"$pkg\",\"usage_percent\":$v}"
+        fi
+        mx=0
+        [[ $rss -gt 0 && $_MEM_TOTAL_KB -gt 0 ]] && mx=$(( rss * 1000 / _MEM_TOTAL_KB ))
+        if [[ $mx -gt 0 ]]; then
+            _x10_fmt_to v "$mx"
+            mem_s+="${mem_s:+,}{\"service_name\":\"$pkg\",\"usage_percent\":$v}"
+        fi
+    done
+    _W[system.cpu_services]="[$cpu_s]"
+    _W[system.memory_services]="[$mem_s]"
+
+    local disk="" fs mount usep
+    while read -r fs _ _ _ usep mount; do
+        [[ "$fs" == Filesystem* || "$fs" == "tmpfs" || "$fs" == "devtmpfs" ]] && continue
+        [[ "$mount" == "/proc"* || "$mount" == "/sys"* || "$mount" == "/run"* ]] && continue
+        usep="${usep%%%}"
+        [[ "$usep" =~ ^[0-9]+$ ]] || continue
+        local e_fs e_mt
+        _json_esc_to e_fs "$fs"
+        _json_esc_to e_mt "$mount"
+        disk+="${disk:+,}{\"filesystem\":\"$e_fs\",\"mount\":\"$e_mt\",\"used_percent\":$usep}"
+    done < <(df -P 2>/dev/null | awk 'NR>1{print $1,$2,$3,$4,$5,$6}')
+    _W[system.disk]="[$disk]"
+
+    # Сеть: здесь только список интерфейсов — скорость считает metrics
+    # (разницей между своими тиками).
+    local net="" iface
+    for iface in /sys/class/net/*; do
+        iface="${iface##*/}"
+        [[ "$iface" == "lo" || "$iface" == "*" ]] && continue
+        _json_esc_to e "$iface"
+        net+="${net:+,}{\"interface\":\"$e\",\"mbps\":0.0}"
+    done
+    _W[system.network]="[$net]"
+
+    local db_name="n/a" db_status="n/a" db_nodes=0
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet postgresql 2>/dev/null || systemctl is-active --quiet 'postgresql@*' 2>/dev/null; then
+            db_name="postgresql"; db_status="active"; db_nodes=1
+        elif systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysqld 2>/dev/null; then
+            db_name="mariadb"; db_status="active"; db_nodes=1
+        fi
+    fi
+    _W[system.database]="{\"name\":\"$db_name\",\"status\":\"$db_status\",\"replication\":\"none\",\"nodes\":$db_nodes}"
+
+    local certs="" cert days subject e_c e_s
+    for cert in /etc/nginx/ssl/*.crt /etc/nginx/ssl/*.pem /opt/flat/cert/*/*.pem /etc/ssl/certs/flat*.pem; do
+        [[ -f "$cert" ]] || continue
+        days=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/notAfter=//' | xargs -I{} date -d {} +%s 2>/dev/null)
+        if [[ "$days" =~ ^[0-9]+$ ]]; then days=$(( (days - now) / 86400 )); else days=0; fi
+        subject=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/subject=//')
+        _json_esc_to e_c "$cert"
+        _json_esc_to e_s "$subject"
+        certs+="${certs:+,}{\"path\":\"$e_c\",\"subject\":\"$e_s\",\"days_left\":$days}"
+        [[ ${#certs} -gt 2000 ]] && break
+    done
+    _W[certificates]="[$certs]"
+}
+
+# uptime_services — по уже полученному общему systemctl show (главное имя
+# пакета и legacy-имена: берётся первый активный юнит).
+_full_collect_uptime() {
+    local now="$1" pkg name enter ts out=""
+    local -a names
+    for pkg in "${_FULL_PKGS[@]}"; do
+        mapfile -t names < <(_sys_pkg_names "$pkg")
+        for name in "${names[@]}"; do
+            [[ "${_SD_ACT[${name}.service]:-}" == "active" ]] || continue
+            enter="${_SD_ENTER[${name}.service]:-}"
+            [[ -n "$enter" && "$enter" != "n/a" && "$enter" != "0" ]] || continue
+            ts=$(date -d "$enter" +%s 2>/dev/null)
+            if [[ "$ts" =~ ^[0-9]+$ && $now -ge $ts ]]; then
+                out+="${out:+,}{\"service_name\":\"$pkg\",\"uptime\":$((now - ts))}"
+            fi
+            break
+        done
+    done
+    _W[uptime_services]="[$out]"
+}
+
+_full_collect_infra() {
+    local d status ver unit e_n e_v e_r list=""
+    local -a deps units=()
+    mapfile -t deps < <(printf '%s\n' "${!ALL_DEPENDS[@]}" | sort)
+    for d in "${deps[@]}"; do
+        [[ -z "$d" || "$d" == *.so.* ]] && continue
+        [[ "$d" =~ ^[A-Za-z0-9@._+-]+$ ]] && units+=("$d")
+    done
+    _systemd_batch "${units[@]}"
+    for d in "${deps[@]}"; do
+        [[ -z "$d" ]] && continue
+        status="not_installed"
+        ver=""
+        unit=0
+        if [[ "$d" == *.so.* ]]; then
+            is_lib_available "$d" 2>/dev/null && status="installed"
+        else
+            if [[ $_PM_SNAP -eq 1 ]]; then
+                [[ -n "${_PM_VER[$d]+x}" ]] && { status="installed"; ver="${_PM_VER[$d]}"; }
+            else
+                is_dep_installed "$d" 2>/dev/null && status="installed"
+                ver=$(get_dep_version "$d" 2>/dev/null)
+            fi
+        fi
+        # Если это ещё и systemd-служба (nginx/postgresql/redis/…) — вместо
+        # installed её состояние (active/inactive/failed), а services
+        # дальше обновляет только его.
+        if [[ "${_SD_LOAD[$d]:-}" == "loaded" && -n "${_SD_ACT[$d]:-}" ]]; then
+            status="${_SD_ACT[$d]}"
+            unit=1
+        fi
+        _json_esc_to e_n "$d"
+        _json_esc_to e_v "$ver"
+        _json_esc_to e_r "${ALL_DEPENDS[$d]}"
+        _W["infra.$d.name"]="\"$e_n\""
+        _W["infra.$d.status"]="$status"
+        _W["infra.$d.rest"]="\"version\":\"$e_v\",\"port_open\":\"\",\"required_by\":\"$e_r\""
+        _W["infra.$d.unit"]="$unit"
+        list+="${list:+ }$d"
+    done
+    _W[infra.list]="$list"
+}
+
+_full_run() {
+    local t0 t1 p pkg i=0 e plist
+    local -a sorted products_list units
+    local -A seen=()
+    _epoch_to t0
+    info "cache: full — старт"
+    detect_os
+    declare -gA _W=() ALL_DEPENDS=()
+    _issues_reset static dynamic
+    _pm_snapshot
+
+    # Установленные пакеты: продукты в фиксированном порядке, внутри — по
+    # алфавиту; фильтры PACKAGES/PRODUCT действуют здесь, и services с
+    # metrics берут этот же список (раньше services их игнорировал).
+    mapfile -t sorted < <(printf '%s\n' "${!PKG_PRODUCT[@]}" | sort)
+    products_list=("${FLAT_PRODUCTS_ORDER[@]}")
+    [[ -n "$FILTER_PRODUCT" ]] && products_list=("$FILTER_PRODUCT")
+    _FULL_PKGS=()
+    declare -A pkg_ver=() prod_pkgs=()
+    for p in "${products_list[@]}"; do
+        for pkg in "${sorted[@]}"; do
+            [[ "${PKG_PRODUCT[$pkg]}" == "$p" ]] || continue
+            [[ -n "$SINGLE_PKG" && "$pkg" != "$SINGLE_PKG" ]] && continue
+            [[ -n "$PACKAGES" && ",${PACKAGES}," != *",$pkg,"* ]] && continue
+            _pkg_installed "$pkg" || continue
+            pkg_ver[$pkg]="$_PKGVER"
+            prod_pkgs[$p]+="${prod_pkgs[$p]:+ }$pkg"
+            _FULL_PKGS+=("$pkg")
+        done
+    done
+
+    # Один systemctl show на все юниты пакетов (включая legacy-имена — для
+    # uptime_services) вместо 2–4 вызовов systemctl на каждый пакет.
+    units=()
+    for pkg in "${_FULL_PKGS[@]}"; do
+        while IFS= read -r e; do
+            [[ -n "$e" && -z "${seen[$e]:-}" ]] || continue
+            seen[$e]=1
+            units+=("${e}.service")
+        done < <(_sys_pkg_names "$pkg")
+    done
+    _systemd_batch "${units[@]}"
+    _ports_snapshot
+
+    for p in "${products_list[@]}"; do
+        plist="${prod_pkgs[$p]:-}"
+        [[ -n "$plist" ]] || continue
+        for pkg in $plist; do
+            _full_collect_pkg "$pkg" "${pkg_ver[$pkg]}"
+        done
+        _json_esc_to e "$p"
+        _W["product.$i.name"]="\"$e\""
+        _W["product.$i.pkgs"]="$plist"
+        i=$((i + 1))
+    done
+    _W[products.count]="$i"
+    _W[pkgs]="${_FULL_PKGS[*]}"
+
+    _full_collect_system "$t0"
+    _full_collect_uptime "$t0"
+    _full_collect_infra
+
+    _json_esc_to e "$SCRIPT_VERSION"; _W[script_version]="\"$e\""
+    _json_esc_to e "${OS_FULL_VER:-${OS_NAME:-unknown}}"; _W[os]="\"$e\""
+    _json_esc_to e "${PM:-unknown}"; _W[package_manager]="\"$e\""
+    if [[ $SHOW_REPO -eq 1 || $SHOW_REPOS_JSON -eq 1 ]]; then
+        _W[repositories]=$(_json_collect_repos)
+    else
+        _W[repositories]="[]"
+    fi
+    _W[issues.static]="$_ISS_static"
+    _W[issues.static.count]="$_ISS_static_E $_ISS_static_W"
+    _W[issues.dynamic]="$_ISS_dynamic"
+    _W[issues.dynamic.count]="$_ISS_dynamic_E $_ISS_dynamic_W"
+    _W[updated_at]="$t0"
+
+    if _cache_write "$_CACHE_FULL" 1; then
+        _epoch_to t1
+        info "cache: full — готово: пакетов ${#_FULL_PKGS[@]}, за $((t1 - t0)) с"
+    else
+        fail "cache: full — не удалось записать $_CACHE_FULL"
+        return 1
+    fi
+}
+
+# ==========================================================================
+# Слой services — живые статусы по списку пакетов из full.cache
+# ==========================================================================
+# Каталог НЕ сканирует. На весь прогон: один systemctl show (is-active и
+# MainPID всех юнитов пакетов и служб-зависимостей), один ss; плюс curl на
+# каждый пакет с API. PID'ы: найденные full'ом (если ещё живы) + свежий
+# MainPID — так metrics переживает перезапуск сервиса без ожидания full.
+_services_run() {
+    local t0 pkg d pids mp
+    local -a pkgs deps units=()
+    _epoch_to t0
+    declare -gA _F=() _W=()
+    _cache_read "$_CACHE_FULL" _F || return 1
+    _issues_reset dynamic
+    read -ra pkgs <<< "${_F[pkgs]:-}"
+    read -ra deps <<< "${_F[infra.list]:-}"
+    for pkg in "${pkgs[@]}"; do
+        units+=("${pkg}.service")
+    done
+    for d in "${deps[@]}"; do
+        [[ "${_F[infra.$d.unit]:-0}" == 1 ]] && units+=("$d")
+    done
+    _systemd_batch "${units[@]}"
+    _ports_snapshot
+
+    for pkg in "${pkgs[@]}"; do
+        pids="${_F[pkg.$pkg.pids]:-}"
+        mp="${_SD_PID[${pkg}.service]:-0}"
+        [[ "$mp" =~ ^[1-9][0-9]*$ ]] && pids+="${pids:+,}$mp"
+        _pkg_process "$pkg" "$pids"
+        _pkg_dynamic "$pkg" "${_SD_ACT[${pkg}.service]:-}"
+    done
+    for d in "${deps[@]}"; do
+        [[ "${_F[infra.$d.unit]:-0}" == 1 && "${_SD_LOAD[$d]:-}" == "loaded" && -n "${_SD_ACT[$d]:-}" ]] || continue
+        _W["infra.$d.status"]="${_SD_ACT[$d]}"
+    done
+    _W[issues.dynamic]="$_ISS_dynamic"
+    _W[issues.dynamic.count]="$_ISS_dynamic_E $_ISS_dynamic_W"
+    _W[updated_at]="$t0"
+    _cache_write "$_CACHE_SERVICES" 1 || { fail "cache: services — не удалось записать $_CACHE_SERVICES"; return 1; }
+}
+
+# ==========================================================================
+# Слой metrics — CPU/RAM/сеть из /proc, без единого внешнего процесса
+# ==========================================================================
+# Работает в основном процессе демона (не в фоне): разницы между тиками
+# (_MET_*) живут в памяти этого процесса. PID'ы — из склеенного кеша (full
+# или services, кто свежее).
+
+_metrics_init() {
+    _DAEMON_CLK_TCK=$(getconf CLK_TCK 2>/dev/null)
+    [[ "$_DAEMON_CLK_TCK" =~ ^[0-9]+$ && "$_DAEMON_CLK_TCK" -gt 0 ]] || _DAEMON_CLK_TCK=100
+    _cpu_cores_detect
+    declare -gA _MET_PID_J=() _MET_NET_PREV=()
+    _MET_CPU_PREV_TOTAL=0
+    _MET_CPU_PREV_IDLE=0
+    # Первый замер — только база для разниц, его результат не используется.
+    _met_cpu_total
+    _met_network
+    _epoch_to _MET_PREV_EPOCH
+}
+
+# Время между тиками берётся из самого /proc/stat (_MET_DT — сумма тактов
+# всех ядер), как у top: целые секунды часов дают при интервале 2–5 с
+# погрешность в десятки процентов.
+_met_cpu_total() {   # → _MET_CPU (%), _MET_DT (такты всех ядер с прошлого вызова)
+    local line total=0 i idle dt di
+    local -a f
+    _MET_CPU=0
+    _MET_DT=0
+    read -r line 2>/dev/null < /proc/stat || return 0
+    read -ra f <<< "$line"
+    for ((i = 1; i < ${#f[@]}; i++)); do
+        total=$(( total + ${f[i]:-0} ))
+    done
+    idle=$(( ${f[4]:-0} + ${f[5]:-0} ))
+    dt=$(( total - _MET_CPU_PREV_TOTAL ))
+    di=$(( idle - _MET_CPU_PREV_IDLE ))
+    _MET_CPU_PREV_TOTAL=$total
+    _MET_CPU_PREV_IDLE=$idle
+    [[ $dt -gt 0 ]] || return 0
+    _MET_DT=$dt
+    _MET_CPU=$(( (dt - di) * 100 / dt ))
+}
+
+_met_network() {   # → _MET_NET: [{"interface","mbps"}] по каждому интерфейсу кроме lo
+    local line iface total prev x10 v e out="" dt="${_MET_DT:-0}"
+    local -a f
+    # Время тика в тактах одного ядра × ядра = _MET_DT; нет его — 1 с.
+    [[ $dt -gt 0 ]] || dt=$(( _DAEMON_CLK_TCK * _CPU_CORES ))
+    while IFS= read -r line; do
+        [[ "$line" == *:* ]] || continue
+        iface="${line%%:*}"
+        iface="${iface// /}"
+        [[ -z "$iface" || "$iface" == "lo" ]] && continue
+        read -ra f <<< "${line#*:}"
+        total=$(( ${f[0]:-0} + ${f[8]:-0} ))
+        prev="${_MET_NET_PREV[$iface]:-}"
+        _MET_NET_PREV[$iface]=$total
+        x10=0
+        [[ -n "$prev" && $total -ge $prev ]] && x10=$(( (total - prev) * 80 * _DAEMON_CLK_TCK * _CPU_CORES / (1000000 * dt) ))
+        _x10_fmt_to v "$x10"
+        _json_esc_to e "$iface"
+        out+="${out:+,}{\"interface\":\"$e\",\"mbps\":$v}"
+    done 2>/dev/null < /proc/net/dev
+    _MET_NET="[$out]"
+}
+
+_metrics_run() {
+    local now pkg pid prev cx dj rss mx v cpu_s="" mem_s="" pids have
+    local -a pkgs arr
+    local -A newj=()
+    _epoch_to now
+    _MET_PREV_EPOCH=$now
+
+    _met_cpu_total
+    _meminfo_read
+    _met_network
+
+    read -ra pkgs <<< "${_F[pkgs]:-}"
+    for pkg in "${pkgs[@]}"; do
+        _cget_to pids "pkg.$pkg.pids"
+        IFS=',' read -ra arr <<< "$pids"
+        dj=0
+        rss=0
+        have=0
+        for pid in "${arr[@]}"; do
+            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            _pid_stat_to "$pid" || continue
+            newj[$pid]=$_PJ
+            prev="${_MET_PID_J[$pid]:-}"
+            if [[ -n "$prev" && $_PJ -ge $prev ]]; then
+                dj=$(( dj + _PJ - prev ))
+                have=1
+            fi
+            _pid_rss_to "$pid" && rss=$(( rss + _PRSS ))
+        done
+        # Доля от ВСЕГО хоста (все ядра), в сотых процента: сумма по сервисам
+        # сопоставима с system.cpu, как у памяти.
+        cx=0
+        [[ $_MET_DT -gt 0 ]] && cx=$(( dj * 10000 / _MET_DT ))
+        if [[ $have -eq 1 && $cx -gt 0 ]]; then
+            _x100_fmt_to v "$cx"
+            cpu_s+="${cpu_s:+,}{\"service_name\":\"$pkg\",\"usage_percent\":$v}"
+        fi
+        mx=0
+        [[ $rss -gt 0 && $_MEM_TOTAL_KB -gt 0 ]] && mx=$(( rss * 1000 / _MEM_TOTAL_KB ))
+        if [[ $mx -gt 0 ]]; then
+            _x10_fmt_to v "$mx"
+            mem_s+="${mem_s:+,}{\"service_name\":\"$pkg\",\"usage_percent\":$v}"
+        fi
+    done
+    # Только текущие PID'ы — иначе таблица разниц росла бы бесконечно.
+    _MET_PID_J=()
+    for pid in "${!newj[@]}"; do
+        _MET_PID_J[$pid]=${newj[$pid]}
+    done
+
+    declare -gA _W=()
+    _W[updated_at]="$now"
+    _W[system.cpu]="{\"usage_percent\":$_MET_CPU,\"cores\":$_CPU_CORES}"
+    _W[system.memory]="{\"total_mb\":$(( _MEM_TOTAL_KB / 1024 )),\"used_mb\":$(( (_MEM_TOTAL_KB - _MEM_AVAIL_KB) / 1024 )),\"available_mb\":$(( _MEM_AVAIL_KB / 1024 ))}"
+    _W[system.cpu_services]="[$cpu_s]"
+    _W[system.memory_services]="[$mem_s]"
+    _W[system.network]="$_MET_NET"
+    _cache_write "$_CACHE_METRICS" 0 || warn "cache: metrics — не удалось записать $_CACHE_METRICS"
+    declare -gA _M=()
+    for v in "${!_W[@]}"; do
+        _M[$v]="${_W[$v]}"
+    done
+    _M_TS=$now
+}
+
+# ==========================================================================
+# Склейка кеша (для metrics и курьера)
+# ==========================================================================
+# full.cache и services.cache перечитываются, только когда сменился их
+# updated_at (первая строка файла) — в обычный тик это одно чтение строки.
+_F_TS=""
+_S_TS=""
+_M_TS=""
+
+_cache_refresh() {
+    local k ts=""
+    IFS=$'\t' read -r k ts 2>/dev/null < "$_CACHE_FULL" || ts=""
+    if [[ -z "$ts" || "$ts" != "$_F_TS" ]]; then
+        declare -gA _F=()
+        _F_TS=""
+        if _cache_read "$_CACHE_FULL" _F; then
+            _F_TS="${_F[updated_at]}"
+        else
+            declare -gA _F=()
+        fi
+    fi
+    [[ -n "$_F_TS" ]] || return 1
+
+    ts=""
+    IFS=$'\t' read -r k ts 2>/dev/null < "$_CACHE_SERVICES" || ts=""
+    if [[ -n "$ts" && "$ts" != "$_S_TS" ]]; then
+        declare -gA _S=()
+        _S_TS=""
+        if _cache_read "$_CACHE_SERVICES" _S; then
+            _S_TS="${_S[updated_at]}"
+        else
+            declare -gA _S=()
+        fi
+    fi
+    _USE_S=0
+    [[ -n "$_S_TS" && $_S_TS -ge $_F_TS ]] && _USE_S=1
+    _USE_M=0
+    [[ -n "$_M_TS" && $_M_TS -ge $_F_TS ]] && _USE_M=1
+    return 0
+}
+
+# Значение ключа из самого свежего слоя, где он есть ($3 — по умолчанию).
+_cget_to() {
+    local k="$2"
+    if [[ $_USE_M -eq 1 && -n "${_M[$k]+x}" ]]; then
+        printf -v "$1" '%s' "${_M[$k]}"
+    elif [[ $_USE_S -eq 1 && -n "${_S[$k]+x}" ]]; then
+        printf -v "$1" '%s' "${_S[$k]}"
+    elif [[ -n "${_F[$k]+x}" ]]; then
+        printf -v "$1" '%s' "${_F[$k]}"
+    else
+        printf -v "$1" '%s' "${3:-}"
+    fi
+}
+
+_layer_json_to() {   # $1 var, $2 epoch данных, $3 источник, $4 интервал, $5 now, $6 sections
+    local iso
+    _iso_utc_to iso "$2"
+    printf -v "$1" '{"updated_at":"%s","age_seconds":%d,"interval_seconds":%d,"source":"%s","sections":[%s]}' \
+        "$iso" "$(( $5 - $2 ))" "$4" "$3" "$6"
+}
+
+# ==========================================================================
+# Курьер — склеивает кеш в полный JSON и отправляет (раз в METRICS_INTERVAL)
+# ==========================================================================
+_courier_send() {
+    local now ts j v i n p pkg d st sd dirs cfg pr po api name list e_cnt w_cnt ie iw
+    local l_full l_svc l_met s_ts s_src m_ts m_src iss_s iss_d obj0='{}'
+    local -a pkgs deps
+    _epoch_to now
+    _iso_utc_to ts "$now"
+
+    s_ts=$_F_TS; s_src="full"
+    [[ $_USE_S -eq 1 ]] && { s_ts=$_S_TS; s_src="services"; }
+    m_ts=$_F_TS; m_src="full"
+    [[ $_USE_M -eq 1 ]] && { m_ts=$_M_TS; m_src="metrics"; }
+    _layer_json_to l_full "$_F_TS" full "$FULL_INTERVAL" "$now" \
+        '"script_version","os","package_manager","repositories","products[].packages[].version/depends/directories/configs","infrastructure[].version","system.disk","system.database","system.uptime_seconds","certificates","uptime_services","issues(static)"'
+    _layer_json_to l_svc "$s_ts" "$s_src" "$SERVICES_INTERVAL" "$now" \
+        '"products[].packages[].systemd/process/ports/api","infrastructure[].status","issues(dynamic)"'
+    _layer_json_to l_met "$m_ts" "$m_src" "$METRICS_INTERVAL" "$now" \
+        '"system.cpu","system.cpu_services","system.memory","system.memory_services","system.network"'
+
+    # Тело — ГОЛЫЙ объект хоста, без конверта {"hosts":[...]}: приёмник сам
+    # раскладывает снимки по host_id/service_name, а конверт он сохранял как
+    # один "хост" с вложенным hosts[], и фронт не находил в нём summary.
+    j="{\"timestamp\":\"$ts\",\"host_id\":\"$_ID_HOST\",\"host_ip\":\"$_ID_IP\",\"service_name\":\"$_ID_SVC\","
+    j+="\"script_version\":${_F[script_version]:-\"\"},\"os\":${_F[os]:-\"\"},\"package_manager\":${_F[package_manager]:-\"\"},"
+    j+="\"layers\":{\"full\":$l_full,\"services\":$l_svc,\"metrics\":$l_met},"
+
+    j+="\"products\":["
+    n="${_F[products.count]:-0}"
+    for ((i = 0; i < n; i++)); do
+        [[ $i -gt 0 ]] && j+=","
+        j+="{\"name\":${_F[product.$i.name]:-\"\"},\"packages\":["
+        read -ra pkgs <<< "${_F[product.$i.pkgs]:-}"
+        list=""
+        for pkg in "${pkgs[@]}"; do
+            _cget_to sd "pkg.$pkg.systemd" '{}'
+            _cget_to pr "pkg.$pkg.process" '{}'
+            _cget_to po "pkg.$pkg.ports" '[]'
+            _cget_to api "pkg.$pkg.api" '{}'
+            list+="${list:+,}{${_F[pkg.$pkg.static]:-\"name\":\"$pkg\"},\"systemd\":$sd,\"directories\":${_F[pkg.$pkg.dirs]:-[]},\"configs\":${_F[pkg.$pkg.configs]:-[]},\"process\":$pr,\"ports\":$po,\"api\":$api}"
+        done
+        j+="$list]}"
+    done
+    j+="],"
+
+    j+="\"infrastructure\":["
+    read -ra deps <<< "${_F[infra.list]:-}"
+    list=""
+    for d in "${deps[@]}"; do
+        _cget_to st "infra.$d.status" "unknown"
+        list+="${list:+,}{\"service_name\":${_F[infra.$d.name]:-\"$d\"},\"status\":\"$st\",${_F[infra.$d.rest]:-\"version\":\"\",\"port_open\":\"\",\"required_by\":\"\"}}"
+    done
+    j+="$list],"
+    j+="\"repositories\":${_F[repositories]:-[]},\"apt_priorities\":[],"
+
+    read -r ie iw <<< "${_F[issues.static.count]:-0 0}"
+    _cget_to v issues.dynamic.count "0 0"
+    read -r e_cnt w_cnt <<< "$v"
+    read -ra pkgs <<< "${_F[pkgs]:-}"
+    j+="\"summary\":{\"installed\":${#pkgs[@]},\"errors\":$(( ie + e_cnt )),\"warnings\":$(( iw + w_cnt ))},"
+
+    j+="\"system\":{"
+    _cget_to v system.cpu '{"usage_percent":0}'; j+="\"cpu\":$v,"
+    _cget_to v system.cpu_services '[]'; j+="\"cpu_services\":$v,"
+    _cget_to v system.memory '{}'; j+="\"memory\":$v,"
+    _cget_to v system.memory_services '[]'; j+="\"memory_services\":$v,"
+    j+="\"disk\":${_F[system.disk]:-[]},\"database\":${_F[system.database]:-$obj0},"
+    _cget_to v system.network '[]'; j+="\"network\":$v,"
+    j+="\"uptime_seconds\":${_F[system.uptime_seconds]:-0}},"
+    j+="\"certificates\":${_F[certificates]:-[]},\"uptime_services\":${_F[uptime_services]:-[]},"
+
+    iss_s="${_F[issues.static]:-}"
+    _cget_to iss_d issues.dynamic ''
+    j+="\"issues\":[${iss_s}${iss_s:+${iss_d:+,}}${iss_d}]"
+    j+="}"
+
+    # Сначала на диск (last_sent.json — что именно ушло, для разбора после
+    # падения), потом push из этого же файла.
+    if printf '%s\n' "$j" > "${_CACHE_SENT}.tmp" 2>/dev/null && mv -f "${_CACHE_SENT}.tmp" "$_CACHE_SENT" 2>/dev/null; then
+        [[ -n "$PUSH_URLS" ]] && push_health_json "$_CACHE_SENT"
+    else
+        warn "courier: не удалось записать $_CACHE_SENT — отправка пропущена"
+    fi
+    if [[ "$PRINT_JSON" == 1 || -t 1 ]]; then
+        printf '%s\n' "$j"
+    fi
+    return 0
 }
 
 # ==========================================================================
 # Отправка JSON на PUSH_URLS
 # ==========================================================================
-# Источник: перенесено без изменений логики из
-# flat_check_modular/lib/agent.sh (раздел 03_push, push_health_json()) —
-# run_health_json() НЕ перенесена, у этого агента свой диспетчер (см. ниже).
+# Тело — из файла (curl --data-binary @file). Шлёт каждые METRICS_INTERVAL
+# секунд, поэтому по умолчанию без повторов и с коротким --max-time: зависший
+# приёмник не должен задерживать следующий тик, а следующая попытка и так
+# через несколько секунд. В лог — только смена состояния URL, иначе это
+# тысячи строк в час; каждая попытка — в DEBUG.
+#   2xx       — ok
+#   404/405   — unconfigured: на этом бэке приём не настроен (бэков на хосте
+#               много, set-push-urls добавляет все) → раз в PUSH_UNCONFIGURED_RETRY
+#   401/403   — auth: токен не принят → раз в PUSH_UNCONFIGURED_RETRY
+#   прочее    — fail: временный сбой (5xx, нет соединения) → каждый тик
+declare -A _PUSH_STATE=() _PUSH_FAILS=() _PUSH_NEXT=()
 
-# Отправка JSON на все URL из PUSH_URLS (http/https).
-# PUSH_INSECURE=1 — не проверять TLS-сертификат (curl -k), для https с self-signed.
+_push_state_set() {   # $1 url, $2 новое состояние, $3 http-код
+    local url="$1" st="$2" code="$3" prev="${_PUSH_STATE[$1]:-}"
+    if [[ "$st" == "ok" ]]; then
+        if [[ "$prev" != "ok" ]]; then
+            if [[ -n "$prev" ]]; then
+                info "push: снова OK $code → $url (было: $prev, неудачных попыток: ${_PUSH_FAILS[$url]:-0})"
+            else
+                info "push: OK $code → $url"
+            fi
+        fi
+        _PUSH_FAILS[$url]=0
+        _PUSH_NEXT[$url]=0
+    else
+        _PUSH_FAILS[$url]=$(( ${_PUSH_FAILS[$url]:-0} + 1 ))
+        if [[ "$prev" != "$st" ]]; then
+            case "$st" in
+                unconfigured) info "push: $url — приём не настроен (http=$code), пробую раз в ${PUSH_UNCONFIGURED_RETRY} с" ;;
+                auth) warn "push: $url — токен не принят (http=$code), проверьте PUSH_TOKEN; пробую раз в ${PUSH_UNCONFIGURED_RETRY} с" ;;
+                *) warn "push: FAIL → $url (http=$code) — дальше в лог только восстановление; каждая попытка — при DEBUG_MODE=1" ;;
+            esac
+        fi
+    fi
+    _PUSH_STATE[$url]="$st"
+}
 
 push_health_json() {
-    local body="$1"
-    local urls=() tokens=() url token i rc=0 http_code
+    local file="$1" url token i=0 rc=0 http_code attempt st now errf="$CACHE_DIR/.push_err" err
+    local -a urls tokens curl_insecure=()
     local auth_hdr="${PUSH_AUTH_HEADER:-Authorization: Bearer}"
-    local curl_insecure=()
     [[ "${PUSH_INSECURE:-0}" == "1" ]] && curl_insecure=(-k)
-
-    _json_ensure_identity
-    [[ -n "$PUSH_URLS" ]] || { warn "push: PUSH_URLS пуст — некуда отправлять"; return 1; }
     command -v curl >/dev/null 2>&1 || { warn "push: curl не найден"; return 1; }
 
-    # split URLs
-    PUSH_URLS="${PUSH_URLS//,/ }"
-    read -ra urls <<< "$PUSH_URLS"
-    if [[ -n "$PUSH_TOKENS" ]]; then
-        PUSH_TOKENS="${PUSH_TOKENS//,/ }"
-        read -ra tokens <<< "$PUSH_TOKENS"
-    fi
+    read -ra urls <<< "${PUSH_URLS//,/ }"
+    read -ra tokens <<< "${PUSH_TOKENS//,/ }"
 
-    i=0
     for url in "${urls[@]}"; do
         [[ -z "$url" ]] && continue
         if [[ ! "$url" =~ ^https?:// ]]; then
-            warn "push: пропуск URL без http/https: $url"
+            [[ "${_PUSH_STATE[$url]:-}" == "bad" ]] || warn "push: пропуск URL без http/https: $url"
+            _PUSH_STATE[$url]="bad"
             rc=1
             continue
         fi
@@ -1486,97 +1976,183 @@ push_health_json() {
         [[ -n "${tokens[$i]:-}" ]] && token="${tokens[$i]}"
         i=$((i + 1))
 
-        local attempt=0 ok=0 curl_errfile="/tmp/flat_push_err.$$"
-        while [[ $attempt -le ${PUSH_RETRIES:-2} ]]; do
+        _epoch_to now
+        if [[ ${_PUSH_NEXT[$url]:-0} -gt $now ]]; then
+            rc=1
+            continue
+        fi
+        attempt=0
+        st="fail"
+        while [[ $attempt -le ${PUSH_RETRIES:-0} ]]; do
             attempt=$((attempt + 1))
-            # Логируем реальную вызываемую команду (токен маскируем), а не
-            # реконструкцию "по мотивам" — чтобы можно было взять и повторить
-            # руками (curl -v ...) без гадания, какие флаги реально ушли.
-            local curl_display="curl -sS -o <body> -w '%{http_code}'"
-            [[ ${#curl_insecure[@]} -gt 0 ]] && curl_display+=" ${curl_insecure[*]}"
-            curl_display+=" --connect-timeout ${PUSH_CONNECT_TIMEOUT:-5} --max-time ${PUSH_MAX_TIME:-30}"
-            curl_display+=" -X POST '$url' -H 'Content-Type: application/json'"
-            curl_display+=" -H 'X-Flat-Host-Id: ${HOST_ID}' -H 'X-Flat-Service-Name: ${SERVICE_NAME}'"
-            [[ -n "$token" ]] && curl_display+=" -H '${auth_hdr} ***'"
-            curl_display+=" --data-binary <json>"
-            log_debug "push: attempt $attempt → run: $curl_display"
-            http_code=$(curl -sS -o /tmp/flat_push_body.$$ -w '%{http_code}' \
+            http_code=$(curl -sS -o /dev/null -w '%{http_code}' \
                 "${curl_insecure[@]}" \
-                --connect-timeout "${PUSH_CONNECT_TIMEOUT:-5}" \
-                --max-time "${PUSH_MAX_TIME:-30}" \
+                --connect-timeout "${PUSH_CONNECT_TIMEOUT:-2}" \
+                --max-time "${PUSH_MAX_TIME:-4}" \
                 -X POST "$url" \
                 -H "Content-Type: application/json" \
                 -H "X-Flat-Host-Id: ${HOST_ID}" \
                 -H "X-Flat-Service-Name: ${SERVICE_NAME}" \
                 ${token:+-H "$auth_hdr $token"} \
-                --data-binary "$body" 2>"$curl_errfile") || true
+                --data-binary "@$file" 2>"$errf") || true
             [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code="000"
-            # http=000 сам по себе не говорит, ПОЧЕМУ (DNS/refused/timeout/TLS) —
-            # curl обычно пишет это в stderr, раньше просто выбрасывался в /dev/null.
-            [[ -s "$curl_errfile" ]] && log_debug "push: attempt $attempt → curl said: $(tr '\n' ' ' < "$curl_errfile" 2>/dev/null)"
-            rm -f "$curl_errfile" 2>/dev/null
-            if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-                info "push: OK $http_code → $url"
-                ok=1
-                break
+            case "$http_code" in
+                2??) st="ok" ;;
+                404|405) st="unconfigured" ;;
+                401|403) st="auth" ;;
+                *) st="fail" ;;
+            esac
+            [[ "$st" == "fail" ]] || break
+            if [[ "${DEBUG_MODE:-0}" -eq 1 ]]; then
+                err=""
+                IFS= read -r -d '' err 2>/dev/null < "$errf"
+                log_debug "push: attempt $attempt → $url http=$http_code ${err//$'\n'/ }"
             fi
-            log_debug "push: attempt $attempt → $url http=$http_code"
-            sleep 1
+            [[ $attempt -le ${PUSH_RETRIES:-0} ]] && _wait_seconds 1
         done
-        rm -f /tmp/flat_push_body.$$ 2>/dev/null
-        [[ $ok -eq 1 ]] || { warn "push: FAIL → $url (last http=$http_code)"; rc=1; }
+        _push_state_set "$url" "$st" "$http_code"
+        if [[ "$st" != "ok" ]]; then
+            rc=1
+            [[ "$st" == "fail" ]] || _PUSH_NEXT[$url]=$(( now + PUSH_UNCONFIGURED_RETRY ))
+        fi
     done
     return "$rc"
+}
+
+# ==========================================================================
+# Планировщик: full/services — в фоне, metrics и курьер — в основном цикле
+# ==========================================================================
+
+# Тот же приём, что init_logging() у flat_check.sh/flat_check_2.sh: каталог
+# лога (соседний с /opt/flat/<продукт>), файл усекается один раз за запуск
+# демона. Нет прав — LOG_FILE="" и только stderr, без падения.
+_daemon_init_logging() {
+    [[ -n "$LOG_FILE" ]] || return 0
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+    if ! { : > "$LOG_FILE"; } 2>/dev/null; then
+        warn "не удалось писать лог-файл $LOG_FILE — файловое логирование выключено, дальше только stderr (переопределить путь: LOG_FILE в конфиге/env)"
+        LOG_FILE=""
+        return 1
+    fi
+    _log_line "INFO" "=== flat_check_agent (демон) — сессия начата ==="
+    return 0
+}
+
+# Запуск слоя в фоне, если предыдущий его запуск уже закончился. Главный
+# цикл — единственный, кто их запускает, поэтому лок-файлы не нужны:
+# достаточно помнить PID своего фонового процесса.
+_BG_full=""
+_BG_services=""
+_layer_launch() {
+    local layer="$1" quiet="${2:-0}" var="_BG_$1"
+    if [[ -n "${!var}" ]] && kill -0 "${!var}" 2>/dev/null; then
+        [[ $quiet -eq 1 ]] || info "cache: $layer — предыдущий запуск ещё не завершился, пропуск"
+        return 1
+    fi
+    ( "_${layer}_run" ) &
+    printf -v "$var" '%s' "$!"
+}
+
+_daemon_init() {
+    local iso
+    _STOP=0
+    _WAITING=0
+    trap '_STOP=1' TERM INT
+    detect_os
+    _json_ensure_identity
+    _json_esc_to _ID_HOST "$HOST_ID"
+    _json_esc_to _ID_IP "$HOST_IP"
+    _json_esc_to _ID_SVC "$SERVICE_NAME"
+    mkdir -p "$CACHE_DIR" 2>/dev/null || { fail "cache: не удалось создать каталог $CACHE_DIR"; exit 1; }
+    _metrics_init
+    declare -gA _F=() _S=() _M=()
+    _USE_S=0
+    _USE_M=0
+    # После перезапуска: уже лежащий кеш отправляется сразу (общий timestamp
+    # — текущий, updated_at частей — старые, по ним видно возраст данных).
+    if _cache_read "$_CACHE_METRICS" _M; then
+        _M_TS="${_M[updated_at]}"
+    else
+        declare -gA _M=()
+    fi
+    _NEXT_FULL=0
+    _NEXT_SERVICES=0
+    _NEXT_METRICS=0
+    _FULL_RETRY_AT=0
+    if _cache_refresh; then
+        _iso_utc_to iso "$_F_TS"
+        _NEXT_FULL=$(( _F_TS + FULL_INTERVAL ))
+        info "cache: найден кеш (full от $iso) — отправка сразу, следующий full через $(( _NEXT_FULL > _MET_PREV_EPOCH ? _NEXT_FULL - _MET_PREV_EPOCH : 0 )) с"
+    fi
+}
+
+daemon_main() {
+    local now pause
+    _daemon_init
+    info "daemon: старт (full=${FULL_INTERVAL}s services=${SERVICES_INTERVAL}s metrics/отправка=${METRICS_INTERVAL}s, кеш=$CACHE_DIR)"
+    while [[ "$_STOP" -eq 0 ]]; do
+        _epoch_to now
+        if ! _cache_refresh; then
+            # Кеша нет/битый: services, metrics и курьер ждут, full — в фоне.
+            if [[ $_WAITING -eq 0 ]]; then
+                warn "cache: кеш не создан или повреждён ($_CACHE_FULL) — запускаю full; services, metrics и отправка ждут его создания"
+                _WAITING=1
+            fi
+            # Упавший full не перезапускаем чаще раза в 30 с.
+            if [[ $now -ge $_FULL_RETRY_AT ]] && _layer_launch full 1; then
+                _FULL_RETRY_AT=$(( now + 30 ))
+            fi
+            _NEXT_FULL=$(( now + FULL_INTERVAL ))
+            _wait_seconds 1
+            continue
+        fi
+        if [[ $_WAITING -eq 1 ]]; then
+            info "cache: кеш создан — services, metrics и отправка продолжают работу"
+            _WAITING=0
+        fi
+        if [[ $now -ge $_NEXT_FULL ]]; then
+            _NEXT_FULL=$(( now + FULL_INTERVAL ))
+            _layer_launch full
+        fi
+        if [[ $now -ge $_NEXT_SERVICES ]]; then
+            _NEXT_SERVICES=$(( now + SERVICES_INTERVAL ))
+            _layer_launch services
+        fi
+        if [[ $now -ge $_NEXT_METRICS ]]; then
+            _NEXT_METRICS=$(( now + METRICS_INTERVAL ))
+            _metrics_run
+            _cache_refresh
+            _courier_send
+        fi
+        _epoch_to now
+        pause=$(( _NEXT_METRICS - now ))
+        [[ $(( _NEXT_SERVICES - now )) -lt $pause ]] && pause=$(( _NEXT_SERVICES - now ))
+        [[ $(( _NEXT_FULL - now )) -lt $pause ]] && pause=$(( _NEXT_FULL - now ))
+        [[ $pause -ge 1 ]] || pause=1
+        _wait_seconds "$pause"
+    done
+    info "daemon: остановлен (сигнал)"
+    wait 2>/dev/null
 }
 
 
 # ==========================================================================
 # Точка входа: без argv — всё поведение определяется env/конфигом выше.
 # ==========================================================================
-# Конфиг-файл: рядом со скриптом по умолчанию ("всё в одном месте"),
-# переопределяется переменной окружения FLAT_AGENT_CONF. Отсутствие файла —
-# не ошибка (_json_load_config() тихо возвращается, если файла нет) —
-# тогда работают только значения из окружения/дефолтов выше. Но если из-за
-# этого в итоге нечего пушить (см. ветку ниже), об этом стоит явно
-# предупредить в stderr — молчание тут неотличимо от "push и не должен был
-# случиться" (см. историю с host, где ожидаемый flat_check_agent.conf не
-# нашёлся из-за несовпадения имени файла, и push тихо не запускался).
+# Конфиг-файл: рядом со скриптом по умолчанию, переопределяется переменной
+# окружения FLAT_AGENT_CONF. Отсутствие файла — не ошибка, но если из-за
+# этого нечего пушить, об этом стоит явно предупредить (молчание неотличимо
+# от "push и не должен был случиться").
 FLAT_AGENT_CONF="${FLAT_AGENT_CONF:-$SCRIPT_DIR/flat_check_agent.conf}"
 _json_load_config "$FLAT_AGENT_CONF"
+_daemon_init_logging
 
-# _json_ensure_identity() вызывается внутри build_health_json() ниже —
-# отдельно здесь не нужна.
-body=""
-if ! body=$(build_health_json); then
-    fail "flat_check_agent: не удалось собрать JSON"
-    exit 1
+if [[ -z "$PUSH_URLS" ]]; then
+    if [[ ! -f "$FLAT_AGENT_CONF" ]]; then
+        warn "конфиг не найден: $FLAT_AGENT_CONF — PUSH_URLS пуст, push пропущен (JSON всё равно собирается в cache/last_sent.json; переопределить путь можно через FLAT_AGENT_CONF)"
+    else
+        info "PUSH_URLS не задан — push пропущен, JSON собирается в cache/last_sent.json"
+    fi
 fi
 
-# Бэк (Partner ingest) принимает конверт {"hosts":[...]}, не голый объект —
-# HostSnapshot.Raw хранит весь элемент как есть, парсит только host_id/
-# service_name/timestamp/summary внутри hosts[]. Оборачиваем один раз здесь,
-# ДО печати — stdout и то, что реально уходит push'ем, остаются идентичны.
-body="{\"hosts\":[${body}]}"
-
-# stdout — ТОЛЬКО это. Ничего больше сюда не печатать.
-printf '%s\n' "$body"
-
-if [[ -n "$PUSH_URLS" ]]; then
-    push_health_json "$body"
-    exit $?
-fi
-
-# PUSH_URLS пуст — push осознанно пропущен, сам по себе это не ошибка
-# (штатный режим "только JSON в stdout", см. шапку файла). Но стоит явно
-# подсветить разницу между двумя причинами, почему он пуст:
-#   - ожидаемый конфиг-файл не нашёлся вообще (вероятная ошибка деплоя —
-#     например неверное имя файла или путь) — WARN;
-#   - конфиг нашёлся и загрузился, просто PUSH_URLS в нём не задан
-#     (вероятно осознанный выбор — не отправлять) — тихий INFO.
-if [[ ! -f "$FLAT_AGENT_CONF" ]]; then
-    warn "конфиг не найден: $FLAT_AGENT_CONF — PUSH_URLS пуст, push пропущен (используются только переменные окружения/встроенные дефолты; переопределить путь можно через FLAT_AGENT_CONF)"
-else
-    info "PUSH_URLS не задан — push пропущен, в stdout только JSON"
-fi
-
-exit 0
+daemon_main
