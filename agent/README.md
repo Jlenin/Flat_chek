@@ -18,7 +18,7 @@ deb/rpm-пакет — см. корневой [`README.md`](../README.md)). Од
 | `flat_check_agent.conf.example` | эталонный конфиг (копировать в `flat_check_agent.conf` рядом со скриптом) |
 | `flat_check_agent.sudoers.example` | справка по правам для non-root запуска |
 | `flat-check-set-push-urls.sh` | вызывается из postinst deb/rpm-пакета `flat-check` — заполняет `PUSH_URLS`/`SERVICE_NAME` в конфиге по реально установленным `*-backend` пакетам и их портам |
-| `flat-check.service.example` | пример systemd-юнита (`Type=simple`) |
+| `flat-check.service.example` | systemd-юнит (`Type=simple`) — кладётся в пакет как `flat-check.service` (`.gitlab-ci.yml`: `cp ./agent/$SERVICE_FILE.example`) |
 | `flat-check.logrotate.example` | ротация `LOG_FILE` (см. «Логирование») |
 | `health-payload.example.json` | пример полного тела, которое агент шлёт в push (голый объект хоста, без конверта) |
 | `ingest-request.example.http` | пример HTTP-запроса push целиком (заголовки + тело) |

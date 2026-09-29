@@ -7,6 +7,7 @@ Wants=nss-lookup.target
 After=nss-lookup.target
 
 [Service]
+# Этот файл кладётся в пакет как flat-check.service (.gitlab-ci.yml: cp ./agent/$SERVICE_FILE.example).
 # Долгоживущий процесс: сам планирует full/services/metrics и отправку
 # внутренними таймерами (см. FULL_INTERVAL/SERVICES_INTERVAL/METRICS_INTERVAL
 # в flat_check_agent.conf) — никакого cron/timer рядом не нужно. Пользователю

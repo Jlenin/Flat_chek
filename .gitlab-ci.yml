@@ -1,0 +1,355 @@
+# ========================================================
+# Назначение переменных для сборки пакетов в этом проекте
+# 1. Создаем токен для проекта
+# 2. Добавляем пользователя GitLab..
+# 3. В настройках проекта выключаем Use separate caches for protected branches
+# 4. Включаем в проекте доступ к общим ранерам
+# 5. Создаем в автотестах ветку под проект
+# 6. Добавляем фаайл build.txt в .gitignore, что бы объединение веток не перебивало билды для версии
+# 7. Добавляем в файл .gitattributes  build.txt и .gitignore
+# ========================================================
+variables:
+    # Каталог в котором будет работать сервис
+    DESTINATION_DIR: "flat-check"
+
+    # Общие значения которые для всех вариантов пакетов. Меняются в звисимосте от каждой сборки.
+    PKG_NAME: "flat-check"
+    SUMMARY: "Script for Flat Service"
+    DESCRIPTION: "Script for Flat Service"
+
+    # Имя бинарника
+    BINARY_FILE: "flat_check_agent.sh"
+    # Конфирурационный файл
+    CONFIG_FILE: "flat_check_agent.conf"
+    # Файл сервиса
+    SERVICE_FILE: $PKG_NAME.service
+
+    # Зависимости для каждой из систем
+    # ИЗМЕНЕНО: cron/cronie больше не нужны — агент теперь демон (Type=simple),
+    # заданий cron не ставит. jq нужен flat-check-set-push-urls.sh, curl — агенту.
+    DEPENDS_astra_7: jq, curl
+    DEPENDS_astra_8: jq, curl
+    DEPENDS_debian_11: jq, curl
+    DEPENDS_debian_12: jq, curl
+    DEPENDS_debian_13: jq, curl
+    DEPENDS_redos_7: jq, curl
+    DEPENDS_redos_8: jq, curl
+    #DEPENDS_redos_9: jq, curl - на будушее
+
+    # Сервисы с которыми не работает.
+    CONFLICTS: {}
+
+
+    # #########################################################
+        # Сервисный файл не генирируется, а лежит локально (agent/flat-check.service.example)
+    # #########################################################
+
+    # Переменные для файла .service
+    SERVICE_TYPE: {}
+
+    # Запуск в .service (ExecStart)
+    EXEC_STARTPRE: {}
+    EXEC_START: $DESTINATION_PATH/$BINARY_FILE app
+    EXEC_STOP: {}
+
+
+    SUDO_FILE: {}
+
+    #########################################################
+    # ID группы Telegram
+    TELEGRAM_CHAT_ID: -1002377507078
+    #########################################################
+
+
+    # Если требуется вводить лицензии, просто закоменти переменную
+    POSTINST_LICENSE: cmd_color "echo 'On is licensed'"
+
+###################################################################
+###################################################################
+###################################################################
+# =========================================
+# Настройки для каждого из вариантов сборки
+# =========================================
+# >>> Ветка RELEASE
+
+RELEASE_default:
+    extends: .rules_for_release
+    variables:
+        TAG: Release
+# Список OS в которых требуется тесты или сборка
+            # astra
+            # astra8
+            # debian_11
+            # debian_12
+            # redos_7
+            # redos_8
+        OS_BUILD: |
+            astra_7
+            astra_8
+            debian_12
+            debian_13
+            redos_7
+            redos_8
+            redhat_9
+
+
+# Список запускаемых этапов:
+# analyze
+# Version
+# Build-binary-go
+# build-pkg
+# test installation
+# send RND:Nexus
+# Cleanup
+# Info
+# Auto-Test
+# Auto-Update
+# Auto-mini-repo
+        JOB_LIST: |
+            Version
+            build-pkg
+            test installation
+            send RND:Nexus
+            Cleanup
+            Info
+            Auto-Test
+            Auto-Update
+
+
+
+
+
+###################################################################
+###################################################################
+###################################################################
+# >>> Ветка DEV
+DEV_default:
+    extends: .rules_for_dev
+    variables:
+        TAG: Develop
+        PKG_NAME_SUFX: "~dev"
+
+
+
+# Список OS в которых требуется тесты или сборка
+            # astra
+            # astra8
+            # debian_11
+            # debian_12
+            # redos_7
+            # redos_8
+        OS_BUILD: |
+            astra_7
+            astra_8
+            debian_11
+            debian_12
+            debian_13
+            redos_7
+            redos_8
+            redhat_9
+
+
+
+# Список запускаемых этапов:
+# analyze
+# Version
+# build-binary-cmake
+# build-pkg
+# test installation
+# send RND:Nexus
+# Auto-Test
+# Auto-Update
+# Auto-mini-repo
+# Cleanup
+# Info
+        JOB_LIST: |
+            Version
+            build-pkg
+            test installation
+            send RND:Nexus
+            Cleanup
+            Info
+            Auto-Test
+            Auto-Update
+
+
+
+
+# =======================================
+# Настройки для каждого из этапов сборки
+# =======================================
+
+# ==========================
+# Сборка бинарного файла
+# ==========================
+# Сборка бинарников зпуститься если есть упоминание в переменной JOB_LIST
+# Работы в файле core.yml
+
+
+.default_binary_script:
+    before_script: |
+                echo "Сборка новой версии: $VERSION"
+
+
+# ==================
+# Сборка пакетов
+# ==================
+# Сборка пакетов зпуститься если есть упоминание в переменной JOB_LIST
+# Работы в файле core.yml
+
+# >>> DEB
+.default_deb_script:
+    variables:
+# Действия перед инсталяцией
+# Настройки для [ preinst ]
+# ИЗМЕНЕНО: при первой установке службы ещё нет — stop не должен давать [ FAIL ]
+        PREINST_DEFAULT: |
+                    echo "Stopping the service $SERVICE_FILE"
+                    systemctl stop $SERVICE_FILE 2>/dev/null || true
+
+        PREINST_INSTALL: {}
+
+        PREINST_UPGRADE: {}
+
+# Действия после инсталяцией
+# Настройки для [ postinst ]
+# ИЗМЕНЕНО: конфиг с PUSH_TOKEN — 640 (иначе читается любым пользователем);
+# убираем задание cron, оставшееся от старого oneshot-юнита (агент теперь демон).
+        POSTINST_INSTALL: |
+                    chown -R $SERVICE_NAME:$SERVICE_GROUP $DESTINATION_PATH
+                    chown -R root:root $DESTINATION_UNIT/$SERVICE_FILE
+
+                    chmod -R 755 $DESTINATION_PATH
+                    chmod -R 644 $DESTINATION_UNIT/$SERVICE_FILE
+                    chmod 640 $DESTINATION_PATH/$CONFIG_FILE
+
+                    crontab -u $SERVICE_NAME -r 2>/dev/null || true
+
+                    bash $DESTINATION_PATH/flat-check-set-push-urls.sh "$DESTINATION_PATH" "$CONFIG_FILE"
+
+        POSTINST_UPGRADE: {}
+
+        # Перезапуск
+# ИЗМЕНЕНО: daemon-reload — иначе после обновления systemd запускает старый юнит
+# из памяти; restart — чтобы гарантированно поднялся новый скрипт.
+        POSTINST_END: |
+                    systemctl daemon-reload
+                    systemctl enable $SERVICE_FILE
+                    systemctl restart $SERVICE_FILE
+
+
+# Действия перед удалением (отключение сервисов по умолчанию)
+# Настройки для [ prerm ]
+# ИЗМЕНЕНО: не падать, если служба уже остановлена/отключена
+        PRERM_REMOVE: |
+                    echo "Stopping the service $SERVICE_FILE"
+                    systemctl stop $SERVICE_FILE 2>/dev/null || true
+                    systemctl disable $SERVICE_FILE 2>/dev/null || true
+
+        PRERM_UPGRADE: {}
+
+# Действия при удалении
+# Настройки для [ postrm ]
+        POSTRM_REMOVE: {}
+        POSTRM_PURGE: {}
+
+# Настройки для [ conffiles ]
+        CONFFILES_DEFAULT: |
+                    ${LOG_ROTATE}/${PKG_NAME}.conf
+                    ${DESTINATION_PATH}/$CONFIG_FILE
+
+
+# Настройки для [ triggers ]
+
+# Скрипты для подготовки сборки
+# ИЗМЕНЕНО: всё, что относится к агенту, берётся из каталога agent/;
+# юнит лежит там как flat-check.service.example и кладётся в пакет как $SERVICE_FILE
+    before_script:
+        - if [[ $tmp_os ]];then
+        -     echo "Собираем пакет из каталога $tmp_os"
+              # Создание необходимых каталогов
+        -     mkdir -p                              ${DIR_DEB}${DESTINATION_UNIT}
+        -     mkdir -p                              ${DIR_DEB}${DESTINATION_PATH}
+        -     mkdir -p                              ${DIR_DEB}${LOG_ROTATE}
+
+
+            # Копируем файл .service
+        -     cp ./agent/$SERVICE_FILE.example      ${DIR_DEB}/${DESTINATION_UNIT}/$SERVICE_FILE
+            # Копируем logratate
+        -     cp ./$tmp_os/$PKG_NAME.conf           ${DIR_DEB}/${LOG_ROTATE}
+            # Копируем бинарный файл
+        -     cp ./agent/$BINARY_FILE               ${DIR_DEB}${DESTINATION_PATH}
+            # Копируем конфиг
+        -     cp ./agent/flat_check_agent.conf.example    ${DIR_DEB}${DESTINATION_PATH}/$CONFIG_FILE
+            # Копируем карту локальных портов backend-сервисов (для генерации PUSH_URLS в постинсте)
+        -     echo "$ALL_LOCAL_PORT" > ${DIR_DEB}${DESTINATION_PATH}/all_local_port.json
+            # Копируем скрипт генерации PUSH_URLS
+        -     cp ./agent/flat-check-set-push-urls.sh ${DIR_DEB}${DESTINATION_PATH}/flat-check-set-push-urls.sh
+
+        - fi
+
+
+# >>> RPM
+.default_rpm_script:
+    variables:
+        # Настройки для [ specfile ]
+        # Общие настройки при сборке rpm
+        SPEC_DEFAULT: {}
+
+        # Копироваание файлов в RPM_BUILD_ROOT при сборке
+        SPEC_INSTALL: |
+            %{__mkdir_p} $$RPM_BUILD_ROOT
+            %{__mv} ./* %{buildroot}
+
+
+        # Атрибуты файлов при инсталяции
+        # ИЗМЕНЕНО: конфиг с PUSH_TOKEN — 0640
+        SPEC_FILE: |
+            %defattr(0755,$SERVICE_NAME,$SERVICE_GROUP,0755)
+            %attr(0755,$SERVICE_NAME,$SERVICE_GROUP) $DESTINATION_PATH
+            %attr(0644,root,root) %{_unitdir}/$SERVICE_FILE
+            %attr(0644,$SERVICE_NAME,$SERVICE_GROUP) ${LOG_ROTATE}/$PKG_NAME.conf
+            %config(noreplace) ${LOG_ROTATE}/$PKG_NAME.conf
+            %config(noreplace) %attr(0640,$SERVICE_NAME,$SERVICE_GROUP) ${DESTINATION_PATH}/$CONFIG_FILE
+
+    # Собираем все файлы в каталоге для добавления в rpm
+    # ИЗМЕНЕНО: всё, что относится к агенту, берётся из каталога agent/;
+# юнит лежит там как flat-check.service.example и кладётся в пакет как $SERVICE_FILE
+    before_script:
+        - if [[ $tmp_os ]];then
+        -     echo "Собираем пакет из каталога $tmp_os"
+        -     mkdir -p                               $DIR_RPM/BUILD/${DESTINATION_UNIT}
+        -     mkdir -p                               $DIR_RPM/BUILD/${DESTINATION_PATH}
+        -     mkdir -p                               $DIR_RPM/BUILD/${LOG_ROTATE}
+
+
+            # Копируем файл .service
+        -     cp ./agent/$SERVICE_FILE.example       $DIR_RPM/BUILD/${DESTINATION_UNIT}/$SERVICE_FILE
+            # Копируем logratate
+        -     cp ./$tmp_os/$PKG_NAME.conf            $DIR_RPM/BUILD/${LOG_ROTATE}
+            # Копируем бинарный файл
+        -     cp ./agent/$BINARY_FILE                $DIR_RPM/BUILD/${DESTINATION_PATH}
+            # Копируем конфиг
+        -     cp ./agent/flat_check_agent.conf.example     $DIR_RPM/BUILD/${DESTINATION_PATH}/$CONFIG_FILE
+            # Копируем карту локальных портов backend-сервисов (для генерации PUSH_URLS в постинсте)
+        -     echo "$ALL_LOCAL_PORT" > $DIR_RPM/BUILD/${DESTINATION_PATH}/all_local_port.json
+            # Копируем скрипт генерации PUSH_URLS
+        -     cp ./agent/flat-check-set-push-urls.sh  $DIR_RPM/BUILD/${DESTINATION_PATH}/flat-check-set-push-urls.sh
+
+        - fi
+
+# =============================
+# Запускаем паралельные проекты
+# =============================
+.Auto-Test:
+    variables:
+        SERVER: "Здесь могла быть ваша реклама!"
+
+
+# ==========================================
+# Файл с обьединенными связями и переменными
+# ==========================================
+include:
+    - project: 'CICD/gitlab-ci'
+      ref: master
+      file: '.core.yml'
