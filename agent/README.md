@@ -18,7 +18,7 @@ deb/rpm-пакет — см. корневой [`README.md`](../README.md)). Од
 | `flat_check_agent.conf.example` | эталонный конфиг (копировать в `flat_check_agent.conf` рядом со скриптом) |
 | `flat_check_agent.sudoers.example` | справка по правам для non-root запуска |
 | `flat-check-set-push-urls.sh` | вызывается из postinst deb/rpm-пакета `flat-check` — заполняет `PUSH_URLS`/`SERVICE_NAME` в конфиге по реально установленным `*-backend` пакетам и их портам |
-| `flat-check.service.example` | пример systemd-юнита (`Type=simple`) |
+| `../flat-check.service` | systemd-юнит (`Type=simple`) — лежит в корне репозитория: оттуда его берёт сборка deb/rpm (`cp ./$SERVICE_FILE` в `.gitlab-ci.yml`) |
 | `flat-check.logrotate.example` | ротация `LOG_FILE` (см. «Логирование») |
 | `health-payload.example.json` | пример полного тела, которое агент шлёт в push (голый объект хоста, без конверта) |
 | `ingest-request.example.http` | пример HTTP-запроса push целиком (заголовки + тело) |
@@ -150,7 +150,7 @@ chmod +x /opt/flat/flat-check/flat_check_agent.sh
 chown -R flat-service:flat-group /opt/flat/flat-check     # запись в cache/
 # впишите реальный PUSH_URLS и токен в flat_check_agent.conf
 
-cp agent/flat-check.service.example /etc/systemd/system/flat-check.service
+cp flat-check.service /etc/systemd/system/flat-check.service
 systemctl daemon-reload
 systemctl enable --now flat-check.service
 tail -f /var/log/flat/flat-check/flat_check_agent.log

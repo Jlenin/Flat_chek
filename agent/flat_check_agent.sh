@@ -42,9 +42,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 # рядом с рабочим каталогом продукта, а не встроенный в код путь. У тех
 # двух это "${SCRIPT_DIR}/${SCRIPT_NAME}.log" (рядом со скриптом, т.к. это
 # разовый прогон); здесь демон долгоживущий, а деплой — /opt/flat/flat-check
-# (см. flat-check.service.example), поэтому файл — в соседний с /opt/flat/
+# (см. flat-check.service в корне репозитория), поэтому файл — в соседний с /opt/flat/
 # каталог /var/log/flat/flat-check/ (тот же путь, что раньше был жёстко
-# прописан в flat-check.service.example как StandardOutput/StandardError).
+# прописан в юните как StandardOutput/StandardError).
 # _log_line()/_daemon_init_logging() ниже: не удалось создать/писать файл —
 # тихо деградирует до LOG_FILE="" (без файла, только stderr) — как и
 # init_logging() у flat_check.sh/flat_check_2.sh, без падений.
