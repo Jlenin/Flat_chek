@@ -102,7 +102,7 @@ declare -A ALL_DEPENDS
 # Порядок продуктов в human/JSON (Infrastructure — в конце)
 FLAT_PRODUCTS_ORDER=(
     "AutoCallServer" "BSS" "Click to Call" "Contact Center" "Device Manager"
-    "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS"
+    "Gateway" "Partner Server" "SoftSwitch" "Tarifficator" "IVR" "LC" "SMS" "Alert"
     "LDAP" "SBC" "Portal" "flat-file" "FVSC" "Infrastructure"
 )
 
@@ -213,6 +213,9 @@ _pkg_set "lc-backend" "LC" "flatSoftSwitchLK"
 # ========== SMS ==========
 _pkg_set "flat-sms" "SMS"
 _pkg_set "flat-smpp" "SMS"
+# ========== Alert ==========
+_pkg_set "alert-backend" "Alert" "flat-smpp"
+_pkg_set "alert-frontend" "Alert" "flat-smpp"
 # ========== LDAP ==========
 _pkg_set "fbr-frontend" "LDAP" "fpbf-frontend" "" "" "nginx"
 _pkg_set "fbr-backend" "LDAP" "flatPartnerBroker,flat-broker"
