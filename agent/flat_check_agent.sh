@@ -23,7 +23,7 @@
 # ПРАВА ДОСТУПА: рассчитан на запуск ОБЫЧНЫМ пользователем, не root.
 # Единственное известное исключение — configs[].status="sudoers" (нет "x" на
 # /etc/sudoers.d) — деградирует до "missing" без ошибок. Подробности —
-# agent/flat_check_agent.sudoers.example.
+# agent/flat_check_agent.sudoers.md.
 #
 # SCRIPT_VERSION ниже — версия ЭТОГО агента, отдельная от flat_check.sh/
 # flat_check_2.sh.
