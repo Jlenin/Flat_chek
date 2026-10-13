@@ -1,68 +1,118 @@
-# flat_check_agent.sh — права доступа для запуска обычным пользователем
-# =======================================================================
+# flat_check_agent.sh — права доступа: установка от root, работа обычным сервисом
+# ===============================================================================
 #
-# Этот файл — не sudoers-конфиг для подключения, а СПРАВКА с примером
-# необязательного ACL. Скрипт рассчитан на запуск ОБЫЧНЫМ пользователем
-# (например, отдельным системным юзером "flat-agent", НЕ root) и без каких
-# либо дополнительных прав уже отдаёт практически полный JSON:
+# Этот файл — СПРАВКА, а не sudoers-конфиг: в /etc/sudoers.d его класть не
+# нужно, правил sudo в нём нет. Агенту sudo не нужен ни для одной проверки.
 #
-#   - dpkg/rpm/pacman/apk-запросы к менеджеру пакетов       — root не нужен
-#   - systemctl is-active/is-enabled/show                    — root не нужен
-#   - ss/netstat (список слушающих портов)                   — root не нужен
-#   - pgrep/ps (видимость чужих процессов)                    — root не нужен
-#     (если только на хосте не включён hidepid=2 для /proc — тогда
-#     process.status в JSON просто покажет "not running" вместо честного
-#     статуса; это осознанный компромисс, не ошибка)
-#   - curl к локальным API health-эндпоинтам                 — root не нужен
-#   - чтение сертификатов (обычно 644/755)                   — root не нужен
-#   - проверка каталога /opt/<pkg> (только проход по пути)   — root не нужен
+# Модель:
+#   1. Установка — один раз от root (sudo): пакет flat-check или шаги ниже.
+#   2. Работа — systemd-сервис flat-check.service от обычного пользователя
+#      flat-service:flat-group (User=/Group= в agent/flat-check.service.example).
+#      Без sudo, без root, без дополнительных capabilities.
 #
-# ЕДИНСТВЕННОЕ известное расхождение без root:
+# Проверено (Ubuntu 24.04): установка по шагам ниже от root, затем запуск
+# агента от flat-service через runuser — кеш, лог и push работают, ошибок
+# прав нет. Сам systemd-юнит в песочнице не запускался (systemd там не
+# работает).
 #
-#   Поле configs[].status для service_name="sudoers" (путь вида
-#   /etc/sudoers.d/<pkg>). На Debian/Ubuntu по умолчанию каталог
-#   /etc/sudoers.d обычно 750 root:root — у обычного пользователя нет "x"
-#   (проход) на сам каталог, поэтому даже проверка "существует ли файл"
-#   тихо возвращает "нет" (`[[ -e ... ]]` не отличает "нет доступа" от
-#   "файла нет"). Итог: это поле будет "missing" всегда, даже если файл
-#   реально есть. Скрипт при этом НЕ падает и не пишет ошибку — просто
-#   поле недостоверно в эту сторону.
 #
-# Если это поле для вас важно (например, дашборд реально смотрит на
-# sudoers-статус) — самый узкий вариант вернуть его без root:
+# 1. УСТАНОВКА (от root, один раз)
+# --------------------------------
+# Пакет flat-check делает шаги «каталог агента» сам (postinst в .gitlab-ci.yml:
+# chown -R на /opt/flat/flat-check, chmod 640 на конфиг). Каталог лога пакет
+# пока НЕ создаёт — этот шаг нужен и при установке пакетом.
 #
-#   setfacl -m u:flat-agent:x /etc/sudoers.d
+#   # Пользователь и группа сервиса (если их ещё нет на хосте)
+#   getent group flat-group >/dev/null || groupadd --system flat-group
+#   getent passwd flat-service >/dev/null || useradd --system -g flat-group \
+#       -d /opt/flat/flat-check -M -s /usr/sbin/nologin flat-service
 #
-# Это даёт учётной записи flat-agent только право ПРОЙТИ по каталогу,
-# чтобы проверить существование файла по ИМЕНИ. Оно НЕ даёт:
-#   - прав на листинг каталога (ls всё равно откажет без "r"),
-#   - прав на чтение содержимого какого-либо файла внутри.
+#   # Каталог агента. Писать сервис будет только в cache/ (создаёт его сам).
+#   install -d -m 0755 /opt/flat/flat-check
+#   cp flat_check_agent.sh /opt/flat/flat-check/
+#   cp flat_check_agent.conf.example /opt/flat/flat-check/flat_check_agent.conf
+#   chown -R flat-service:flat-group /opt/flat/flat-check
+#   chmod 0755 /opt/flat/flat-check/flat_check_agent.sh
+#   chmod 0640 /opt/flat/flat-check/flat_check_agent.conf   # в конфиге PUSH_TOKEN
 #
-# Проверить, что ACL применился:
-#   getfacl /etc/sudoers.d
+#   # Каталог файлового лога (LOG_FILE). Без этого шага сервис не может
+#   # создать /var/log/flat/flat-check и тихо работает без файла, только
+#   # stderr (journalctl -u flat-check).
+#   install -d -m 0755 /var/log/flat
+#   install -d -m 0755 -o flat-service -g flat-group /var/log/flat/flat-check
+#   # Именно 0755, не 0775: logrotate (работает от root) отказывается
+#   # ротировать файл в каталоге, доступном на запись группе, отличной от
+#   # root ("parent directory has insecure permissions").
 #
-# Откатить:
-#   setfacl -x u:flat-agent /etc/sudoers.d
+#   # Юнит и ротация лога
+#   cp flat-check.service.example /etc/systemd/system/flat-check.service
+#   cp flat-check.logrotate.example /etc/logrotate.d/flat-check
+#   systemctl daemon-reload
+#   systemctl enable --now flat-check.service
 #
-# Этот шаг НЕОБЯЗАТЕЛЕН — большинству интеграций мониторинга статус
-# sudoers-файла не важен, деградация до "missing" безопасна по умолчанию.
 #
-# ЧЕГО ДЕЛАТЬ НЕ НУЖНО:
-#   - Не добавляйте flat-agent в /etc/sudoers с NOPASSWD:ALL или похожим
-#     широким правилом — скрипту это не требуется ни для одной проверки.
-#   - Не запускайте flat_check_agent.sh через sudo/из-под root "для
-#     простоты" — весь остальной функционал и так работает без этого.
+# 2. РАБОТА (обычный сервис, без sudo)
+# ------------------------------------
+# Пишет агент только в два места:
+#   /opt/flat/flat-check/cache/   — кеш и last_sent.json (создаёт сам)
+#   /var/log/flat/flat-check/     — LOG_FILE (каталог создаётся при установке)
+# Читает свой конфиг /opt/flat/flat-check/flat_check_agent.conf (0640).
 #
-# КЕШ: демон пишет в каталог cache/ рядом со скриптом (создаёт его сам) —
-# пользователю, от которого он работает, нужна запись в каталог скрипта:
+# Всё остальное — только чтение, root для этого не нужен:
+#   - dpkg-query/dpkg -s, rpm -q/-qa/-qR, pacman -Q — база пакетов
+#   - systemctl show / is-active — состояние юнитов (D-Bus, только чтение)
+#   - ss -lntu или netstat -lntu — слушающие порты (без -p, имена процессов
+#     не нужны)
+#   - pgrep, /proc/<pid>/stat, status, comm, cmdline — процессы
+#   - /proc/stat, /proc/meminfo, /proc/net/dev, /proc/uptime,
+#     /sys/class/net, df -P — CPU, память, сеть, диски
+#   - curl — локальные health-API и push на PUSH_URLS
+#   - openssl x509 — сертификаты в /etc/nginx/ssl, /opt/flat/cert,
+#     /etc/ssl/certs/flat*.pem (нужно право на чтение файла; обычно 0644)
+#   - проверка существования /opt/flat/<pkg>, /var/log/flat/<pkg>,
+#     /etc/nginx/sites-*, /etc/logrotate.d — нужен только проход по каталогам
 #
-#   chown -R flat-agent:flat-agent /opt/flat/flat-check
+# Проверить, что сервис работает не от root:
+#   systemctl show flat-check -p User -p Group
+#   ps -o user=,group=,args= -p "$(systemctl show flat-check -p MainPID --value)"
+#   ls -l /opt/flat/flat-check/cache /var/log/flat/flat-check   # владелец flat-service
 #
-# ФАЙЛОВЫЙ ЛОГ (LOG_FILE, см. agent/README.md "Логирование"): демон сам
-# делает mkdir -p для каталога лога при старте, но если /var/log/flat уже
-# существует и принадлежит root — у обычного пользователя может не быть
-# прав создать в нём подкаталог flat-check. Деградация тихая (просто нет
-# файлового лога, работает только stderr), но если он нужен — создайте
-# каталог заранее с нужным владельцем:
+# Запустить вручную (проверить конфиг) — тоже от имени сервиса, не от root.
+# runuser работает и с оболочкой nologin; JSON печатается в терминал:
+#   runuser -u flat-service -- /opt/flat/flat-check/flat_check_agent.sh
 #
-#   install -d -o flat-agent -g flat-agent /var/log/flat/flat-check
+#
+# 3. ЧТО БЕЗ ROOT ВИДНО ХУЖЕ (осознанные компромиссы, без ошибок и падений)
+# ------------------------------------------------------------------------
+# а) configs[].status для service_name="sudoers" (/etc/sudoers.d/<pkg>).
+#    На Debian/Ubuntu каталог /etc/sudoers.d обычно 0750 root:root: без права
+#    прохода проверка «есть ли файл» всегда отвечает «нет», и поле всегда
+#    "missing", даже если файл есть. Если поле нужно — самый узкий вариант:
+#
+#      setfacl -m u:flat-service:x /etc/sudoers.d    # пакет acl
+#
+#    Это даёт только проход по каталогу: проверить файл по ИМЕНИ. Листинг
+#    каталога и чтение файлов по-прежнему запрещены (проверено).
+#      Проверить:  getfacl /etc/sudoers.d
+#      Откатить:   setfacl -x u:flat-service /etc/sudoers.d
+#    Шаг НЕОБЯЗАТЕЛЕН: деградация до "missing" безопасна.
+#
+# б) /proc смонтирован с hidepid=2: чужие процессы не видны, process.status
+#    покажет "not running". Если нужно — добавить flat-service в группу,
+#    указанную в опции gid= монтирования /proc.
+#
+# в) Сертификат без права на чтение: файл попадёт в certificates[] с
+#    "days_left":0 и пустым subject — это не реальный срок. Сертификаты
+#    (не ключи) обычно 0644 и читаются.
+#
+#
+# 4. ЧЕГО ДЕЛАТЬ НЕ НУЖНО
+# -----------------------
+#   - Не давать flat-service sudo (тем более NOPASSWD:ALL) и не класть этот
+#     файл в /etc/sudoers.d — ни одной проверке это не нужно.
+#   - Не убирать User=/Group= из юнита и не запускать агент от root «для
+#     простоты». Первый запуск от root создаёт cache/ и файл лога от root
+#     (0755/0644), после чего сервис не может писать кеш ("Permission
+#     denied") и тихо теряет файловый лог (проверено). Если так уже
+#     случилось:
+#       chown -R flat-service:flat-group /opt/flat/flat-check /var/log/flat/flat-check
