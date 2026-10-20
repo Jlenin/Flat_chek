@@ -148,6 +148,7 @@ cp agent/flat_check_agent.sh agent/flat_check_agent.conf.example /opt/flat/flat-
 mv /opt/flat/flat-check/flat_check_agent.conf.example /opt/flat/flat-check/flat_check_agent.conf
 chmod +x /opt/flat/flat-check/flat_check_agent.sh
 chown -R flat-service:flat-group /opt/flat/flat-check     # запись в cache/
+install -d -m 0755 -o flat-service -g flat-group /var/log/flat/flat-check   # LOG_FILE
 # впишите реальный PUSH_URLS и токен в flat_check_agent.conf
 
 cp agent/flat-check.service.example /etc/systemd/system/flat-check.service

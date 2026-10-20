@@ -232,7 +232,12 @@ DEV_default:
         # Перезапуск
 # ИЗМЕНЕНО: daemon-reload — иначе после обновления systemd запускает старый юнит
 # из памяти; restart — чтобы гарантированно поднялся новый скрипт.
+# ИЗМЕНЕНО: каталог LOG_FILE агента — здесь, а не в POSTINST_INSTALL, чтобы он
+# появился и при обновлении уже установленного пакета, до restart. Сам агент
+# (flat-service) создать его в /var/log не может и молча пишет только в journal.
+# 0755, не 0775: logrotate не ротирует в каталоге, куда пишет группа не root.
         POSTINST_END: |
+                    install -d -m 0755 -o $SERVICE_NAME -g $SERVICE_GROUP /var/log/flat/flat-check
                     systemctl daemon-reload
                     systemctl enable $SERVICE_FILE
                     systemctl restart $SERVICE_FILE
@@ -304,6 +309,8 @@ DEV_default:
 
         # Атрибуты файлов при инсталяции
         # ИЗМЕНЕНО: конфиг с PUSH_TOKEN — 0640
+        # ИЗМЕНЕНО: каталог LOG_FILE агента входит в пакет (владелец — сервис, 0755),
+        # не завися от того, выполняет ли rpm-сборка POSTINST_* из .core.yml.
         SPEC_FILE: |
             %defattr(0755,$SERVICE_NAME,$SERVICE_GROUP,0755)
             %attr(0755,$SERVICE_NAME,$SERVICE_GROUP) $DESTINATION_PATH
@@ -311,6 +318,7 @@ DEV_default:
             %attr(0644,$SERVICE_NAME,$SERVICE_GROUP) ${LOG_ROTATE}/$PKG_NAME.conf
             %config(noreplace) ${LOG_ROTATE}/$PKG_NAME.conf
             %config(noreplace) %attr(0640,$SERVICE_NAME,$SERVICE_GROUP) ${DESTINATION_PATH}/$CONFIG_FILE
+            %dir %attr(0755,$SERVICE_NAME,$SERVICE_GROUP) /var/log/flat/flat-check
 
     # Собираем все файлы в каталоге для добавления в rpm
     # ИЗМЕНЕНО: всё, что относится к агенту, берётся из каталога agent/;
@@ -321,6 +329,8 @@ DEV_default:
         -     mkdir -p                               $DIR_RPM/BUILD/${DESTINATION_UNIT}
         -     mkdir -p                               $DIR_RPM/BUILD/${DESTINATION_PATH}
         -     mkdir -p                               $DIR_RPM/BUILD/${LOG_ROTATE}
+            # Каталог LOG_FILE агента (в SPEC_FILE — %dir с владельцем сервиса)
+        -     mkdir -p                               $DIR_RPM/BUILD/var/log/flat/flat-check
 
 
             # Копируем файл .service
