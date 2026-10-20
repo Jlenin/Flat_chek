@@ -175,12 +175,14 @@ _pkg_set "c2c-backend" "Click to Call" "" "8080" "/api/health"
 _pkg_set "c2c-frontend" "Click to Call" "" "" "" "nginx"
 # ========== Contact Center ==========
 _pkg_set "fcs-span" "Contact Center"
+_pkg_set "frec-span" "Contact Center"
 _pkg_set "fcs-chat" "Contact Center" "fcs-chat-server"
 _pkg_set "fcs-contact" "Contact Center" "fcs-flexconnect"
 _pkg_set "fcs-contact-db" "Contact Center" "" "" "" "mariadb"
 _pkg_set "fcs-contact-db-pg" "Contact Center" "" "" "" "postgresql"
 _pkg_set "fcs-recognize" "Contact Center" "flat-contact-recognize"
 _pkg_set "fcs-replication" "Contact Center" "fcs-record-replication,flat-record-replication"
+_pkg_set "frec-replication" "Contact Center"
 _pkg_set "fcs-recordtask" "Contact Center" "fcs-recproc,flat-record-taskservice"
 _pkg_set "fcs-screen" "Contact Center" "fcs-screen-record,flat-screen-recording"
 _pkg_set "fcs-swau" "Contact Center" "fcs-swau"
@@ -209,6 +211,7 @@ _pkg_set "asr-backend" "Contact Center"
 _pkg_set "asr-analytics" "Contact Center"
 # ========== Device Manager ==========
 _pkg_set "fdm-server" "Device Manager" "fdm-server"
+_pkg_set "fdm-server-update" "Device Manager"
 _pkg_set "fcc-frontend" "Device Manager" "" "" "" "nginx"
 _pkg_set "fcc-backend" "Device Manager"
 # ========== Gateway ==========
@@ -234,6 +237,7 @@ _pkg_set "fss-server" "SoftSwitch" "" "8080,8081" "/api/v1/health" "nginx,postgr
 _pkg_set "fss-web" "SoftSwitch" "fss-web" "" "" "nginx"
 _pkg_set "fss-csta" "SoftSwitch" "csta-rest-broker"
 _pkg_set "fss-capagent" "SoftSwitch" "flat-capagent"
+_pkg_set "flat-watchdog" "SoftSwitch"
 # ========== Tarifficator ==========
 _pkg_set "ftr-frontend" "Tarifficator" "tarifficator-frontend" "" "" "nginx"
 _pkg_set "ftr-server" "Tarifficator"
@@ -586,8 +590,9 @@ is_pkg_installed_tiny_dpkg() {
     local pkg="$1" legacy="$2" old
 
     dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q 'install ok installed' && return 0
+    # Имена deb-пакетов всегда строчные, а старые имена в каталоге бывают в camelCase.
     for old in $(echo "$legacy" | tr ',' ' '); do
-        dpkg-query -W -f='${Status}\n' "$old" 2>/dev/null | grep -q 'install ok installed' && return 0
+        dpkg-query -W -f='${Status}\n' "${old,,}" 2>/dev/null | grep -q 'install ok installed' && return 0
     done
     return 1
 }
@@ -1034,8 +1039,9 @@ _proc_cmdline_to() {
 
 # process пакета по списку PID'ов (через запятую): мёртвые и повторы
 # отбрасываются, ps_lines — до 5 строк → _W[pkg.<p>.process], _W[pkg.<p>.pids].
-_pkg_process() {
+_pkg_process() {   # $3=1 — у пакета нет службы: без процессов статус "n/a"
     local pkg="$1" pid list="" pl="" n=0 line e st="not running"
+    [[ "${3:-0}" == 1 ]] && st="n/a"
     local -a arr
     local -A seen=()
     IFS=',' read -ra arr <<< "$2"
@@ -1086,18 +1092,23 @@ _api_check() {
 
 # Живая часть пакета: systemd (is-active), порты, API + dynamic-issues →
 # _W[pkg.<p>.systemd|ports|api]. Одна и та же функция у full и services.
+# $3 — юнит пакета (по умолчанию <пакет>.service), $4=1 — службы у пакета нет.
 _pkg_dynamic() {
-    local pkg="$1" active="${2:-}" unit="${1}.service" unit_path spec open ports="" e1 e2 e3 is_infra=0
+    local pkg="$1" active="${2:-}" unit="${3:-${1}.service}" nosvc="${4:-0}" unit_path spec open ports="" e1 e2 e3 is_infra=0
     local -a specs
     _is_infrastructure_pkg "$pkg" && is_infra=1
-    [[ -n "$active" ]] || active="unknown"
-    _unit_path_to unit_path "$unit"
-    _json_esc_to e1 "$unit_path"
-    _json_esc_to e2 "$unit"
-    _json_esc_to e3 "$active"
-    _W["pkg.$pkg.systemd"]="{\"unit_path\":\"$e1\",\"service_name\":\"$e2\",\"status\":\"$e3\"}"
-    if [[ $is_infra -eq 0 && -n "$unit_path" && "$active" != "active" ]]; then
-        _issue_add dynamic error "$pkg" systemd_inactive "systemd: $unit is $active"
+    if [[ "$nosvc" == 1 ]]; then
+        _W["pkg.$pkg.systemd"]='{"unit_path":"","service_name":"","status":"n/a"}'
+    else
+        [[ -n "$active" ]] || active="unknown"
+        _unit_path_to unit_path "$unit"
+        _json_esc_to e1 "$unit_path"
+        _json_esc_to e2 "$unit"
+        _json_esc_to e3 "$active"
+        _W["pkg.$pkg.systemd"]="{\"unit_path\":\"$e1\",\"service_name\":\"$e2\",\"status\":\"$e3\"}"
+        if [[ $is_infra -eq 0 && -n "$unit_path" && "$active" != "active" ]]; then
+            _issue_add dynamic error "$pkg" systemd_inactive "systemd: $unit is $active"
+        fi
     fi
 
     IFS=',' read -ra specs <<< "${PKG_PORTS[$pkg]:-}"
@@ -1211,7 +1222,7 @@ _json_collect_repos() {
 # Все установленные в системе пакеты с версиями — ОДНИМ запросом к
 # пакетному менеджеру (вместо dpkg-query на каждую из ~100 записей каталога).
 _pm_snapshot() {
-    declare -gA _PM_VER=()
+    declare -gA _PM_VER=() _PM_LC=()
     _PM_SNAP=0
     local name st ver
     case "$PM" in
@@ -1232,6 +1243,12 @@ _pm_snapshot() {
             ;;
         *) return 1 ;;
     esac
+    # Имя в нижнем регистре → настоящее имя: старые имена в каталоге бывают в
+    # camelCase (flatSoftSwitchBackend), а имена deb-пакетов всегда строчные
+    # (flatsoftswitchbackend), dpkg-query регистр различает.
+    for name in "${!_PM_VER[@]}"; do
+        _PM_LC["${name,,}"]="$name"
+    done
     _PM_SNAP=1
 }
 
@@ -1239,19 +1256,25 @@ _pm_snapshot() {
 # Как и раньше: нет в пакетном менеджере, но есть unit-файл — считается
 # установленным (has_any_trace), версия тогда пустая.
 _pkg_installed() {
-    local pkg="$1" old
+    local pkg="$1" old real
     local -a olds
     _PKGVER=""
+    _PKGREAL=""    # имя, под которым пакет стоит в системе (основное или legacy)
     if [[ $_PM_SNAP -eq 1 ]]; then
         if [[ -n "${_PM_VER[$pkg]+x}" ]]; then
             _PKGVER="${_PM_VER[$pkg]}"
+            _PKGREAL="$pkg"
             return 0
         fi
+        # Старые имена — без учёта регистра (см. _PM_LC в _pm_snapshot).
         IFS=',' read -ra olds <<< "${PKG_LEGACY[$pkg]:-}"
         for old in "${olds[@]}"; do
             old="${old// /}"
-            if [[ -n "$old" && -n "${_PM_VER[$old]+x}" ]]; then
-                _PKGVER="${_PM_VER[$old]}"
+            [[ -n "$old" ]] || continue
+            real="${_PM_LC[${old,,}]:-}"
+            if [[ -n "$real" ]]; then
+                _PKGVER="${_PM_VER[$real]}"
+                _PKGREAL="$real"
                 return 0
             fi
         done
@@ -1260,6 +1283,122 @@ _pkg_installed() {
     fi
     is_pkg_installed_tiny "$pkg" "${PKG_LEGACY[$pkg]:-}" || return 1
     _PKGVER=$(_pkg_version "$pkg")
+    return 0
+}
+
+# Юниты и каталоги пакета — из списка его файлов у пакетного менеджера, а не
+# только по соглашению об именах (/opt/flat/<пакет>, <пакет>.service):
+# пакеты «берем готовый» ставят юнит и каталоги под своими именами. Только
+# чтение базы пакетов — root не нужен.
+# → _PKG_FILES_OK[pkg]=1 — список файлов получен; _PKG_UNITS[pkg] — юниты
+#   пакета через пробел (без шаблонов name@.service); _PKG_OPT/_PKG_LOG[pkg] —
+#   его каталог в /opt/flat и /var/log/flat ("" — пакет туда ничего не ставит).
+_pkg_files_scan() {
+    local pkg="$1" real="$2" f u d opt="" log="" units=""
+    local -a files
+    _PKG_FILES_OK[$pkg]=0
+    _PKG_UNITS[$pkg]=""
+    _PKG_OPT[$pkg]=""
+    _PKG_LOG[$pkg]=""
+    [[ -n "$real" ]] || return 1
+    case "$PM" in
+        dpkg)   mapfile -t files < <(dpkg-query -L "$real" 2>/dev/null) ;;
+        rpm)    mapfile -t files < <(rpm -ql "$real" 2>/dev/null) ;;
+        pacman) mapfile -t files < <(pacman -Qlq "$real" 2>/dev/null) ;;
+        *)      return 1 ;;
+    esac
+    [[ ${#files[@]} -gt 0 ]] || return 1
+    for f in "${files[@]}"; do
+        case "$f" in
+            /etc/systemd/system/*.service|/usr/lib/systemd/system/*.service|/lib/systemd/system/*.service)
+                u="${f##*/}"
+                # Только верхний уровень каталога (не *.wants/), без шаблонов.
+                [[ "$f" == */systemd/system/"$u" && "$u" != *@.service ]] || continue
+                [[ " $units " == *" $u "* ]] || units+="${units:+ }$u"
+                ;;
+            /opt/flat/?*)
+                d="${f#/opt/flat/}"
+                d="/opt/flat/${d%%/*}"
+                [[ -z "$opt" || "$d" == "/opt/flat/$pkg" ]] && opt="$d"
+                ;;
+            /var/log/flat/?*)
+                d="${f#/var/log/flat/}"
+                d="/var/log/flat/${d%%/*}"
+                [[ -z "$log" || "$d" == "/var/log/flat/$pkg" ]] && log="$d"
+                ;;
+        esac
+    done
+    _PKG_FILES_OK[$pkg]=1
+    _PKG_UNITS[$pkg]="$units"
+    _PKG_OPT[$pkg]="$opt"
+    _PKG_LOG[$pkg]="$log"
+    return 0
+}
+
+# Строки ExecStart/ExecStartPre/WorkingDirectory всех юнитов системы →
+# _UNIT_REF[юнит] — один раз за прогон full и только если понадобилось.
+_units_index() {
+    [[ "${_UNIT_REF_DONE:-0}" -eq 1 ]] && return 0
+    _UNIT_REF_DONE=1
+    local d f u line refs
+    for d in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+        for f in "$d"/*.service; do
+            [[ -f "$f" ]] || continue
+            u="${f##*/}"
+            [[ "$u" == *@.service || -n "${_UNIT_REF[$u]+x}" ]] && continue
+            refs=""
+            while IFS= read -r line; do
+                case "$line" in
+                    ExecStart=*|ExecStartPre=*|WorkingDirectory=*) refs+=" ${line#*=}" ;;
+                esac
+            done 2>/dev/null < "$f"
+            _UNIT_REF[$u]="$refs "
+        done
+    done
+}
+
+# Главный юнит пакета → _PKG_UNIT[pkg] ("" — службы у пакета нет). Только для
+# пакетов, чей список файлов получен; остальные — по-старому, <пакет>.service.
+#   1) юниты из списка файлов: <пакет>.service или старое имя, иначе первый;
+#   2) по соглашению: на диске есть <пакет>.service или <старое имя>.service;
+#   3) юнит, чей ExecStart/WorkingDirectory указывает в каталог пакета в
+#      /opt/flat (юнит создан скриптом установки, в списке файлов его нет),
+#      если он не принадлежит другому пакету.
+# $2 — юниты, уже принадлежащие пакетам по спискам файлов (через пробел).
+_pkg_pick_unit() {
+    local pkg="$1" claimed="$2" name u unit_path opt="${_PKG_OPT[$1]:-}" found=""
+    local -a names keys
+    _PKG_UNIT[$pkg]=""
+    mapfile -t names < <(_sys_pkg_names "$pkg")
+    if [[ -n "${_PKG_UNITS[$pkg]}" ]]; then
+        for name in "${names[@]}"; do
+            if [[ " ${_PKG_UNITS[$pkg]} " == *" ${name}.service "* ]]; then
+                _PKG_UNIT[$pkg]="${name}.service"
+                return 0
+            fi
+        done
+        _PKG_UNIT[$pkg]="${_PKG_UNITS[$pkg]%% *}"
+        return 0
+    fi
+    for name in "${names[@]}"; do
+        if _unit_path_to unit_path "${name}.service"; then
+            _PKG_UNIT[$pkg]="${name}.service"
+            _PKG_UNITS[$pkg]="${name}.service"
+            return 0
+        fi
+    done
+    [[ -n "$opt" ]] || return 1
+    _units_index
+    mapfile -t keys < <(printf '%s\n' "${!_UNIT_REF[@]}" | sort)
+    for u in "${keys[@]}"; do
+        [[ -n "$u" && " $claimed " != *" $u "* ]] || continue
+        # ExecStart может начинаться с префиксов -@+!, поэтому без пробела перед путём.
+        [[ "${_UNIT_REF[$u]}" == *"$opt/"* || "${_UNIT_REF[$u]}" == *"$opt "* ]] || continue
+        found+="${found:+ }$u"
+    done
+    [[ -n "$found" ]] || return 1
+    _PKG_UNIT[$pkg]="${found%% *}"
+    _PKG_UNITS[$pkg]="$found"
     return 0
 }
 
@@ -1283,33 +1422,73 @@ _full_collect_pkg() {
         register_dep "$d" "$pkg"
     done
 
+    # Юнит: по списку файлов пакета (_pkg_pick_unit); список не получен —
+    # по-старому, <пакет>.service. nosvc=1 — службы у пакета нет (например,
+    # пакет схемы БД): systemd и процесс — "n/a", находок по ним нет.
+    local nosvc=0 units="${1}.service" u mp files_ok="${_PKG_FILES_OK[$1]:-0}" active=""
+    if [[ "$files_ok" == 1 ]]; then
+        unit="${_PKG_UNIT[$pkg]:-}"
+        units="${_PKG_UNITS[$pkg]:-}"
+        [[ -n "$unit" ]] || nosvc=1
+    fi
+    _W["pkg.$pkg.unit"]="$unit"
+    _W["pkg.$pkg.units"]="$units"
+    _W["pkg.$pkg.nosvc"]="$nosvc"
+
     # systemd: unit-файл и is-enabled — здесь; is-active — в _pkg_dynamic.
-    _unit_path_to unit_path "$unit"
-    enabled="${_SD_EN[$unit]:-}"
-    [[ -n "$enabled" ]] || enabled="unknown"
-    if [[ $is_infra -eq 0 ]]; then
-        if [[ -z "$unit_path" ]]; then
-            _issue_add static warning "$pkg" systemd_unit_missing "systemd unit: $unit not found"
-        elif [[ "$enabled" != "enabled" ]]; then
-            _issue_add static error "$pkg" systemd_disabled "systemd: $unit is $enabled"
+    if [[ $nosvc -eq 0 ]]; then
+        _unit_path_to unit_path "$unit"
+        enabled="${_SD_EN[$unit]:-}"
+        [[ -n "$enabled" ]] || enabled="unknown"
+        if [[ $is_infra -eq 0 ]]; then
+            if [[ -z "$unit_path" ]]; then
+                _issue_add static warning "$pkg" systemd_unit_missing "systemd unit: $unit not found"
+            elif [[ "$enabled" != "enabled" ]]; then
+                _issue_add static error "$pkg" systemd_disabled "systemd: $unit is $enabled"
+            fi
         fi
+        active="${_SD_ACT[$unit]:-}"
     fi
 
-    # Поиск процессов (pgrep + MainPID) — только в full.
+    # Поиск процессов (pgrep + MainPID всех юнитов пакета) — только в full.
     pids=$(_sys_pkg_pids "$pkg" 2>/dev/null | paste -sd',' - 2>/dev/null)
-    _pkg_process "$pkg" "$pids"
+    for u in $units; do
+        mp="${_SD_PID[$u]:-0}"
+        [[ "$mp" =~ ^[1-9][0-9]*$ ]] && pids+="${pids:+,}$mp"
+    done
+    _pkg_process "$pkg" "$pids" "$nosvc"
 
     # Каталоги FLAT (у Infrastructure — системные пакеты без /opt/flat).
+    # Список файлов получен — каталоги берутся из него; соглашение
+    # (/opt/flat/<пакет>, /var/log/flat/<пакет>) проверяется только у пакетов,
+    # которые ему следуют, остальным — "n/a" вместо ложного "missing".
     if [[ $is_infra -eq 1 ]]; then
         opt_status="n/a"; log_status="n/a"; opt_path=""; log_path=""
     else
-        if [[ -d "$opt_path" ]]; then
+        local opt_check=1 log_check=1
+        if [[ "$files_ok" == 1 ]]; then
+            if [[ -n "${_PKG_OPT[$pkg]}" ]]; then
+                opt_path="${_PKG_OPT[$pkg]}"
+            elif [[ ! -d "$opt_path" ]]; then
+                opt_check=0
+            fi
+            if [[ -n "${_PKG_LOG[$pkg]}" ]]; then
+                log_path="${_PKG_LOG[$pkg]}"
+            elif [[ $opt_check -eq 0 || "$opt_path" != "/opt/flat/$pkg" ]] && [[ ! -d "$log_path" ]]; then
+                log_check=0
+            fi
+        fi
+        if [[ $opt_check -eq 0 ]]; then
+            opt_status="n/a"; opt_path=""
+        elif [[ -d "$opt_path" ]]; then
             opt_status="ok"
             opt_owner=$(stat -c '%U:%G' "$opt_path" 2>/dev/null)
         else
             _issue_add static warning "$pkg" opt_dir_missing "dir: $opt_path missing"
         fi
-        if [[ -d "$log_path" ]]; then
+        if [[ $log_check -eq 0 ]]; then
+            log_status="n/a"; log_path=""
+        elif [[ -d "$log_path" ]]; then
             log_status="ok"
             log_owner=$(stat -c '%U:%G' "$log_path" 2>/dev/null)
         elif [[ -n "${_W[pkg.$pkg.pids]}" ]]; then
@@ -1340,7 +1519,7 @@ _full_collect_pkg() {
     done
     _W["pkg.$pkg.configs"]="[$cfg]"
 
-    _pkg_dynamic "$pkg" "${_SD_ACT[$unit]:-}"
+    _pkg_dynamic "$pkg" "$active" "$unit" "$nosvc"
 }
 
 # system (кроме того, что потом обновляет metrics — его начальные значения
@@ -1443,16 +1622,21 @@ _full_collect_system() {
     _W[certificates]="[$certs]"
 }
 
-# uptime_services — по уже полученному общему systemctl show (главное имя
-# пакета и legacy-имена: берётся первый активный юнит).
+# uptime_services — по уже полученному общему systemctl show (главный юнит
+# пакета, затем главное имя и legacy-имена: берётся первый активный юнит).
 _full_collect_uptime() {
-    local now="$1" pkg name enter ts out=""
-    local -a names
+    local now="$1" pkg name u enter ts out=""
+    local -a names cands
     for pkg in "${_FULL_PKGS[@]}"; do
+        cands=()
+        [[ -n "${_PKG_UNIT[$pkg]:-}" ]] && cands+=("${_PKG_UNIT[$pkg]}")
         mapfile -t names < <(_sys_pkg_names "$pkg")
         for name in "${names[@]}"; do
-            [[ "${_SD_ACT[${name}.service]:-}" == "active" ]] || continue
-            enter="${_SD_ENTER[${name}.service]:-}"
+            cands+=("${name}.service")
+        done
+        for u in "${cands[@]}"; do
+            [[ "${_SD_ACT[$u]:-}" == "active" ]] || continue
+            enter="${_SD_ENTER[$u]:-}"
             [[ -n "$enter" && "$enter" != "n/a" && "$enter" != "0" ]] || continue
             ts=$(date -d "$enter" +%s 2>/dev/null)
             if [[ "$ts" =~ ^[0-9]+$ && $now -ge $ts ]]; then
@@ -1525,7 +1709,7 @@ _full_run() {
     products_list=("${FLAT_PRODUCTS_ORDER[@]}")
     [[ -n "$FILTER_PRODUCT" ]] && products_list=("$FILTER_PRODUCT")
     _FULL_PKGS=()
-    declare -A pkg_ver=() prod_pkgs=()
+    declare -A pkg_ver=() prod_pkgs=() pkg_real=()
     for p in "${products_list[@]}"; do
         for pkg in "${sorted[@]}"; do
             [[ "${PKG_PRODUCT[$pkg]}" == "$p" ]] || continue
@@ -1533,18 +1717,38 @@ _full_run() {
             [[ -n "$PACKAGES" && ",${PACKAGES}," != *",$pkg,"* ]] && continue
             _pkg_installed "$pkg" || continue
             pkg_ver[$pkg]="$_PKGVER"
+            pkg_real[$pkg]="$_PKGREAL"
             prod_pkgs[$p]+="${prod_pkgs[$p]:+ }$pkg"
             _FULL_PKGS+=("$pkg")
         done
     done
 
-    # Один systemctl show на все юниты пакетов (включая legacy-имена — для
-    # uptime_services) вместо 2–4 вызовов systemctl на каждый пакет.
+    # Юниты и каталоги пакетов — по спискам их файлов (_pkg_files_scan), затем
+    # главный юнит каждого пакета (_pkg_pick_unit).
+    declare -gA _PKG_FILES_OK=() _PKG_UNITS=() _PKG_UNIT=() _PKG_OPT=() _PKG_LOG=() _UNIT_REF=()
+    _UNIT_REF_DONE=0
+    local claimed=""
+    for pkg in "${_FULL_PKGS[@]}"; do
+        _pkg_files_scan "$pkg" "${pkg_real[$pkg]}"
+        claimed+="${_PKG_UNITS[$pkg]:+ ${_PKG_UNITS[$pkg]}}"
+    done
+    for pkg in "${_FULL_PKGS[@]}"; do
+        [[ "${_PKG_FILES_OK[$pkg]}" == 1 ]] && _pkg_pick_unit "$pkg" "$claimed"
+    done
+
+    # Один systemctl show на все юниты пакетов (найденные по спискам файлов и
+    # по именам/legacy-именам — для uptime_services) вместо 2–4 вызовов
+    # systemctl на каждый пакет.
     units=()
     for pkg in "${_FULL_PKGS[@]}"; do
-        while IFS= read -r e; do
-            [[ -n "$e" && -z "${seen[$e]:-}" ]] || continue
+        for e in ${_PKG_UNITS[$pkg]:-}; do
+            [[ -z "${seen[$e]:-}" ]] || continue
             seen[$e]=1
+            units+=("$e")
+        done
+        while IFS= read -r e; do
+            [[ -n "$e" && -z "${seen[${e}.service]:-}" ]] || continue
+            seen[${e}.service]=1
             units+=("${e}.service")
         done < <(_sys_pkg_names "$pkg")
     done
@@ -1600,7 +1804,7 @@ _full_run() {
 # каждый пакет с API. PID'ы: найденные full'ом (если ещё живы) + свежий
 # MainPID — так metrics переживает перезапуск сервиса без ожидания full.
 _services_run() {
-    local t0 pkg d pids mp
+    local t0 pkg d pids mp u unit nosvc active
     local -a pkgs deps units=()
     _epoch_to t0
     declare -gA _F=() _W=()
@@ -1608,8 +1812,16 @@ _services_run() {
     _issues_reset dynamic
     read -ra pkgs <<< "${_F[pkgs]:-}"
     read -ra deps <<< "${_F[infra.list]:-}"
+    # Юниты пакета — те, что нашёл full (pkg.<p>.units); в кеше от прежней
+    # версии агента их нет — тогда <пакет>.service, как раньше.
     for pkg in "${pkgs[@]}"; do
-        units+=("${pkg}.service")
+        if [[ -n "${_F[pkg.$pkg.units]+x}" ]]; then
+            for u in ${_F[pkg.$pkg.units]}; do
+                units+=("$u")
+            done
+        else
+            units+=("${pkg}.service")
+        fi
     done
     for d in "${deps[@]}"; do
         [[ "${_F[infra.$d.unit]:-0}" == 1 ]] && units+=("$d")
@@ -1618,11 +1830,21 @@ _services_run() {
     _ports_snapshot
 
     for pkg in "${pkgs[@]}"; do
+        unit="${pkg}.service"
+        nosvc=0
+        if [[ -n "${_F[pkg.$pkg.unit]+x}" ]]; then
+            unit="${_F[pkg.$pkg.unit]}"
+            nosvc="${_F[pkg.$pkg.nosvc]:-0}"
+        fi
         pids="${_F[pkg.$pkg.pids]:-}"
-        mp="${_SD_PID[${pkg}.service]:-0}"
-        [[ "$mp" =~ ^[1-9][0-9]*$ ]] && pids+="${pids:+,}$mp"
-        _pkg_process "$pkg" "$pids"
-        _pkg_dynamic "$pkg" "${_SD_ACT[${pkg}.service]:-}"
+        for u in ${_F[pkg.$pkg.units]-$unit}; do
+            mp="${_SD_PID[$u]:-0}"
+            [[ "$mp" =~ ^[1-9][0-9]*$ ]] && pids+="${pids:+,}$mp"
+        done
+        active=""
+        [[ -n "$unit" ]] && active="${_SD_ACT[$unit]:-}"
+        _pkg_process "$pkg" "$pids" "$nosvc"
+        _pkg_dynamic "$pkg" "$active" "$unit" "$nosvc"
     done
     for d in "${deps[@]}"; do
         [[ "${_F[infra.$d.unit]:-0}" == 1 && "${_SD_LOAD[$d]:-}" == "loaded" && -n "${_SD_ACT[$d]:-}" ]] || continue
