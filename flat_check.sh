@@ -138,12 +138,14 @@ _pkg_set "c2c-backend" "Click to Call" "" "8080" "/api/health"
 _pkg_set "c2c-frontend" "Click to Call" "" "" "" "nginx"
 # ========== Contact Center ==========
 _pkg_set "fcs-span" "Contact Center"
+_pkg_set "frec-span" "Contact Center"
 _pkg_set "fcs-chat" "Contact Center" "fcs-chat-server"
 _pkg_set "fcs-contact" "Contact Center" "fcs-flexconnect"
 _pkg_set "fcs-contact-db" "Contact Center" "" "" "" "mariadb"
 _pkg_set "fcs-contact-db-pg" "Contact Center" "" "" "" "postgresql"
 _pkg_set "fcs-recognize" "Contact Center" "flat-contact-recognize"
 _pkg_set "fcs-replication" "Contact Center" "fcs-record-replication,flat-record-replication"
+_pkg_set "frec-replication" "Contact Center"
 _pkg_set "fcs-recordtask" "Contact Center" "fcs-recproc,flat-record-taskservice"
 _pkg_set "fcs-screen" "Contact Center" "fcs-screen-record,flat-screen-recording"
 _pkg_set "fcs-swau" "Contact Center" "fcs-swau"
@@ -172,6 +174,7 @@ _pkg_set "asr-backend" "Contact Center"
 _pkg_set "asr-analytics" "Contact Center"
 # ========== Device Manager ==========
 _pkg_set "fdm-server" "Device Manager" "fdm-server"
+_pkg_set "fdm-server-update" "Device Manager"
 _pkg_set "fcc-frontend" "Device Manager" "" "" "" "nginx"
 _pkg_set "fcc-backend" "Device Manager"
 # ========== Gateway ==========
@@ -182,6 +185,7 @@ _pkg_set "fps-backend" "Partner Server" "flatPartnerAuth"
 _pkg_set "fps-profile" "Partner Server" "flatImageProcessor"
 _pkg_set "fps-frontend" "Partner Server" "flatPartnerFrontend" "" "" "nginx"
 _pkg_set "fps-license" "Partner Server" "flatPartnerLicense"
+_pkg_set "license-backend" "Partner Server"
 _pkg_set "fps-admin" "Partner Server" "flatPartnerLicenseAdmin"
 _pkg_set "fps-agent" "Partner Server" "flatPartnerLicenseAgent"
 _pkg_set "fps-server" "Partner Server" "flatPartnerServer"
@@ -197,6 +201,7 @@ _pkg_set "fss-server" "SoftSwitch" "" "8080,8081" "/api/v1/health" "nginx,postgr
 _pkg_set "fss-web" "SoftSwitch" "fss-web" "" "" "nginx"
 _pkg_set "fss-csta" "SoftSwitch" "csta-rest-broker"
 _pkg_set "fss-capagent" "SoftSwitch" "flat-capagent"
+_pkg_set "flat-watchdog" "SoftSwitch"
 # ========== Tarifficator ==========
 _pkg_set "ftr-frontend" "Tarifficator" "tarifficator-frontend" "" "" "nginx"
 _pkg_set "ftr-server" "Tarifficator"
@@ -251,6 +256,7 @@ _pkg_set "postgresql" "Infrastructure"
 # Debian/Ubuntu/Astra не поставляют пакет с именем "mariadb" — только mariadb-server;
 # без legacy is_pkg_installed_tiny() всегда возвращал "не установлен" даже при наличии сервера.
 _pkg_set "mariadb" "Infrastructure" "mariadb-server,mysql-server"
+_pkg_set "ftts-server" "Infrastructure"
 FLAT_PKG_CATALOG_EOF
 }
 

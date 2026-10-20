@@ -30,7 +30,7 @@
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 [[ -z "$SCRIPT_DIR" ]] && SCRIPT_DIR="$(pwd)"
@@ -222,6 +222,7 @@ _pkg_set "fps-backend" "Partner Server" "flatPartnerAuth"
 _pkg_set "fps-profile" "Partner Server" "flatImageProcessor"
 _pkg_set "fps-frontend" "Partner Server" "flatPartnerFrontend" "" "" "nginx"
 _pkg_set "fps-license" "Partner Server" "flatPartnerLicense"
+_pkg_set "license-backend" "Partner Server"
 _pkg_set "fps-admin" "Partner Server" "flatPartnerLicenseAdmin"
 _pkg_set "fps-agent" "Partner Server" "flatPartnerLicenseAgent"
 _pkg_set "fps-server" "Partner Server" "flatPartnerServer"
@@ -292,6 +293,7 @@ _pkg_set "postgresql" "Infrastructure"
 # Debian/Ubuntu/Astra не поставляют пакет с именем "mariadb" — только mariadb-server;
 # без legacy is_pkg_installed_tiny() всегда возвращал "не установлен" даже при наличии сервера.
 _pkg_set "mariadb" "Infrastructure" "mariadb-server,mysql-server"
+_pkg_set "ftts-server" "Infrastructure"
 FLAT_PKG_CATALOG_EOF
 }
 
