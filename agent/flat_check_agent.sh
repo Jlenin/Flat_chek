@@ -239,6 +239,8 @@ _pkg_set "fss-web" "SoftSwitch" "fss-web" "" "" "nginx"
 _pkg_set "fss-csta" "SoftSwitch" "csta-rest-broker"
 _pkg_set "fss-capagent" "SoftSwitch" "flat-capagent"
 _pkg_set "flat-watchdog" "SoftSwitch"
+_pkg_set "flat-vault" "SoftSwitch"
+_pkg_set "sip-backend" "SoftSwitch"
 # ========== Tarifficator ==========
 _pkg_set "ftr-frontend" "Tarifficator" "tarifficator-frontend" "" "" "nginx"
 _pkg_set "ftr-server" "Tarifficator"
@@ -264,6 +266,8 @@ _pkg_set "fbr-backend" "LDAP" "flatPartnerBroker,flat-broker"
 _pkg_set "flat-ldap" "LDAP" "ldapSynchronizer"
 _pkg_set "flat-broker" "LDAP"
 _pkg_set "flat-transfer-server" "LDAP"
+_pkg_set "flat-ai-backend" "LDAP"
+_pkg_set "flat-check" "LDAP"
 # ========== SBC ==========
 _pkg_set "sbc-backend" "SBC" "flat.sbc.backend"
 _pkg_set "sbc-core" "SBC" "flat.sbc.core"
@@ -294,6 +298,11 @@ _pkg_set "postgresql" "Infrastructure"
 # без legacy is_pkg_installed_tiny() всегда возвращал "не установлен" даже при наличии сервера.
 _pkg_set "mariadb" "Infrastructure" "mariadb-server,mysql-server"
 _pkg_set "ftts-server" "Infrastructure"
+_pkg_set "patroni" "Infrastructure"
+_pkg_set "etcd-server" "Infrastructure"
+_pkg_set "etcd-client" "Infrastructure"
+_pkg_set "haproxy" "Infrastructure"
+_pkg_set "pgbackrest" "Infrastructure"
 FLAT_PKG_CATALOG_EOF
 }
 
