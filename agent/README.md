@@ -16,7 +16,7 @@ deb/rpm-пакет — см. корневой [`README.md`](../README.md)). Од
 |------|------------|
 | `flat_check_agent.sh` | сам агент — один файл, `chmod +x`, и всё |
 | `flat_check_agent.conf.example` | эталонный конфиг (копировать в `flat_check_agent.conf` рядом со скриптом) |
-| `flat_check_agent.sudoers.example` | справка по правам для non-root запуска |
+| `flat_check_agent.sudoers.md` | справка по правам для non-root запуска |
 | `flat-check-set-push-urls.sh` | вызывается из postinst deb/rpm-пакета `flat-check` — заполняет `PUSH_URLS`/`SERVICE_NAME` в конфиге по реально установленным `*-backend` пакетам и их портам |
 | `flat-check.service.example` | systemd-юнит (`Type=simple`) — кладётся в пакет как `flat-check.service` (`.gitlab-ci.yml`: `cp ./agent/$SERVICE_FILE.example`) |
 | `flat-check.logrotate.example` | ротация `LOG_FILE` (см. «Логирование») |
@@ -115,7 +115,7 @@ deb/rpm-пакет — см. корневой [`README.md`](../README.md)). Од
 - **Права доступа:** обычный пользователь, не root. Нужна запись в `cache/`
   рядом со скриптом (и в каталог `LOG_FILE`). Единственное известное
   ограничение проверок — `configs[].status="sudoers"` (подробности —
-  `flat_check_agent.sudoers.example`).
+  `flat_check_agent.sudoers.md`).
 
 ## Логирование
 
@@ -148,6 +148,7 @@ cp agent/flat_check_agent.sh agent/flat_check_agent.conf.example /opt/flat/flat-
 mv /opt/flat/flat-check/flat_check_agent.conf.example /opt/flat/flat-check/flat_check_agent.conf
 chmod +x /opt/flat/flat-check/flat_check_agent.sh
 chown -R flat-service:flat-group /opt/flat/flat-check     # запись в cache/
+install -d -m 0755 -o flat-service -g flat-group /var/log/flat/flat-check   # LOG_FILE
 # впишите реальный PUSH_URLS и токен в flat_check_agent.conf
 
 cp agent/flat-check.service.example /etc/systemd/system/flat-check.service
